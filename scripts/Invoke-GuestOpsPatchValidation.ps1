@@ -424,6 +424,53 @@ try {
     Write-Host ('Selected updates: {0}' -f $selectedUpdateCount)
     Write-Host ('Pending reboot: {0}' -f $pendingRebootIsPending)
 
+    $pendingRebootChecks = Get-ObjectPropertyValue -InputObject $status -Path @('pendingReboot', 'checks')
+    if ($null -ne $pendingRebootChecks) {
+        Write-Host 'Pending reboot checks:'
+        foreach ($checkName in @('componentBasedServicing', 'windowsUpdate', 'pendingFileRename')) {
+            $checkValue = Get-ObjectPropertyValue -InputObject $pendingRebootChecks -Path @($checkName)
+            if ($null -ne $checkValue) {
+                Write-Host (' - {0}: {1}' -f $checkName, $checkValue)
+            }
+        }
+    }
+
+    $agentErrors = Get-ObjectPropertyValue -InputObject $status -Path @('errors')
+    if ($null -ne $agentErrors -and @($agentErrors).Count -gt 0) {
+        Write-Host 'Agent errors:'
+        foreach ($agentError in @($agentErrors)) {
+            $message = Get-ObjectPropertyValue -InputObject $agentError -Path @('message')
+            $type = Get-ObjectPropertyValue -InputObject $agentError -Path @('type')
+            $line = Get-ObjectPropertyValue -InputObject $agentError -Path @('line')
+            $stage = Get-ObjectPropertyValue -InputObject $agentError -Path @('stage')
+
+            $details = @()
+            if (-not [string]::IsNullOrWhiteSpace([string]$stage)) {
+                $details += ('stage={0}' -f $stage)
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace([string]$line)) {
+                $details += ('line={0}' -f $line)
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace([string]$type)) {
+                $details += ('type={0}' -f $type)
+            }
+
+            if ($details.Count -gt 0) {
+                Write-Host (' - {0} ({1})' -f $message, ($details -join '; '))
+            }
+            else {
+                Write-Host (' - {0}' -f $message)
+            }
+
+            $command = Get-ObjectPropertyValue -InputObject $agentError -Path @('command')
+            if (-not [string]::IsNullOrWhiteSpace([string]$command)) {
+                Write-Host ('   command: {0}' -f ([string]$command).Trim())
+            }
+        }
+    }
+
     $updates = Get-ObjectPropertyValue -InputObject $status -Path @('updates')
     if ($null -ne $updates) {
         foreach ($update in @($updates)) {

@@ -56,6 +56,29 @@ function Format-HResult {
     return ('0x{0:X8}' -f ([uint32]$value))
 }
 
+function Get-OptionalPropertyValue {
+    param(
+        $InputObject,
+        [string]$Name
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    try {
+        $property = $InputObject.PSObject.Properties[$Name]
+        if ($null -eq $property) {
+            return $null
+        }
+
+        return $property.Value
+    }
+    catch {
+        return $null
+    }
+}
+
 function Get-ComStringCollection {
     param($Collection)
 
@@ -192,11 +215,13 @@ function New-OperationResult {
         return $null
     }
 
+    $rebootRequired = Get-OptionalPropertyValue -InputObject $Result -Name 'RebootRequired'
+
     return [ordered]@{
         resultCode = [int]$Result.ResultCode
         result = Convert-ResultCode -ResultCode $Result.ResultCode
-        hResult = Format-HResult -HResult $Result.HResult
-        rebootRequired = if ($Result.PSObject.Properties.Name -contains 'RebootRequired') { [bool]$Result.RebootRequired } else { $null }
+        hResult = Format-HResult -HResult (Get-OptionalPropertyValue -InputObject $Result -Name 'HResult')
+        rebootRequired = if ($null -ne $rebootRequired) { [bool]$rebootRequired } else { $null }
     }
 }
 
@@ -281,7 +306,7 @@ try {
     $status.searchResult = [ordered]@{
         resultCode = [int]$searchResult.ResultCode
         result = Convert-ResultCode -ResultCode $searchResult.ResultCode
-        hResult = Format-HResult -HResult $searchResult.HResult
+        hResult = Format-HResult -HResult (Get-OptionalPropertyValue -InputObject $searchResult -Name 'HResult')
     }
 
     if ($searchResult.Updates.Count -eq 0) {

@@ -175,6 +175,8 @@ if ($existingScripts.ContainsKey($agentPath)) {
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'CreateUpdateInstaller'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'ConvertTo-Json'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Test-PendingReboot'
+    Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Get-OptionalPropertyValue'
+    Assert-TextDoesNotMatch -RelativePath $agentPath -Text $agentText -Pattern '(?i)\$[a-z_][a-z0-9_]*\.HResult\b' -Reason 'WUA COM HResult can be absent under StrictMode'
 }
 
 if ($existingScripts.ContainsKey($orchestratorPath)) {
@@ -189,6 +191,8 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'InitiateFileTransferToGuest'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'InitiateFileTransferFromGuest'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'curl.exe'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Agent errors:'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Pending reboot checks:'
 }
 
 if ($existingScripts.ContainsKey($launcherPath)) {
