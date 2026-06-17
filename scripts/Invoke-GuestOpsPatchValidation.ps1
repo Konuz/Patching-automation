@@ -157,8 +157,8 @@ function New-GuestDirectory {
     $programSpec.ProgramPath = 'C:\Windows\System32\cmd.exe'
     $programSpec.Arguments = ('/c if not exist "{0}" mkdir "{0}"' -f $DirectoryPath)
 
-    $pid = $ProcessManager.StartProgramInGuest($VMView.MoRef, $GuestAuth, $programSpec)
-    return $pid
+    $processId = $ProcessManager.StartProgramInGuest($VMView.MoRef, $GuestAuth, $programSpec)
+    return $processId
 }
 
 function Wait-GuestProcess {
@@ -166,7 +166,7 @@ function Wait-GuestProcess {
         $ProcessManager,
         $VMView,
         $GuestAuth,
-        [long]$Pid,
+        [long]$ProcessId,
         [int]$TimeoutSeconds,
         [int]$PollSeconds
     )
@@ -174,7 +174,7 @@ function Wait-GuestProcess {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 
     while ((Get-Date) -lt $deadline) {
-        $processes = @($ProcessManager.ListProcessesInGuest($VMView.MoRef, $GuestAuth, @($Pid)))
+        $processes = @($ProcessManager.ListProcessesInGuest($VMView.MoRef, $GuestAuth, @($ProcessId)))
         if ($processes.Count -gt 0) {
             $process = $processes[0]
             if ($null -ne $process.EndTime -or $null -ne $process.ExitCode) {
@@ -365,8 +365,8 @@ try {
     $localLogPath = Join-Path $runOutputDirectory 'agent.log'
 
     Write-Step -Message ('Creating guest working directory {0}.' -f $GuestWorkingDirectory)
-    $mkdirPid = New-GuestDirectory -ProcessManager $managers.ProcessManager -VMView $vmView -GuestAuth $guestAuth -DirectoryPath $GuestWorkingDirectory
-    $mkdirResult = Wait-GuestProcess -ProcessManager $managers.ProcessManager -VMView $vmView -GuestAuth $guestAuth -Pid $mkdirPid -TimeoutSeconds 120 -PollSeconds 5
+    $mkdirProcessId = New-GuestDirectory -ProcessManager $managers.ProcessManager -VMView $vmView -GuestAuth $guestAuth -DirectoryPath $GuestWorkingDirectory
+    $mkdirResult = Wait-GuestProcess -ProcessManager $managers.ProcessManager -VMView $vmView -GuestAuth $guestAuth -ProcessId $mkdirProcessId -TimeoutSeconds 120 -PollSeconds 5
     if (-not $mkdirResult.Completed -or $mkdirResult.ExitCode -ne 0) {
         throw ('Failed to create guest working directory. Completed={0}; ExitCode={1}' -f $mkdirResult.Completed, $mkdirResult.ExitCode)
     }
@@ -374,10 +374,10 @@ try {
     Send-GuestFile -FileManager $managers.FileManager -VMView $vmView -GuestAuth $guestAuth -HostName $hostName -CurlPath $curlPath -LocalPath $AgentPath -GuestPath $guestAgentPath
 
     Write-Step -Message 'Starting guest WUA agent.'
-    $agentPid = Start-GuestAgent -ProcessManager $managers.ProcessManager -VMView $vmView -GuestAuth $guestAuth -GuestAgentPath $guestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SearchOnly:$SearchOnly
-    Write-Step -Message ('Guest agent PID: {0}' -f $agentPid)
+    $agentProcessId = Start-GuestAgent -ProcessManager $managers.ProcessManager -VMView $vmView -GuestAuth $guestAuth -GuestAgentPath $guestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SearchOnly:$SearchOnly
+    Write-Step -Message ('Guest agent PID: {0}' -f $agentProcessId)
 
-    $agentResult = Wait-GuestProcess -ProcessManager $managers.ProcessManager -VMView $vmView -GuestAuth $guestAuth -Pid $agentPid -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds
+    $agentResult = Wait-GuestProcess -ProcessManager $managers.ProcessManager -VMView $vmView -GuestAuth $guestAuth -ProcessId $agentProcessId -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds
     Write-Step -Message ('Guest agent process completed={0}, exitCode={1}.' -f $agentResult.Completed, $agentResult.ExitCode)
 
     $artifactErrors = @()

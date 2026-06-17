@@ -112,6 +112,32 @@ function Assert-NoForbiddenCommand {
     }
 }
 
+function Assert-NoReservedVariableName {
+    param(
+        [System.Management.Automation.Language.Ast]$Ast,
+        [string]$RelativePath,
+        [string[]]$ReservedNames
+    )
+
+    if (-not $Ast) {
+        return
+    }
+
+    $variableAsts = $Ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.VariableExpressionAst]
+    }, $true)
+
+    foreach ($variableAst in $variableAsts) {
+        $variableName = $variableAst.VariablePath.UserPath
+        foreach ($reservedName in $ReservedNames) {
+            if ($variableName -ieq $reservedName) {
+                Add-Failure -Message ("Reserved automatic variable name in {0} at line {1}: {2}" -f $RelativePath, $variableAst.Extent.StartLineNumber, $variableName)
+            }
+        }
+    }
+}
+
 $agentPath = 'guest\Run-LocalPatch.ps1'
 $orchestratorPath = 'scripts\Invoke-GuestOpsPatchValidation.ps1'
 $launcherPath = 'Start-PatchingGuestOps.ps1'
@@ -132,11 +158,16 @@ $forbiddenCommands = @(
     'Copy-VMGuestFile'
 )
 
+$reservedVariableNames = @(
+    'PID'
+)
+
 if ($existingScripts.ContainsKey($agentPath)) {
     $agentAst = Get-ScriptAst -RelativePath $agentPath -Path $existingScripts[$agentPath]
     $agentText = Get-ScriptText -Path $existingScripts[$agentPath]
 
     Assert-NoForbiddenCommand -Ast $agentAst -RelativePath $agentPath -ForbiddenNames $forbiddenCommands
+    Assert-NoReservedVariableName -Ast $agentAst -RelativePath $agentPath -ReservedNames $reservedVariableNames
     Assert-TextDoesNotMatch -RelativePath $agentPath -Text $agentText -Pattern '(?i)ForEach-Object\s+-Parallel' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Microsoft.Update.Session'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'CreateUpdateSearcher'
@@ -151,6 +182,7 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     $orchestratorText = Get-ScriptText -Path $existingScripts[$orchestratorPath]
 
     Assert-NoForbiddenCommand -Ast $orchestratorAst -RelativePath $orchestratorPath -ForbiddenNames $forbiddenCommands
+    Assert-NoReservedVariableName -Ast $orchestratorAst -RelativePath $orchestratorPath -ReservedNames $reservedVariableNames
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?i)ForEach-Object\s+-Parallel' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'StartProgramInGuest'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'ListProcessesInGuest'
@@ -164,6 +196,7 @@ if ($existingScripts.ContainsKey($launcherPath)) {
     $launcherText = Get-ScriptText -Path $existingScripts[$launcherPath]
 
     Assert-NoForbiddenCommand -Ast $launcherAst -RelativePath $launcherPath -ForbiddenNames $forbiddenCommands
+    Assert-NoReservedVariableName -Ast $launcherAst -RelativePath $launcherPath -ReservedNames $reservedVariableNames
     Assert-TextDoesNotMatch -RelativePath $launcherPath -Text $launcherText -Pattern '(?i)ForEach-Object\s+-Parallel' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Invoke-StaticChecks.ps1'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Invoke-GuestOpsPatchValidation.ps1'
