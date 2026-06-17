@@ -114,9 +114,10 @@ function Assert-NoForbiddenCommand {
 
 $agentPath = 'guest\Run-LocalPatch.ps1'
 $orchestratorPath = 'scripts\Invoke-GuestOpsPatchValidation.ps1'
+$launcherPath = 'Start-PatchingGuestOps.ps1'
 
 $existingScripts = @{}
-foreach ($relativePath in @($agentPath, $orchestratorPath)) {
+foreach ($relativePath in @($agentPath, $orchestratorPath, $launcherPath)) {
     $path = Assert-FileExists -RelativePath $relativePath
     if ($path) {
         $existingScripts[$relativePath] = $path
@@ -156,6 +157,18 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'InitiateFileTransferToGuest'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'InitiateFileTransferFromGuest'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'curl.exe'
+}
+
+if ($existingScripts.ContainsKey($launcherPath)) {
+    $launcherAst = Get-ScriptAst -RelativePath $launcherPath -Path $existingScripts[$launcherPath]
+    $launcherText = Get-ScriptText -Path $existingScripts[$launcherPath]
+
+    Assert-NoForbiddenCommand -Ast $launcherAst -RelativePath $launcherPath -ForbiddenNames $forbiddenCommands
+    Assert-TextDoesNotMatch -RelativePath $launcherPath -Text $launcherText -Pattern '(?i)ForEach-Object\s+-Parallel' -Reason 'PowerShell 7 parallelism is out of scope'
+    Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Invoke-StaticChecks.ps1'
+    Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Invoke-GuestOpsPatchValidation.ps1'
+    Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Get-Credential'
+    Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle '$PSScriptRoot'
 }
 
 if ($failures.Count -gt 0) {
