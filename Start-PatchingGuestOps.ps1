@@ -5,6 +5,7 @@ param(
     [pscredential]$VIServerCredential,
     [pscredential]$GuestCredential,
     [int]$MaxUpdates = 1,
+    [string]$InstallSelection,
     [int]$TimeoutMinutes = 180,
     [int]$PollSeconds = 15,
     [string]$GuestWorkingDirectory = 'C:\ProgramData\PatchingGuestOps',
@@ -92,6 +93,10 @@ $orchestratorParams = @{
     MaxUpdates = $MaxUpdates
     TimeoutMinutes = $TimeoutMinutes
     PollSeconds = $PollSeconds
+}
+
+if (-not [string]::IsNullOrWhiteSpace($InstallSelection)) {
+    $orchestratorParams.InstallSelection = $InstallSelection
 }
 
 if ($SearchOnly) {

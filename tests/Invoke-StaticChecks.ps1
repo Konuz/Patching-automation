@@ -176,6 +176,7 @@ if ($existingScripts.ContainsKey($agentPath)) {
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'ConvertTo-Json'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Test-PendingReboot'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Get-OptionalPropertyValue'
+    Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'SelectedUpdateIndexes'
     Assert-TextDoesNotMatch -RelativePath $agentPath -Text $agentText -Pattern '(?i)\$[a-z_][a-z0-9_]*\.HResult\b' -Reason 'WUA COM HResult can be absent under StrictMode'
 }
 
@@ -193,6 +194,12 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'curl.exe'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Agent errors:'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Pending reboot checks:'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'InstallSelection'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Resolve-UpdateSelection'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Read-UpdateSelection'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Available updates'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'A for all'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SelectedUpdateIndexes'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?i)\$kbArticleIds\.Count\b' -Reason 'ConvertFrom-Json can collapse one KB article id to a scalar under StrictMode'
 }
 
@@ -206,6 +213,7 @@ if ($existingScripts.ContainsKey($launcherPath)) {
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Invoke-StaticChecks.ps1'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Invoke-GuestOpsPatchValidation.ps1'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Get-Credential'
+    Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'InstallSelection'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle '$PSScriptRoot'
 }
 

@@ -2,6 +2,7 @@
 param(
     [string]$WorkingDirectory = 'C:\ProgramData\PatchingGuestOps',
     [int]$MaxUpdates = 1,
+    [int[]]$SelectedUpdateIndexes = @(),
     [switch]$SearchOnly,
     [string]$SearchCriteria = "IsInstalled=0 and IsHidden=0 and Type='Software'"
 )
@@ -258,6 +259,7 @@ $status = [ordered]@{
     workingDirectory = $WorkingDirectory
     searchCriteria = $SearchCriteria
     maxUpdates = $MaxUpdates
+    selectedUpdateIndexes = @($SelectedUpdateIndexes)
     searchOnly = [bool]$SearchOnly
     services = @()
     systemDriveFreeGB = $null
@@ -328,6 +330,22 @@ try {
     else {
         $selectedUpdates = New-Object -ComObject Microsoft.Update.UpdateColl
         $selectedSearchIndexes = @()
+        $selectedIndexLookup = @{}
+        foreach ($selectedUpdateIndex in @($SelectedUpdateIndexes)) {
+            if ($selectedUpdateIndex -lt 0) {
+                throw ('SelectedUpdateIndexes contains a negative index: {0}' -f $selectedUpdateIndex)
+            }
+
+            $selectedIndexLookup[[int]$selectedUpdateIndex] = $true
+        }
+
+        foreach ($selectedUpdateIndex in @($selectedIndexLookup.Keys)) {
+            if ([int]$selectedUpdateIndex -ge [int]$searchResult.Updates.Count) {
+                throw ('SelectedUpdateIndexes contains an out-of-range index: {0}. Available index range: 0..{1}' -f $selectedUpdateIndex, ([int]$searchResult.Updates.Count - 1))
+            }
+        }
+
+        $hasExplicitSelection = ($selectedIndexLookup.Count -gt 0)
         $selectionLimit = [Math]::Min($MaxUpdates, [int]$searchResult.Updates.Count)
 
         for ($i = 0; $i -lt $searchResult.Updates.Count; $i++) {
@@ -335,7 +353,8 @@ try {
             $record = New-UpdateRecord -Update $update -Index $i
             $status.updates += $record
 
-            if ($selectedUpdates.Count -lt $selectionLimit) {
+            $shouldSelectUpdate = if ($hasExplicitSelection) { $selectedIndexLookup.ContainsKey($i) } else { $selectedUpdates.Count -lt $selectionLimit }
+            if ($shouldSelectUpdate) {
                 try {
                     if (-not $update.EulaAccepted) {
                         $update.AcceptEula()

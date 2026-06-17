@@ -18,6 +18,8 @@ param(
 
     [int]$MaxUpdates = 1,
 
+    [string]$InstallSelection,
+
     [switch]$SearchOnly,
 
     [int]$TimeoutMinutes = 180,
@@ -265,6 +267,7 @@ function Start-GuestAgent {
         [string]$GuestAgentPath,
         [string]$GuestWorkingDirectory,
         [int]$MaxUpdates,
+        [int[]]$SelectedUpdateIndexes = @(),
         [switch]$SearchOnly
     )
 
@@ -282,6 +285,13 @@ function Start-GuestAgent {
 
     if ($SearchOnly) {
         $arguments += '-SearchOnly'
+    }
+
+    if (@($SelectedUpdateIndexes).Count -gt 0) {
+        $arguments += '-SelectedUpdateIndexes'
+        foreach ($selectedUpdateIndex in @($SelectedUpdateIndexes)) {
+            $arguments += ([string]$selectedUpdateIndex)
+        }
     }
 
     $programSpec = New-Object VMware.Vim.GuestProgramSpec
@@ -319,6 +329,161 @@ function Get-ObjectPropertyValue {
     }
 
     return $current
+}
+
+function Get-KbArticleText {
+    param($Update)
+
+    $kbArticleIds = Get-ObjectPropertyValue -InputObject $Update -Path @('kbArticleIds')
+    $kbArticleIdList = @(@($kbArticleIds) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($kbArticleIdList.Count -eq 0) {
+        return $null
+    }
+
+    return ($kbArticleIdList -join ',')
+}
+
+function Show-AvailableUpdates {
+    param($Updates)
+
+    Write-Host ''
+    Write-Host 'Available updates'
+    Write-Host '-----------------'
+
+    foreach ($update in @($Updates)) {
+        $updateIndex = [int](Get-ObjectPropertyValue -InputObject $update -Path @('index') -DefaultValue 0)
+        $displayNumber = $updateIndex + 1
+        Write-Host ('{0}. {1}' -f $displayNumber, (Get-ObjectPropertyValue -InputObject $update -Path @('title')))
+
+        $kbText = Get-KbArticleText -Update $update
+        if (-not [string]::IsNullOrWhiteSpace($kbText)) {
+            Write-Host ('   KB: {0}' -f $kbText)
+        }
+    }
+}
+
+function Resolve-UpdateSelection {
+    param(
+        [string]$Selection,
+        $Updates
+    )
+
+    $updateList = @($Updates)
+    if ($updateList.Count -eq 0) {
+        return @()
+    }
+
+    $selectionText = ([string]$Selection).Trim()
+    if ([string]::IsNullOrWhiteSpace($selectionText)) {
+        throw 'Select at least one update.'
+    }
+
+    if ($selectionText -ieq 'A' -or $selectionText -ieq 'All') {
+        return @(0..($updateList.Count - 1))
+    }
+
+    $selectedIndexes = New-Object System.Collections.Generic.List[int]
+    $seenIndexes = @{}
+    foreach ($part in @($selectionText -split '[,\s]+')) {
+        if ([string]::IsNullOrWhiteSpace($part)) {
+            continue
+        }
+
+        $displayNumber = 0
+        if (-not [int]::TryParse($part, [ref]$displayNumber)) {
+            throw ('Invalid update selection: {0}' -f $part)
+        }
+
+        if ($displayNumber -lt 1 -or $displayNumber -gt $updateList.Count) {
+            throw ('Update selection {0} is outside the range 1..{1}.' -f $displayNumber, $updateList.Count)
+        }
+
+        $selectedIndex = $displayNumber - 1
+        if (-not $seenIndexes.ContainsKey($selectedIndex)) {
+            $seenIndexes[$selectedIndex] = $true
+            [void]$selectedIndexes.Add($selectedIndex)
+        }
+    }
+
+    if ($selectedIndexes.Count -eq 0) {
+        throw 'Select at least one update.'
+    }
+
+    return @($selectedIndexes)
+}
+
+function Read-UpdateSelection {
+    param($Updates)
+
+    while ($true) {
+        $selection = Read-Host 'Select updates to install (for example 1,2,3 or A for all)'
+        try {
+            return Resolve-UpdateSelection -Selection $selection -Updates $Updates
+        }
+        catch {
+            Write-Warning $_.Exception.Message
+        }
+    }
+}
+
+function Invoke-GuestAgentRun {
+    param(
+        $ProcessManager,
+        $FileManager,
+        $VMView,
+        $GuestAuth,
+        [string]$HostName,
+        [string]$CurlPath,
+        [string]$GuestAgentPath,
+        [string]$GuestWorkingDirectory,
+        [string]$GuestStatusPath,
+        [string]$GuestLogPath,
+        [string]$LocalStatusPath,
+        [string]$LocalLogPath,
+        [int]$MaxUpdates,
+        [int[]]$SelectedUpdateIndexes = @(),
+        [switch]$SearchOnly,
+        [int]$TimeoutSeconds,
+        [int]$PollSeconds,
+        [string]$Description
+    )
+
+    Write-Step -Message $Description
+    $agentProcessId = Start-GuestAgent -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateIndexes $SelectedUpdateIndexes -SearchOnly:$SearchOnly
+    Write-Step -Message ('Guest agent PID: {0}' -f $agentProcessId)
+
+    $agentResult = Wait-GuestProcess -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -ProcessId $agentProcessId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
+    Write-Step -Message ('Guest agent process completed={0}, exitCode={1}.' -f $agentResult.Completed, $agentResult.ExitCode)
+
+    $artifactErrors = @()
+    try {
+        Receive-GuestFile -FileManager $FileManager -VMView $VMView -GuestAuth $GuestAuth -HostName $HostName -CurlPath $CurlPath -GuestPath $GuestStatusPath -LocalPath $LocalStatusPath
+    }
+    catch {
+        $artifactErrors += ('status.json download failed: {0}' -f $_.Exception.Message)
+    }
+
+    try {
+        Receive-GuestFile -FileManager $FileManager -VMView $VMView -GuestAuth $GuestAuth -HostName $HostName -CurlPath $CurlPath -GuestPath $GuestLogPath -LocalPath $LocalLogPath
+    }
+    catch {
+        $artifactErrors += ('agent.log download failed: {0}' -f $_.Exception.Message)
+    }
+
+    if ($artifactErrors.Count -gt 0) {
+        foreach ($artifactError in $artifactErrors) {
+            Write-Warning $artifactError
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $LocalStatusPath -PathType Leaf)) {
+        throw ('status.json was not downloaded. Output directory: {0}' -f (Split-Path -Parent $LocalStatusPath))
+    }
+
+    return [pscustomobject]@{
+        AgentResult = $agentResult
+        Status = Get-Content -LiteralPath $LocalStatusPath -Raw | ConvertFrom-Json
+    }
 }
 
 if (-not $VIServerCredential) {
@@ -373,39 +538,62 @@ try {
 
     Send-GuestFile -FileManager $managers.FileManager -VMView $vmView -GuestAuth $guestAuth -HostName $hostName -CurlPath $curlPath -LocalPath $AgentPath -GuestPath $guestAgentPath
 
-    Write-Step -Message 'Starting guest WUA agent.'
-    $agentProcessId = Start-GuestAgent -ProcessManager $managers.ProcessManager -VMView $vmView -GuestAuth $guestAuth -GuestAgentPath $guestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SearchOnly:$SearchOnly
-    Write-Step -Message ('Guest agent PID: {0}' -f $agentProcessId)
-
-    $agentResult = Wait-GuestProcess -ProcessManager $managers.ProcessManager -VMView $vmView -GuestAuth $guestAuth -ProcessId $agentProcessId -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds
-    Write-Step -Message ('Guest agent process completed={0}, exitCode={1}.' -f $agentResult.Completed, $agentResult.ExitCode)
-
-    $artifactErrors = @()
-    try {
-        Receive-GuestFile -FileManager $managers.FileManager -VMView $vmView -GuestAuth $guestAuth -HostName $hostName -CurlPath $curlPath -GuestPath $guestStatusPath -LocalPath $localStatusPath
-    }
-    catch {
-        $artifactErrors += ('status.json download failed: {0}' -f $_.Exception.Message)
-    }
-
-    try {
-        Receive-GuestFile -FileManager $managers.FileManager -VMView $vmView -GuestAuth $guestAuth -HostName $hostName -CurlPath $curlPath -GuestPath $guestLogPath -LocalPath $localLogPath
-    }
-    catch {
-        $artifactErrors += ('agent.log download failed: {0}' -f $_.Exception.Message)
+    $agentRunParams = @{
+        ProcessManager = $managers.ProcessManager
+        FileManager = $managers.FileManager
+        VMView = $vmView
+        GuestAuth = $guestAuth
+        HostName = $hostName
+        CurlPath = $curlPath
+        GuestAgentPath = $guestAgentPath
+        GuestWorkingDirectory = $GuestWorkingDirectory
+        GuestStatusPath = $guestStatusPath
+        GuestLogPath = $guestLogPath
+        LocalStatusPath = $localStatusPath
+        LocalLogPath = $localLogPath
+        TimeoutSeconds = ($TimeoutMinutes * 60)
+        PollSeconds = $PollSeconds
     }
 
-    if ($artifactErrors.Count -gt 0) {
-        foreach ($artifactError in $artifactErrors) {
-            Write-Warning $artifactError
+    if ($SearchOnly) {
+        $agentRun = Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SearchOnly -Description 'Starting guest WUA search.'
+        $agentResult = $agentRun.AgentResult
+        $status = $agentRun.Status
+    }
+    else {
+        $searchRun = Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SearchOnly -Description 'Starting guest WUA search.'
+        $searchStatus = $searchRun.Status
+        $searchOutcome = Get-ObjectPropertyValue -InputObject $searchStatus -Path @('outcome')
+        $searchAvailableUpdateCount = [int](Get-ObjectPropertyValue -InputObject $searchStatus -Path @('availableUpdateCount') -DefaultValue 0)
+
+        if ($searchOutcome -ne 'SearchOnly' -or $searchAvailableUpdateCount -eq 0) {
+            $agentResult = $searchRun.AgentResult
+            $status = $searchStatus
+        }
+        else {
+            $availableUpdates = Get-ObjectPropertyValue -InputObject $searchStatus -Path @('updates')
+            if ($null -eq $availableUpdates) {
+                $availableUpdates = @()
+            }
+
+            Show-AvailableUpdates -Updates $availableUpdates
+
+            if ([string]::IsNullOrWhiteSpace($InstallSelection)) {
+                $selectedUpdateIndexes = Read-UpdateSelection -Updates $availableUpdates
+            }
+            else {
+                $selectedUpdateIndexes = Resolve-UpdateSelection -Selection $InstallSelection -Updates $availableUpdates
+            }
+
+            $selectedDisplayNumbers = @($selectedUpdateIndexes | ForEach-Object { [string]($_ + 1) })
+            Write-Step -Message ('Selected update number(s): {0}' -f ($selectedDisplayNumbers -join ','))
+
+            $installRun = Invoke-GuestAgentRun @agentRunParams -MaxUpdates @($selectedUpdateIndexes).Count -SelectedUpdateIndexes $selectedUpdateIndexes -Description 'Starting guest WUA install.'
+            $agentResult = $installRun.AgentResult
+            $status = $installRun.Status
         }
     }
 
-    if (-not (Test-Path -LiteralPath $localStatusPath -PathType Leaf)) {
-        throw ('status.json was not downloaded. Output directory: {0}' -f $runOutputDirectory)
-    }
-
-    $status = Get-Content -LiteralPath $localStatusPath -Raw | ConvertFrom-Json
     $outcome = Get-ObjectPropertyValue -InputObject $status -Path @('outcome')
     $isElevated = Get-ObjectPropertyValue -InputObject $status -Path @('isElevated')
     $availableUpdateCount = Get-ObjectPropertyValue -InputObject $status -Path @('availableUpdateCount')
