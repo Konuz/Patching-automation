@@ -477,8 +477,9 @@ try {
             if (Get-ObjectPropertyValue -InputObject $update -Path @('selected') -DefaultValue $false) {
                 Write-Host ('Selected update: {0}' -f (Get-ObjectPropertyValue -InputObject $update -Path @('title')))
                 $kbArticleIds = Get-ObjectPropertyValue -InputObject $update -Path @('kbArticleIds')
-                if ($kbArticleIds -and $kbArticleIds.Count -gt 0) {
-                    Write-Host ('KB: {0}' -f (@($kbArticleIds) -join ','))
+                $kbArticleIdList = @(@($kbArticleIds) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+                if ($kbArticleIdList.Count -gt 0) {
+                    Write-Host ('KB: {0}' -f ($kbArticleIdList -join ','))
                 }
 
                 $installResult = Get-ObjectPropertyValue -InputObject $update -Path @('installResult')
