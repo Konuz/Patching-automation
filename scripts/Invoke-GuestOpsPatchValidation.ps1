@@ -289,9 +289,7 @@ function Start-GuestAgent {
 
     if (@($SelectedUpdateIndexes).Count -gt 0) {
         $arguments += '-SelectedUpdateIndexes'
-        foreach ($selectedUpdateIndex in @($SelectedUpdateIndexes)) {
-            $arguments += ([string]$selectedUpdateIndex)
-        }
+        $arguments += (@($SelectedUpdateIndexes) -join ',')
     }
 
     $programSpec = New-Object VMware.Vim.GuestProgramSpec

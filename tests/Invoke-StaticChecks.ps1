@@ -200,6 +200,8 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Available updates'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'A for all'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SelectedUpdateIndexes'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "-join ','"
+    Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)foreach\s*\(\$selectedUpdateIndex\s+in\s+@\(\$SelectedUpdateIndexes\)\)\s*\{\s*\$arguments\s*\+=' -Reason 'PowerShell binds separated array values as positional SearchCriteria arguments'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?i)\$kbArticleIds\.Count\b' -Reason 'ConvertFrom-Json can collapse one KB article id to a scalar under StrictMode'
 }
 
