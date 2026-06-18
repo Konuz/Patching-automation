@@ -352,6 +352,22 @@ function Get-KbArticleText {
     return ($kbArticleIdList -join ',')
 }
 
+function Get-RoleFlagText {
+    param($Status)
+
+    $roleFlags = Get-ObjectPropertyValue -InputObject $Status -Path @('roleFlags')
+    if ($null -eq $roleFlags) {
+        return 'unknown'
+    }
+
+    $detected = @(Get-ObjectPropertyValue -InputObject $roleFlags -Path @('detected') | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($detected.Count -eq 0) {
+        return 'none'
+    }
+
+    return ($detected -join ', ')
+}
+
 function Show-AvailableUpdates {
     param($Updates)
 
@@ -574,8 +590,14 @@ try {
         $searchStatus = $searchRun.Status
         $searchOutcome = Get-ObjectPropertyValue -InputObject $searchStatus -Path @('outcome')
         $searchAvailableUpdateCount = [int](Get-ObjectPropertyValue -InputObject $searchStatus -Path @('availableUpdateCount') -DefaultValue 0)
+        $failoverClusterDetected = [bool](Get-ObjectPropertyValue -InputObject $searchStatus -Path @('roleFlags', 'failoverCluster') -DefaultValue $false)
 
-        if ($searchOutcome -ne 'SearchOnly' -or $searchAvailableUpdateCount -eq 0) {
+        if ($failoverClusterDetected) {
+            Write-Warning 'Skipped: Failover Cluster detected. Please update manually one by one.'
+            $agentResult = $searchRun.AgentResult
+            $status = $searchStatus
+        }
+        elseif ($searchOutcome -ne 'SearchOnly' -or $searchAvailableUpdateCount -eq 0) {
             $agentResult = $searchRun.AgentResult
             $status = $searchStatus
         }
@@ -633,6 +655,7 @@ try {
     Write-Host ('Agent elevated: {0}' -f $isElevated)
     Write-Host ('Available updates: {0}' -f $availableUpdateCount)
     Write-Host ('Selected updates: {0}' -f $selectedUpdateCount)
+    Write-Host ('Role flags: {0}' -f (Get-RoleFlagText -Status $status))
     Write-Host ('Pending reboot: {0}' -f $pendingRebootIsPending)
 
     $pendingRebootChecks = Get-ObjectPropertyValue -InputObject $status -Path @('pendingReboot', 'checks')

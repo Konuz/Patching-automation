@@ -160,6 +160,30 @@ function Test-PendingReboot {
     }
 }
 
+function Get-RoleFlags {
+    $failoverCluster = ($null -ne (Get-Service -Name 'ClusSvc' -ErrorAction SilentlyContinue))
+    $sql = (@(Get-Service -Name @('MSSQLSERVER', 'MSSQL$*', 'SQLSERVERAGENT', 'SQLAgent$*') -ErrorAction SilentlyContinue).Count -gt 0)
+    $exchange = (@(Get-Service -Name 'MSExchange*' -ErrorAction SilentlyContinue).Count -gt 0)
+
+    $detected = @()
+    if ($failoverCluster) {
+        $detected += 'Failover Cluster'
+    }
+    if ($sql) {
+        $detected += 'SQL'
+    }
+    if ($exchange) {
+        $detected += 'Exchange'
+    }
+
+    return [ordered]@{
+        failoverCluster = $failoverCluster
+        sql = $sql
+        exchange = $exchange
+        detected = $detected
+    }
+}
+
 function New-UpdateRecord {
     param(
         $Update,
@@ -272,6 +296,7 @@ $status = [ordered]@{
     pendingReboot = $null
     pendingRebootBefore = $null
     pendingRebootAfter = $null
+    roleFlags = $null
     errors = @()
 }
 
@@ -289,6 +314,7 @@ try {
     $status.services = Get-ServiceSnapshot
     $status.systemDriveFreeGB = Get-SystemDriveFreeGB
     $status.pendingRebootBefore = Test-PendingReboot
+    $status.roleFlags = Get-RoleFlags
     Save-Status -Status $status
 
     if (-not $status.isElevated) {
