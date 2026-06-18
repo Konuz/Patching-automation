@@ -2,7 +2,7 @@
 param(
     [string]$WorkingDirectory = 'C:\ProgramData\PatchingGuestOps',
     [int]$MaxUpdates = 1,
-    [int[]]$SelectedUpdateIndexes = @(),
+    [string[]]$SelectedUpdateIds = @(),
     [switch]$SearchOnly,
     [string]$SearchCriteria = "IsInstalled=0 and IsHidden=0 and Type='Software'"
 )
@@ -259,7 +259,7 @@ $status = [ordered]@{
     workingDirectory = $WorkingDirectory
     searchCriteria = $SearchCriteria
     maxUpdates = $MaxUpdates
-    selectedUpdateIndexes = @($SelectedUpdateIndexes)
+    selectedUpdateIds = @($SelectedUpdateIds)
     searchOnly = [bool]$SearchOnly
     services = @()
     systemDriveFreeGB = $null
@@ -330,30 +330,37 @@ try {
     else {
         $selectedUpdates = New-Object -ComObject Microsoft.Update.UpdateColl
         $selectedSearchIndexes = @()
-        $selectedIndexLookup = @{}
-        foreach ($selectedUpdateIndex in @($SelectedUpdateIndexes)) {
-            if ($selectedUpdateIndex -lt 0) {
-                throw ('SelectedUpdateIndexes contains a negative index: {0}' -f $selectedUpdateIndex)
+        $selectedIdLookup = @{}
+        foreach ($selectedUpdateId in @($SelectedUpdateIds)) {
+            if ([string]::IsNullOrWhiteSpace([string]$selectedUpdateId)) {
+                continue
             }
 
-            $selectedIndexLookup[[int]$selectedUpdateIndex] = $true
+            $selectedIdLookup[[string]$selectedUpdateId] = $true
         }
 
-        foreach ($selectedUpdateIndex in @($selectedIndexLookup.Keys)) {
-            if ([int]$selectedUpdateIndex -ge [int]$searchResult.Updates.Count) {
-                throw ('SelectedUpdateIndexes contains an out-of-range index: {0}. Available index range: 0..{1}' -f $selectedUpdateIndex, ([int]$searchResult.Updates.Count - 1))
-            }
-        }
-
-        $hasExplicitSelection = ($selectedIndexLookup.Count -gt 0)
+        $hasExplicitSelection = ($selectedIdLookup.Count -gt 0)
         $selectionLimit = [Math]::Min($MaxUpdates, [int]$searchResult.Updates.Count)
+        $seenSelectedIds = @{}
 
         for ($i = 0; $i -lt $searchResult.Updates.Count; $i++) {
             $update = $searchResult.Updates.Item($i)
             $record = New-UpdateRecord -Update $update -Index $i
             $status.updates += $record
 
-            $shouldSelectUpdate = if ($hasExplicitSelection) { $selectedIndexLookup.ContainsKey($i) } else { $selectedUpdates.Count -lt $selectionLimit }
+            if ($hasExplicitSelection) {
+                # Select by stable update identity, not by position: the install pass
+                # runs a fresh WUA search whose ordering is not guaranteed to match the
+                # search pass the operator chose from.
+                $shouldSelectUpdate = ($null -ne $record.updateId -and $selectedIdLookup.ContainsKey([string]$record.updateId))
+                if ($shouldSelectUpdate) {
+                    $seenSelectedIds[[string]$record.updateId] = $true
+                }
+            }
+            else {
+                $shouldSelectUpdate = ($selectedUpdates.Count -lt $selectionLimit)
+            }
+
             if ($shouldSelectUpdate) {
                 try {
                     if (-not $update.EulaAccepted) {
@@ -366,6 +373,8 @@ try {
                     $record.eulaAccepted = [bool]$update.EulaAccepted
                 }
                 catch {
+                    # Record the per-update failure but keep going so one bad EULA does
+                    # not discard the rest of an otherwise valid batch.
                     $record.errors += [ordered]@{
                         stage = 'AcceptEulaOrSelect'
                         message = $_.Exception.Message
@@ -377,8 +386,15 @@ try {
                         updateId = $record.updateId
                         message = $_.Exception.Message
                     }
-                    throw
+                    $record.selected = $false
                 }
+            }
+        }
+
+        if ($hasExplicitSelection) {
+            $missingUpdateIds = @(@($selectedIdLookup.Keys) | Where-Object { -not $seenSelectedIds.ContainsKey([string]$_) })
+            if ($missingUpdateIds.Count -gt 0) {
+                throw ('Selected update id(s) not present in the current search result (search/selection drift): {0}' -f ($missingUpdateIds -join ', '))
             }
         }
 
@@ -458,7 +474,7 @@ try {
         }
     }
 
-    Write-AgentLog -Message ('Install completed with outcome {0}.' -f $status.outcome)
+    Write-AgentLog -Message ('Agent run completed with outcome {0}.' -f $status.outcome)
 }
 catch {
     $status.outcome = 'Failed'

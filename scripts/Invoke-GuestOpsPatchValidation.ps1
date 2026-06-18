@@ -139,7 +139,18 @@ function Invoke-Curl {
     )
 
     Write-Step -Message $Description
-    $output = & $CurlPath @Arguments 2>&1
+    # curl reports failures on stderr; under $ErrorActionPreference='Stop' a native
+    # stderr write captured via 2>&1 is promoted to a terminating error before we can
+    # inspect $LASTEXITCODE, which would bypass the descriptive throw below. Relax it
+    # only around the call and rely on the exit code.
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $CurlPath @Arguments 2>&1
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
     $exitCode = $LASTEXITCODE
 
     if ($exitCode -ne 0) {
@@ -267,7 +278,7 @@ function Start-GuestAgent {
         [string]$GuestAgentPath,
         [string]$GuestWorkingDirectory,
         [int]$MaxUpdates,
-        [int[]]$SelectedUpdateIndexes = @(),
+        [string[]]$SelectedUpdateIds = @(),
         [switch]$SearchOnly
     )
 
@@ -287,9 +298,9 @@ function Start-GuestAgent {
         $arguments += '-SearchOnly'
     }
 
-    if (@($SelectedUpdateIndexes).Count -gt 0) {
-        $arguments += '-SelectedUpdateIndexes'
-        $arguments += (@($SelectedUpdateIndexes) -join ',')
+    if (@($SelectedUpdateIds).Count -gt 0) {
+        $arguments += '-SelectedUpdateIds'
+        $arguments += (@($SelectedUpdateIds) -join ',')
     }
 
     $programSpec = New-Object VMware.Vim.GuestProgramSpec
@@ -439,7 +450,7 @@ function Invoke-GuestAgentRun {
         [string]$LocalStatusPath,
         [string]$LocalLogPath,
         [int]$MaxUpdates,
-        [int[]]$SelectedUpdateIndexes = @(),
+        [string[]]$SelectedUpdateIds = @(),
         [switch]$SearchOnly,
         [int]$TimeoutSeconds,
         [int]$PollSeconds,
@@ -447,7 +458,7 @@ function Invoke-GuestAgentRun {
     )
 
     Write-Step -Message $Description
-    $agentProcessId = Start-GuestAgent -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateIndexes $SelectedUpdateIndexes -SearchOnly:$SearchOnly
+    $agentProcessId = Start-GuestAgent -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateIds $SelectedUpdateIds -SearchOnly:$SearchOnly
     Write-Step -Message ('Guest agent PID: {0}' -f $agentProcessId)
 
     $agentResult = Wait-GuestProcess -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -ProcessId $agentProcessId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
@@ -530,7 +541,7 @@ try {
     Write-Step -Message ('Creating guest working directory {0}.' -f $GuestWorkingDirectory)
     $mkdirProcessId = New-GuestDirectory -ProcessManager $managers.ProcessManager -VMView $vmView -GuestAuth $guestAuth -DirectoryPath $GuestWorkingDirectory
     $mkdirResult = Wait-GuestProcess -ProcessManager $managers.ProcessManager -VMView $vmView -GuestAuth $guestAuth -ProcessId $mkdirProcessId -TimeoutSeconds 120 -PollSeconds 5
-    if (-not $mkdirResult.Completed -or $mkdirResult.ExitCode -ne 0) {
+    if (-not $mkdirResult.Completed -or ($null -ne $mkdirResult.ExitCode -and $mkdirResult.ExitCode -ne 0)) {
         throw ('Failed to create guest working directory. Completed={0}; ExitCode={1}' -f $mkdirResult.Completed, $mkdirResult.ExitCode)
     }
 
@@ -586,7 +597,21 @@ try {
             $selectedDisplayNumbers = @($selectedUpdateIndexes | ForEach-Object { [string]($_ + 1) })
             Write-Step -Message ('Selected update number(s): {0}' -f ($selectedDisplayNumbers -join ','))
 
-            $installRun = Invoke-GuestAgentRun @agentRunParams -MaxUpdates @($selectedUpdateIndexes).Count -SelectedUpdateIndexes $selectedUpdateIndexes -Description 'Starting guest WUA install.'
+            # Translate the operator's positional choices into stable UpdateIDs so the
+            # install pass selects by identity, immune to WUA re-ordering between passes.
+            $availableUpdateList = @($availableUpdates)
+            $selectedUpdateIds = @()
+            foreach ($selectedUpdateIndex in @($selectedUpdateIndexes)) {
+                $selectedUpdate = $availableUpdateList[$selectedUpdateIndex]
+                $selectedUpdateId = Get-ObjectPropertyValue -InputObject $selectedUpdate -Path @('updateId')
+                if ([string]::IsNullOrWhiteSpace([string]$selectedUpdateId)) {
+                    throw ('Selected update number {0} has no updateId and cannot be installed reliably.' -f ($selectedUpdateIndex + 1))
+                }
+
+                $selectedUpdateIds += [string]$selectedUpdateId
+            }
+
+            $installRun = Invoke-GuestAgentRun @agentRunParams -MaxUpdates @($selectedUpdateIds).Count -SelectedUpdateIds $selectedUpdateIds -Description 'Starting guest WUA install.'
             $agentResult = $installRun.AgentResult
             $status = $installRun.Status
         }

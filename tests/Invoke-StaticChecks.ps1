@@ -98,6 +98,9 @@ function Assert-NoForbiddenCommand {
         $node -is [System.Management.Automation.Language.CommandAst]
     }, $true)
 
+    # GetCommandName() resolves only statically-named commands; dynamic dispatch such
+    # as `& $cmd` is invisible here. Assert-NoForbiddenCommandLiteral adds a
+    # defense-in-depth text scan for the forbidden names as string literals.
     foreach ($commandAst in $commandAsts) {
         $commandName = $commandAst.GetCommandName()
         if (-not $commandName) {
@@ -108,6 +111,21 @@ function Assert-NoForbiddenCommand {
             if ($commandName -ieq $forbiddenName) {
                 Add-Failure -Message ("Forbidden command in {0} at line {1}: {2}" -f $RelativePath, $commandAst.Extent.StartLineNumber, $commandName)
             }
+        }
+    }
+}
+
+function Assert-NoForbiddenCommandLiteral {
+    param(
+        [string]$RelativePath,
+        [string]$Text,
+        [string[]]$ForbiddenNames
+    )
+
+    foreach ($forbiddenName in $ForbiddenNames) {
+        $pattern = '(?i)["'']{0}["'']' -f [regex]::Escape($forbiddenName)
+        if ($Text -match $pattern) {
+            Add-Failure -Message ("Forbidden command name as a string literal in {0} (possible dynamic dispatch): {1}" -f $RelativePath, $forbiddenName)
         }
     }
 }
@@ -130,6 +148,9 @@ function Assert-NoReservedVariableName {
 
     foreach ($variableAst in $variableAsts) {
         $variableName = $variableAst.VariablePath.UserPath
+        if ($variableName -match ':') {
+            $variableName = $variableName.Split(':')[-1]
+        }
         foreach ($reservedName in $ReservedNames) {
             if ($variableName -ieq $reservedName) {
                 Add-Failure -Message ("Reserved automatic variable name in {0} at line {1}: {2}" -f $RelativePath, $variableAst.Extent.StartLineNumber, $variableName)
@@ -167,8 +188,9 @@ if ($existingScripts.ContainsKey($agentPath)) {
     $agentText = Get-ScriptText -Path $existingScripts[$agentPath]
 
     Assert-NoForbiddenCommand -Ast $agentAst -RelativePath $agentPath -ForbiddenNames $forbiddenCommands
+    Assert-NoForbiddenCommandLiteral -RelativePath $agentPath -Text $agentText -ForbiddenNames $forbiddenCommands
     Assert-NoReservedVariableName -Ast $agentAst -RelativePath $agentPath -ReservedNames $reservedVariableNames
-    Assert-TextDoesNotMatch -RelativePath $agentPath -Text $agentText -Pattern '(?i)ForEach-Object\s+-Parallel' -Reason 'PowerShell 7 parallelism is out of scope'
+    Assert-TextDoesNotMatch -RelativePath $agentPath -Text $agentText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Microsoft.Update.Session'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'CreateUpdateSearcher'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'CreateUpdateDownloader'
@@ -176,7 +198,7 @@ if ($existingScripts.ContainsKey($agentPath)) {
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'ConvertTo-Json'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Test-PendingReboot'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Get-OptionalPropertyValue'
-    Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'SelectedUpdateIndexes'
+    Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'SelectedUpdateIds'
     Assert-TextDoesNotMatch -RelativePath $agentPath -Text $agentText -Pattern '(?i)\$[a-z_][a-z0-9_]*\.HResult\b' -Reason 'WUA COM HResult can be absent under StrictMode'
 }
 
@@ -185,8 +207,9 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     $orchestratorText = Get-ScriptText -Path $existingScripts[$orchestratorPath]
 
     Assert-NoForbiddenCommand -Ast $orchestratorAst -RelativePath $orchestratorPath -ForbiddenNames $forbiddenCommands
+    Assert-NoForbiddenCommandLiteral -RelativePath $orchestratorPath -Text $orchestratorText -ForbiddenNames $forbiddenCommands
     Assert-NoReservedVariableName -Ast $orchestratorAst -RelativePath $orchestratorPath -ReservedNames $reservedVariableNames
-    Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?i)ForEach-Object\s+-Parallel' -Reason 'PowerShell 7 parallelism is out of scope'
+    Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'StartProgramInGuest'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'ListProcessesInGuest'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'InitiateFileTransferToGuest'
@@ -199,9 +222,9 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Read-UpdateSelection'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Available updates'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'A for all'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SelectedUpdateIndexes'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "-join ','"
-    Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)foreach\s*\(\$selectedUpdateIndex\s+in\s+@\(\$SelectedUpdateIndexes\)\)\s*\{\s*\$arguments\s*\+=' -Reason 'PowerShell binds separated array values as positional SearchCriteria arguments'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SelectedUpdateIds'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "@(`$SelectedUpdateIds) -join ','"
+    Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern "(?i)'-SelectedUpdateIds'\s+(foreach|for)\b" -Reason 'SelectedUpdateIds must be one joined argument, not appended per element (PowerShell would bind them as positional SearchCriteria)'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?i)\$kbArticleIds\.Count\b' -Reason 'ConvertFrom-Json can collapse one KB article id to a scalar under StrictMode'
 }
 
@@ -210,8 +233,9 @@ if ($existingScripts.ContainsKey($launcherPath)) {
     $launcherText = Get-ScriptText -Path $existingScripts[$launcherPath]
 
     Assert-NoForbiddenCommand -Ast $launcherAst -RelativePath $launcherPath -ForbiddenNames $forbiddenCommands
+    Assert-NoForbiddenCommandLiteral -RelativePath $launcherPath -Text $launcherText -ForbiddenNames $forbiddenCommands
     Assert-NoReservedVariableName -Ast $launcherAst -RelativePath $launcherPath -ReservedNames $reservedVariableNames
-    Assert-TextDoesNotMatch -RelativePath $launcherPath -Text $launcherText -Pattern '(?i)ForEach-Object\s+-Parallel' -Reason 'PowerShell 7 parallelism is out of scope'
+    Assert-TextDoesNotMatch -RelativePath $launcherPath -Text $launcherText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Invoke-StaticChecks.ps1'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Invoke-GuestOpsPatchValidation.ps1'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Get-Credential'
