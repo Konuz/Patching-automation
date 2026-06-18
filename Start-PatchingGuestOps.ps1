@@ -2,15 +2,21 @@
 param(
     [string]$VIServer,
     [string]$VMName,
+    [string[]]$VMNames,
+    [string]$VMListPath,
     [pscredential]$VIServerCredential,
     [pscredential]$GuestCredential,
     [int]$MaxUpdates = 1,
     [string]$InstallSelection,
+    [string[]]$SelectedUpdateKeys,
+    [int]$ThrottleLimit = 3,
     [int]$TimeoutMinutes = 180,
     [int]$PollSeconds = 15,
     [string]$GuestWorkingDirectory = 'C:\ProgramData\PatchingGuestOps',
     [string]$LocalOutputDirectory,
     [switch]$SearchOnly,
+    [switch]$PlanOnly,
+    [switch]$SkipConfirmation,
     [switch]$IgnoreVCenterCertificate,
     [switch]$KeepConnected,
     [switch]$SkipStaticChecks
@@ -50,6 +56,56 @@ function Read-RequiredValue {
     return $value
 }
 
+function Resolve-VMTargetNames {
+    param(
+        [string]$SingleVMName,
+        [string[]]$ManyVMNames,
+        [string]$ListPath
+    )
+
+    $targets = @()
+
+    if (-not [string]::IsNullOrWhiteSpace($SingleVMName)) {
+        $targets += $SingleVMName
+    }
+
+    foreach ($name in @($ManyVMNames)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$name)) {
+            $targets += [string]$name
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ListPath)) {
+        if (-not (Test-Path -LiteralPath $ListPath -PathType Leaf)) {
+            throw ('VM list file not found: {0}' -f $ListPath)
+        }
+
+        $targets += @(Get-Content -LiteralPath $ListPath | Where-Object {
+            -not [string]::IsNullOrWhiteSpace([string]$_) -and -not ([string]$_).TrimStart().StartsWith('#')
+        } | ForEach-Object { ([string]$_).Trim() })
+    }
+
+    $uniqueTargets = @()
+    $seenTargets = @{}
+    foreach ($target in @($targets)) {
+        $targetText = ([string]$target).Trim()
+        if ([string]::IsNullOrWhiteSpace($targetText)) {
+            continue
+        }
+
+        if (-not $seenTargets.ContainsKey($targetText)) {
+            $seenTargets[$targetText] = $true
+            $uniqueTargets += $targetText
+        }
+    }
+
+    if ($uniqueTargets.Count -eq 0) {
+        $uniqueTargets += (Read-RequiredValue -CurrentValue $null -Prompt 'Non-production VM name')
+    }
+
+    return $uniqueTargets
+}
+
 $root = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($root)) {
     $root = (Get-Location).Path
@@ -72,25 +128,26 @@ if (-not $SkipStaticChecks) {
 }
 
 $VIServer = Read-RequiredValue -CurrentValue $VIServer -Prompt 'vCenter'
-$VMName = Read-RequiredValue -CurrentValue $VMName -Prompt 'Non-production VM name'
+$resolvedVMNames = @(Resolve-VMTargetNames -SingleVMName $VMName -ManyVMNames $VMNames -ListPath $VMListPath)
 
 if (-not $VIServerCredential) {
     $VIServerCredential = Get-Credential -Message ('Credentials for vCenter {0}' -f $VIServer)
 }
 
 if (-not $GuestCredential) {
-    $GuestCredential = Get-Credential -Message ('Local administrator credentials for guest VM {0}' -f $VMName)
+    $GuestCredential = Get-Credential -Message 'Local administrator credentials for guest VM targets'
 }
 
 $orchestratorParams = @{
     VIServer = $VIServer
-    VMName = $VMName
+    VMNames = $resolvedVMNames
     VIServerCredential = $VIServerCredential
     GuestCredential = $GuestCredential
     AgentPath = $agentPath
     GuestWorkingDirectory = $GuestWorkingDirectory
     LocalOutputDirectory = $LocalOutputDirectory
     MaxUpdates = $MaxUpdates
+    ThrottleLimit = $ThrottleLimit
     TimeoutMinutes = $TimeoutMinutes
     PollSeconds = $PollSeconds
 }
@@ -99,8 +156,20 @@ if (-not [string]::IsNullOrWhiteSpace($InstallSelection)) {
     $orchestratorParams.InstallSelection = $InstallSelection
 }
 
+if ($SelectedUpdateKeys -and @($SelectedUpdateKeys).Count -gt 0) {
+    $orchestratorParams.SelectedUpdateKeys = $SelectedUpdateKeys
+}
+
 if ($SearchOnly) {
     $orchestratorParams.SearchOnly = $true
+}
+
+if ($PlanOnly) {
+    $orchestratorParams.PlanOnly = $true
+}
+
+if ($SkipConfirmation) {
+    $orchestratorParams.SkipConfirmation = $true
 }
 
 if ($IgnoreVCenterCertificate) {

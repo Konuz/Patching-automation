@@ -3,8 +3,11 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$VIServer,
 
-    [Parameter(Mandatory = $true)]
     [string]$VMName,
+
+    [string[]]$VMNames,
+
+    [string]$VMListPath,
 
     [pscredential]$VIServerCredential,
 
@@ -20,7 +23,15 @@ param(
 
     [string]$InstallSelection,
 
+    [string[]]$SelectedUpdateKeys,
+
+    [int]$ThrottleLimit = 3,
+
     [switch]$SearchOnly,
+
+    [switch]$PlanOnly,
+
+    [switch]$SkipConfirmation,
 
     [int]$TimeoutMinutes = 180,
 
@@ -37,6 +48,56 @@ $ErrorActionPreference = 'Stop'
 function Write-Step {
     param([string]$Message)
     Write-Host ('[{0}] {1}' -f (Get-Date).ToString('HH:mm:ss'), $Message)
+}
+
+function Resolve-VMTargetNames {
+    param(
+        [string]$SingleVMName,
+        [string[]]$ManyVMNames,
+        [string]$ListPath
+    )
+
+    $targets = @()
+
+    if (-not [string]::IsNullOrWhiteSpace($SingleVMName)) {
+        $targets += $SingleVMName
+    }
+
+    foreach ($name in @($ManyVMNames)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$name)) {
+            $targets += [string]$name
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ListPath)) {
+        if (-not (Test-Path -LiteralPath $ListPath -PathType Leaf)) {
+            throw ('VM list file not found: {0}' -f $ListPath)
+        }
+
+        $targets += @(Get-Content -LiteralPath $ListPath | Where-Object {
+            -not [string]::IsNullOrWhiteSpace([string]$_) -and -not ([string]$_).TrimStart().StartsWith('#')
+        } | ForEach-Object { ([string]$_).Trim() })
+    }
+
+    $uniqueTargets = @()
+    $seenTargets = @{}
+    foreach ($target in @($targets)) {
+        $targetText = ([string]$target).Trim()
+        if ([string]::IsNullOrWhiteSpace($targetText)) {
+            continue
+        }
+
+        if (-not $seenTargets.ContainsKey($targetText)) {
+            $seenTargets[$targetText] = $true
+            $uniqueTargets += $targetText
+        }
+    }
+
+    if ($uniqueTargets.Count -eq 0) {
+        throw 'At least one VM target is required. Use -VMName, -VMNames, or -VMListPath.'
+    }
+
+    return $uniqueTargets
 }
 
 function Assert-LocalPrerequisites {
@@ -509,6 +570,23 @@ function Invoke-GuestAgentRun {
         AgentResult = $agentResult
         Status = Get-Content -LiteralPath $LocalStatusPath -Raw | ConvertFrom-Json
     }
+}
+
+$targetVMNames = @(Resolve-VMTargetNames -SingleVMName $VMName -ManyVMNames $VMNames -ListPath $VMListPath)
+if ($PlanOnly) {
+    throw 'PlanOnly is not available until patch plan generation is implemented.'
+}
+
+if ($SelectedUpdateKeys -and @($SelectedUpdateKeys).Count -gt 0) {
+    throw 'SelectedUpdateKeys is not available until patch plan application is implemented.'
+}
+
+if ($targetVMNames.Count -gt 1) {
+    Write-Warning 'Multiple VM targets were supplied; only the first target will be processed until multi-VM discovery is implemented.'
+}
+
+if ([string]::IsNullOrWhiteSpace($VMName)) {
+    $VMName = $targetVMNames[0]
 }
 
 if (-not $VIServerCredential) {

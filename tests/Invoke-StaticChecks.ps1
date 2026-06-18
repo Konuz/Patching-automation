@@ -234,6 +234,13 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'A for all'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SelectedUpdateIds'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "@(`$SelectedUpdateIds) -join ','"
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'VMNames'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'VMListPath'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'ThrottleLimit'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'PlanOnly'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SkipConfirmation'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SelectedUpdateKeys'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Resolve-VMTargetNames'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Role flags:'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'failoverCluster'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Skipped: Failover Cluster detected. Please update manually one by one.'
@@ -253,6 +260,13 @@ if ($existingScripts.ContainsKey($launcherPath)) {
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Invoke-GuestOpsPatchValidation.ps1'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Get-Credential'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'InstallSelection'
+    Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'VMNames'
+    Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'VMListPath'
+    Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'ThrottleLimit'
+    Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'PlanOnly'
+    Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'SkipConfirmation'
+    Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'SelectedUpdateKeys'
+    Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Resolve-VMTargetNames'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle '$PSScriptRoot'
 }
 
