@@ -162,9 +162,11 @@ function Assert-NoReservedVariableName {
 $agentPath = 'guest\Run-LocalPatch.ps1'
 $orchestratorPath = 'scripts\Invoke-GuestOpsPatchValidation.ps1'
 $launcherPath = 'Start-PatchingGuestOps.ps1'
+$modelPath = 'scripts\PatchPlanModel.ps1'
+$modelTestPath = 'tests\Invoke-ModelChecks.ps1'
 
 $existingScripts = @{}
-foreach ($relativePath in @($agentPath, $orchestratorPath, $launcherPath)) {
+foreach ($relativePath in @($agentPath, $orchestratorPath, $launcherPath, $modelPath, $modelTestPath)) {
     $path = Assert-FileExists -RelativePath $relativePath
     if ($path) {
         $existingScripts[$relativePath] = $path
@@ -247,6 +249,32 @@ if ($existingScripts.ContainsKey($launcherPath)) {
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Get-Credential'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'InstallSelection'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle '$PSScriptRoot'
+}
+
+if ($existingScripts.ContainsKey($modelPath)) {
+    $modelAst = Get-ScriptAst -RelativePath $modelPath -Path $existingScripts[$modelPath]
+    $modelText = Get-ScriptText -Path $existingScripts[$modelPath]
+
+    Assert-NoForbiddenCommand -Ast $modelAst -RelativePath $modelPath -ForbiddenNames $forbiddenCommands
+    Assert-NoForbiddenCommandLiteral -RelativePath $modelPath -Text $modelText -ForbiddenNames $forbiddenCommands
+    Assert-NoReservedVariableName -Ast $modelAst -RelativePath $modelPath -ReservedNames $reservedVariableNames
+    Assert-TextDoesNotMatch -RelativePath $modelPath -Text $modelText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
+    Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'New-UpdateIdentityKey'
+    Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'New-UpdateGroupRecords'
+    Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'Get-DefaultUpdateSelection'
+    Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'New-PatchPlanRecords'
+    Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'ConvertTo-PatchSummaryRows'
+}
+
+if ($existingScripts.ContainsKey($modelTestPath)) {
+    $modelTestAst = Get-ScriptAst -RelativePath $modelTestPath -Path $existingScripts[$modelTestPath]
+    $modelTestText = Get-ScriptText -Path $existingScripts[$modelTestPath]
+
+    Assert-NoForbiddenCommand -Ast $modelTestAst -RelativePath $modelTestPath -ForbiddenNames $forbiddenCommands
+    Assert-NoForbiddenCommandLiteral -RelativePath $modelTestPath -Text $modelTestText -ForbiddenNames $forbiddenCommands
+    Assert-NoReservedVariableName -Ast $modelTestAst -RelativePath $modelTestPath -ReservedNames $reservedVariableNames
+    Assert-TextContains -RelativePath $modelTestPath -Text $modelTestText -Needle 'PatchPlanModel.ps1'
+    Assert-TextContains -RelativePath $modelTestPath -Text $modelTestText -Needle 'Model checks passed.'
 }
 
 if ($failures.Count -gt 0) {
