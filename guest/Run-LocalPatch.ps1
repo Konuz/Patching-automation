@@ -3,6 +3,7 @@ param(
     [string]$WorkingDirectory = 'C:\ProgramData\PatchingGuestOps',
     [int]$MaxUpdates = 1,
     [string[]]$SelectedUpdateIds = @(),
+    [string[]]$SelectedUpdateKeys = @(),
     [switch]$SearchOnly,
     [string]$SearchCriteria = "IsInstalled=0 and IsHidden=0 and Type='Software'"
 )
@@ -90,6 +91,42 @@ function Get-ComStringCollection {
 
     for ($i = 0; $i -lt $Collection.Count; $i++) {
         $values += [string]$Collection.Item($i)
+    }
+
+    return $values
+}
+
+function New-UpdateIdentityKey {
+    param(
+        [string]$UpdateId,
+        [int]$RevisionNumber
+    )
+
+    if ([string]::IsNullOrWhiteSpace($UpdateId)) {
+        return $null
+    }
+
+    return ('{0}|{1}' -f $UpdateId, $RevisionNumber)
+}
+
+function Get-ComCategoryCollection {
+    param($Collection)
+
+    $values = @()
+    if ($null -eq $Collection) {
+        return $values
+    }
+
+    for ($i = 0; $i -lt $Collection.Count; $i++) {
+        try {
+            $category = $Collection.Item($i)
+            if ($null -ne $category -and -not [string]::IsNullOrWhiteSpace([string]$category.Name)) {
+                $values += [string]$category.Name
+            }
+        }
+        catch {
+            Write-AgentLog -Message ('Unable to read update category at index {0}: {1}' -f $i, $_.Exception.Message)
+        }
     }
 
     return $values
@@ -209,6 +246,8 @@ function New-UpdateRecord {
         $revisionNumber = $null
     }
 
+    $identityKey = New-UpdateIdentityKey -UpdateId $updateId -RevisionNumber $revisionNumber
+
     $rebootBehavior = $null
     try {
         $rebootBehavior = [int]$Update.InstallationBehavior.RebootBehavior
@@ -217,12 +256,22 @@ function New-UpdateRecord {
         $rebootBehavior = $null
     }
 
+    $categories = @()
+    try {
+        $categories = @(Get-ComCategoryCollection -Collection $Update.Categories)
+    }
+    catch {
+        $categories = @()
+    }
+
     return [ordered]@{
         index = $Index
         title = [string]$Update.Title
         kbArticleIds = $kbArticleIds
         updateId = $updateId
         revisionNumber = $revisionNumber
+        identityKey = $identityKey
+        categories = $categories
         selected = $false
         eulaAccepted = [bool]$Update.EulaAccepted
         isDownloadedBeforeRun = [bool]$Update.IsDownloaded
@@ -284,6 +333,7 @@ $status = [ordered]@{
     searchCriteria = $SearchCriteria
     maxUpdates = $MaxUpdates
     selectedUpdateIds = @($SelectedUpdateIds)
+    selectedUpdateKeys = @($SelectedUpdateKeys)
     searchOnly = [bool]$SearchOnly
     services = @()
     systemDriveFreeGB = $null
@@ -356,6 +406,15 @@ try {
     else {
         $selectedUpdates = New-Object -ComObject Microsoft.Update.UpdateColl
         $selectedSearchIndexes = @()
+        $selectedKeyLookup = @{}
+        foreach ($selectedUpdateKey in @($SelectedUpdateKeys)) {
+            if ([string]::IsNullOrWhiteSpace([string]$selectedUpdateKey)) {
+                continue
+            }
+
+            $selectedKeyLookup[[string]$selectedUpdateKey] = $true
+        }
+
         $selectedIdLookup = @{}
         foreach ($selectedUpdateId in @($SelectedUpdateIds)) {
             if ([string]::IsNullOrWhiteSpace([string]$selectedUpdateId)) {
@@ -365,22 +424,26 @@ try {
             $selectedIdLookup[[string]$selectedUpdateId] = $true
         }
 
-        $hasExplicitSelection = ($selectedIdLookup.Count -gt 0)
+        $hasExplicitKeySelection = ($selectedKeyLookup.Count -gt 0)
+        $hasExplicitIdSelection = ($selectedIdLookup.Count -gt 0)
         $selectionLimit = [Math]::Min($MaxUpdates, [int]$searchResult.Updates.Count)
-        $seenSelectedIds = @{}
+        $seenSelectedLookupKeys = @{}
 
         for ($i = 0; $i -lt $searchResult.Updates.Count; $i++) {
             $update = $searchResult.Updates.Item($i)
             $record = New-UpdateRecord -Update $update -Index $i
             $status.updates += $record
 
-            if ($hasExplicitSelection) {
-                # Select by stable update identity, not by position: the install pass
-                # runs a fresh WUA search whose ordering is not guaranteed to match the
-                # search pass the operator chose from.
+            if ($hasExplicitKeySelection) {
+                $shouldSelectUpdate = ($null -ne $record.identityKey -and $selectedKeyLookup.ContainsKey([string]$record.identityKey))
+                if ($shouldSelectUpdate) {
+                    $seenSelectedLookupKeys[[string]$record.identityKey] = $true
+                }
+            }
+            elseif ($hasExplicitIdSelection) {
                 $shouldSelectUpdate = ($null -ne $record.updateId -and $selectedIdLookup.ContainsKey([string]$record.updateId))
                 if ($shouldSelectUpdate) {
-                    $seenSelectedIds[[string]$record.updateId] = $true
+                    $seenSelectedLookupKeys[[string]$record.updateId] = $true
                 }
             }
             else {
@@ -417,8 +480,14 @@ try {
             }
         }
 
-        if ($hasExplicitSelection) {
-            $missingUpdateIds = @(@($selectedIdLookup.Keys) | Where-Object { -not $seenSelectedIds.ContainsKey([string]$_) })
+        if ($hasExplicitKeySelection) {
+            $missingUpdateKeys = @(@($selectedKeyLookup.Keys) | Where-Object { -not $seenSelectedLookupKeys.ContainsKey([string]$_) })
+            if ($missingUpdateKeys.Count -gt 0) {
+                throw ('Selected update key(s) not present in the current search result (search/selection drift): {0}' -f ($missingUpdateKeys -join ', '))
+            }
+        }
+        elseif ($hasExplicitIdSelection) {
+            $missingUpdateIds = @(@($selectedIdLookup.Keys) | Where-Object { -not $seenSelectedLookupKeys.ContainsKey([string]$_) })
             if ($missingUpdateIds.Count -gt 0) {
                 throw ('Selected update id(s) not present in the current search result (search/selection drift): {0}' -f ($missingUpdateIds -join ', '))
             }
