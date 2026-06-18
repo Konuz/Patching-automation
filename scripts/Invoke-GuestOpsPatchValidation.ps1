@@ -340,6 +340,7 @@ function Start-GuestAgent {
         [string]$GuestWorkingDirectory,
         [int]$MaxUpdates,
         [string[]]$SelectedUpdateIds = @(),
+        [string[]]$SelectedUpdateKeys = @(),
         [switch]$SearchOnly
     )
 
@@ -364,6 +365,12 @@ function Start-GuestAgent {
         $arguments += (@($SelectedUpdateIds) -join ',')
     }
 
+    if (@($SelectedUpdateKeys).Count -gt 0) {
+        $quotedSelectedUpdateKeys = @($SelectedUpdateKeys | ForEach-Object { '"{0}"' -f (([string]$_) -replace '"', '`"') })
+        $arguments += '-SelectedUpdateKeys'
+        $arguments += ($quotedSelectedUpdateKeys -join ',')
+    }
+
     $programSpec = New-Object VMware.Vim.GuestProgramSpec
     $programSpec.ProgramPath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
     $programSpec.Arguments = ($arguments -join ' ')
@@ -375,6 +382,20 @@ function Start-GuestAgent {
 function Get-SafeFileName {
     param([string]$Value)
     return ($Value -replace '[^a-zA-Z0-9_.-]', '_')
+}
+
+function New-UniqueOutputDirectory {
+    param([string]$BasePath)
+
+    $candidatePath = $BasePath
+    $suffix = 2
+    while (Test-Path -LiteralPath $candidatePath) {
+        $candidatePath = '{0}-{1}' -f $BasePath, $suffix
+        $suffix++
+    }
+
+    New-Item -ItemType Directory -Force -Path $candidatePath | Out-Null
+    return $candidatePath
 }
 
 function Get-ObjectPropertyValue {
@@ -411,22 +432,6 @@ function Get-KbArticleText {
     }
 
     return ($kbArticleIdList -join ',')
-}
-
-function Get-RoleFlagText {
-    param($Status)
-
-    $roleFlags = Get-ObjectPropertyValue -InputObject $Status -Path @('roleFlags')
-    if ($null -eq $roleFlags) {
-        return 'unknown'
-    }
-
-    $detected = @(Get-ObjectPropertyValue -InputObject $roleFlags -Path @('detected') | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
-    if ($detected.Count -eq 0) {
-        return 'none'
-    }
-
-    return ($detected -join ', ')
 }
 
 function Show-AvailableUpdates {
@@ -528,6 +533,7 @@ function Invoke-GuestAgentRun {
         [string]$LocalLogPath,
         [int]$MaxUpdates,
         [string[]]$SelectedUpdateIds = @(),
+        [string[]]$SelectedUpdateKeys = @(),
         [switch]$SearchOnly,
         [int]$TimeoutSeconds,
         [int]$PollSeconds,
@@ -535,7 +541,7 @@ function Invoke-GuestAgentRun {
     )
 
     Write-Step -Message $Description
-    $agentProcessId = Start-GuestAgent -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateIds $SelectedUpdateIds -SearchOnly:$SearchOnly
+    $agentProcessId = Start-GuestAgent -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateIds $SelectedUpdateIds -SelectedUpdateKeys $SelectedUpdateKeys -SearchOnly:$SearchOnly
     Write-Step -Message ('Guest agent PID: {0}' -f $agentProcessId)
 
     $agentResult = Wait-GuestProcess -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -ProcessId $agentProcessId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
@@ -572,6 +578,163 @@ function Invoke-GuestAgentRun {
     }
 }
 
+function Test-IsSuccessfulDiscoveryOutcome {
+    param([string]$Outcome)
+
+    return ($Outcome -in @('SearchOnly', 'NoApplicableUpdates'))
+}
+
+function New-DiscoveryRecord {
+    param(
+        [string]$VMName,
+        $Status,
+        [string]$OutputDirectory,
+        [string[]]$Errors = @()
+    )
+
+    $outcome = Get-ObjectPropertyValue -InputObject $Status -Path @('outcome')
+    if ([string]::IsNullOrWhiteSpace([string]$outcome) -and @($Errors).Count -gt 0) {
+        $outcome = 'DiscoveryFailed'
+    }
+
+    return [pscustomobject]@{
+        vmName = $VMName
+        computerName = Get-ObjectPropertyValue -InputObject $Status -Path @('computerName')
+        outcome = $outcome
+        isElevated = Get-ObjectPropertyValue -InputObject $Status -Path @('isElevated')
+        availableUpdateCount = Get-ObjectPropertyValue -InputObject $Status -Path @('availableUpdateCount') -DefaultValue 0
+        roleFlags = Get-ObjectPropertyValue -InputObject $Status -Path @('roleFlags')
+        pendingRebootBefore = Get-ObjectPropertyValue -InputObject $Status -Path @('pendingRebootBefore')
+        updates = @(Get-ObjectPropertyValue -InputObject $Status -Path @('updates') -DefaultValue @())
+        outputDirectory = $OutputDirectory
+        errors = @($Errors)
+    }
+}
+
+function Invoke-VMAgentCycle {
+    param(
+        [string]$VMName,
+        $Managers,
+        $GuestAuth,
+        [string]$CurlPath,
+        [string]$AgentPath,
+        [string]$GuestWorkingDirectory,
+        [string]$VMOutputDirectory,
+        [int]$MaxUpdates,
+        [string[]]$SelectedUpdateKeys = @(),
+        [switch]$SearchOnly,
+        [int]$TimeoutSeconds,
+        [int]$PollSeconds
+    )
+
+    Write-Step -Message ('Resolving VM {0}.' -f $VMName)
+    $vm = Get-ExactVM -Name $VMName
+    Assert-VMReadyForGuestOps -VM $vm
+
+    $vmView = Get-View $vm.Id
+    $hostName = Get-VMHostNameForTransfer -VMView $vmView
+
+    New-Item -ItemType Directory -Force -Path $VMOutputDirectory | Out-Null
+
+    $guestAgentPath = Join-Path $GuestWorkingDirectory 'Run-LocalPatch.ps1'
+    $guestStatusPath = Join-Path $GuestWorkingDirectory 'status.json'
+    $guestLogPath = Join-Path $GuestWorkingDirectory 'agent.log'
+    $localStatusPath = Join-Path $VMOutputDirectory 'status.json'
+    $localLogPath = Join-Path $VMOutputDirectory 'agent.log'
+
+    Write-Step -Message ('Creating guest working directory {0}.' -f $GuestWorkingDirectory)
+    $mkdirProcessId = New-GuestDirectory -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -DirectoryPath $GuestWorkingDirectory
+    $mkdirResult = Wait-GuestProcess -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -ProcessId $mkdirProcessId -TimeoutSeconds 120 -PollSeconds 5
+    if (-not $mkdirResult.Completed -or ($null -ne $mkdirResult.ExitCode -and $mkdirResult.ExitCode -ne 0)) {
+        throw ('Failed to create guest working directory. Completed={0}; ExitCode={1}' -f $mkdirResult.Completed, $mkdirResult.ExitCode)
+    }
+
+    Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $AgentPath -GuestPath $guestAgentPath
+
+    $agentRunParams = @{
+        ProcessManager = $Managers.ProcessManager
+        FileManager = $Managers.FileManager
+        VMView = $vmView
+        GuestAuth = $GuestAuth
+        HostName = $hostName
+        CurlPath = $CurlPath
+        GuestAgentPath = $guestAgentPath
+        GuestWorkingDirectory = $GuestWorkingDirectory
+        GuestStatusPath = $guestStatusPath
+        GuestLogPath = $guestLogPath
+        LocalStatusPath = $localStatusPath
+        LocalLogPath = $localLogPath
+        TimeoutSeconds = $TimeoutSeconds
+        PollSeconds = $PollSeconds
+    }
+
+    if ($SearchOnly) {
+        return Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SearchOnly -Description ('Starting guest WUA search for {0}.' -f $VMName)
+    }
+
+    return Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -Description ('Starting guest WUA install for {0}.' -f $VMName)
+}
+
+function Invoke-DiscoveryPhase {
+    param(
+        [string[]]$TargetVMNames,
+        $Managers,
+        $GuestAuth,
+        [string]$CurlPath,
+        [string]$AgentPath,
+        [string]$GuestWorkingDirectory,
+        [int]$MaxUpdates,
+        [int]$TimeoutSeconds,
+        [int]$PollSeconds,
+        [string]$CycleOutputDirectory
+    )
+
+    $records = @()
+    foreach ($targetVMName in @($TargetVMNames)) {
+        $vmOutputDirectory = Join-Path $CycleOutputDirectory ('{0:D3}-{1}' -f ($records.Count + 1), (Get-SafeFileName -Value $targetVMName))
+
+        try {
+            $agentRun = Invoke-VMAgentCycle -VMName $targetVMName -Managers $Managers -GuestAuth $GuestAuth -CurlPath $CurlPath -AgentPath $AgentPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $vmOutputDirectory -MaxUpdates $MaxUpdates -SearchOnly -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
+            $record = New-DiscoveryRecord -VMName $targetVMName -Status $agentRun.Status -OutputDirectory $vmOutputDirectory
+            $recordErrors = @($record.errors)
+
+            if (-not (Test-IsSuccessfulDiscoveryOutcome -Outcome $record.outcome)) {
+                $recordErrors += ('Discovery returned outcome {0}.' -f $record.outcome)
+            }
+
+            if (-not $agentRun.AgentResult.Completed) {
+                $finishedAt = Get-ObjectPropertyValue -InputObject $agentRun.Status -Path @('finishedAt')
+                if ((Test-IsSuccessfulDiscoveryOutcome -Outcome $record.outcome) -and -not [string]::IsNullOrWhiteSpace([string]$finishedAt)) {
+                    Write-Warning ('Discovery guest process result timed out for {0}. status.json has a successful discovery outcome and finishedAt, so the JSON artifact remains the primary discovery result.' -f $targetVMName)
+                }
+                else {
+                    $recordErrors += 'Discovery guest process result timed out and status.json did not contain both a successful discovery outcome and finishedAt.'
+                }
+            }
+
+            $record.errors = @($recordErrors)
+            $records += $record
+        }
+        catch {
+            $errorMessage = $_.Exception.Message
+            Write-Warning ('Discovery failed for {0}: {1}' -f $targetVMName, $errorMessage)
+            $records += New-DiscoveryRecord -VMName $targetVMName -Status $null -OutputDirectory $vmOutputDirectory -Errors @($errorMessage)
+        }
+    }
+
+    $discoveryPath = Join-Path $CycleOutputDirectory 'discovery.json'
+    @($records) | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $discoveryPath -Encoding UTF8
+
+    Write-Host ''
+    Write-Host 'Discovery summary'
+    Write-Host '-----------------'
+    foreach ($record in @($records)) {
+        Write-Host ('{0}: outcome={1}; updates={2}; roles={3}' -f $record.vmName, $record.outcome, $record.availableUpdateCount, (Get-RoleFlagText -RoleFlags $record.roleFlags))
+    }
+
+    return @($records)
+}
+
 $targetVMNames = @(Resolve-VMTargetNames -SingleVMName $VMName -ManyVMNames $VMNames -ListPath $VMListPath)
 if ($PlanOnly) {
     throw 'PlanOnly is not available until patch plan generation is implemented.'
@@ -579,10 +742,6 @@ if ($PlanOnly) {
 
 if ($SelectedUpdateKeys -and @($SelectedUpdateKeys).Count -gt 0) {
     throw 'SelectedUpdateKeys is not available until patch plan application is implemented.'
-}
-
-if ($targetVMNames.Count -gt 1) {
-    Write-Warning 'Multiple VM targets were supplied; only the first target will be processed until multi-VM discovery is implemented.'
 }
 
 if ([string]::IsNullOrWhiteSpace($VMName)) {
@@ -596,6 +755,8 @@ if (-not $VIServerCredential) {
 if (-not $GuestCredential) {
     $GuestCredential = Get-Credential -Message ('Local administrator credentials for guest VM {0}' -f $VMName)
 }
+
+. (Join-Path $PSScriptRoot 'PatchPlanModel.ps1')
 
 $curlPath = Assert-LocalPrerequisites -LocalAgentPath $AgentPath
 
@@ -612,14 +773,29 @@ try {
     Write-Step -Message ('Connecting to vCenter {0}.' -f $VIServer)
     $connection = Connect-VIServer -Server $VIServer -Credential $VIServerCredential -ErrorAction Stop
 
+    $guestAuth = New-GuestAuthentication -Credential $GuestCredential
+    $managers = Get-GuestOpsManagers
+
+    if ($targetVMNames.Count -gt 1) {
+        $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $runOutputDirectory = New-UniqueOutputDirectory -BasePath (Join-Path $LocalOutputDirectory $timestamp)
+
+        $discoveryRecords = Invoke-DiscoveryPhase -TargetVMNames $targetVMNames -Managers $managers -GuestAuth $guestAuth -CurlPath $curlPath -AgentPath $AgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory
+        $failedDiscoveryRecords = @($discoveryRecords | Where-Object { @($_.errors).Count -gt 0 })
+        if ($failedDiscoveryRecords.Count -gt 0) {
+            $scriptExitCode = 1
+        }
+        else {
+            $scriptExitCode = 0
+        }
+    }
+    else {
     Write-Step -Message ('Resolving VM {0}.' -f $VMName)
     $vm = Get-ExactVM -Name $VMName
     Assert-VMReadyForGuestOps -VM $vm
 
     $vmView = Get-View $vm.Id
     $hostName = Get-VMHostNameForTransfer -VMView $vmView
-    $guestAuth = New-GuestAuthentication -Credential $GuestCredential
-    $managers = Get-GuestOpsManagers
 
     $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $safeVmName = Get-SafeFileName -Value $VMName
@@ -733,7 +909,7 @@ try {
     Write-Host ('Agent elevated: {0}' -f $isElevated)
     Write-Host ('Available updates: {0}' -f $availableUpdateCount)
     Write-Host ('Selected updates: {0}' -f $selectedUpdateCount)
-    Write-Host ('Role flags: {0}' -f (Get-RoleFlagText -Status $status))
+    Write-Host ('Role flags: {0}' -f (Get-RoleFlagText -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags'))))
     Write-Host ('Pending reboot: {0}' -f $pendingRebootIsPending)
 
     $pendingRebootChecks = Get-ObjectPropertyValue -InputObject $status -Path @('pendingReboot', 'checks')
@@ -824,6 +1000,7 @@ try {
             Write-Warning 'The GuestOps process result timed out and status.json did not contain both a successful outcome and finishedAt.'
             $scriptExitCode = 1
         }
+    }
     }
 }
 catch {
