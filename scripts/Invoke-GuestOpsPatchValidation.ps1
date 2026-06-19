@@ -632,6 +632,85 @@ function Read-UpdateGroupSelection {
     return $selectedKeys
 }
 
+function Show-PatchPlan {
+    param($PatchPlanRecords)
+
+    Write-Host ''
+    Write-Host 'Patch plan'
+    Write-Host '----------'
+
+    foreach ($record in @($PatchPlanRecords)) {
+        Write-Host ''
+        Write-Host $record.vmName
+        $roleFlagText = if ($record.roleFlags -is [string]) { [string]$record.roleFlags } else { Get-RoleFlagText -RoleFlags $record.roleFlags }
+        Write-Host ('Role flags: {0}' -f $roleFlagText)
+
+        if ($record.action -eq 'Skip') {
+            Write-Host $record.reason
+            continue
+        }
+
+        if ($record.action -eq 'NoSelectedUpdates') {
+            Write-Host $record.reason
+            continue
+        }
+
+        Write-Host 'Selected:'
+        foreach ($update in @($record.selectedUpdates)) {
+            $kbPrefix = if ([string]::IsNullOrWhiteSpace([string]$update.kbText)) { '' } else { ('{0} - ' -f $update.kbText) }
+            Write-Host ('- {0}{1}' -f $kbPrefix, $update.title)
+        }
+    }
+}
+
+function Confirm-PatchPlan {
+    param([switch]$SkipConfirmation)
+
+    if ($SkipConfirmation) {
+        return $true
+    }
+
+    $answer = Read-Host 'Proceed with this plan? [Y/N]'
+    return ($answer -ieq 'Y' -or $answer -ieq 'Yes')
+}
+
+function Update-PatchPlanWithDiscoveryFailures {
+    param(
+        $PatchPlanRecords,
+        $DiscoveryRecords
+    )
+
+    $planRecordsByVmName = @{}
+    foreach ($record in @($PatchPlanRecords)) {
+        $vmName = [string](Get-ObjectPropertyValue -InputObject $record -Path @('vmName'))
+        if (-not [string]::IsNullOrWhiteSpace($vmName) -and -not $planRecordsByVmName.ContainsKey($vmName)) {
+            $planRecordsByVmName[$vmName] = $record
+        }
+    }
+
+    foreach ($discoveryRecord in @($DiscoveryRecords)) {
+        $vmName = [string](Get-ObjectPropertyValue -InputObject $discoveryRecord -Path @('vmName'))
+        if ([string]::IsNullOrWhiteSpace($vmName) -or -not $planRecordsByVmName.ContainsKey($vmName)) {
+            continue
+        }
+
+        $errors = @(Get-ObjectPropertyValue -InputObject $discoveryRecord -Path @('errors') -DefaultValue @() | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace([string]$_) })
+        $outcome = [string](Get-ObjectPropertyValue -InputObject $discoveryRecord -Path @('outcome'))
+        $hasDiscoveryErrors = ($errors.Count -gt 0)
+        $hasSuccessfulDiscoveryOutcome = Test-IsSuccessfulDiscoveryOutcome -Outcome $outcome
+        if (-not $hasDiscoveryErrors -and $hasSuccessfulDiscoveryOutcome) {
+            continue
+        }
+
+        $planRecord = $planRecordsByVmName[$vmName]
+        $planRecord.action = 'Skip'
+        $planRecord.reason = 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.'
+        $planRecord.selectedUpdates = @()
+    }
+
+    return @($PatchPlanRecords)
+}
+
 function Invoke-GuestAgentRun {
     param(
         $ProcessManager,
@@ -852,9 +931,6 @@ function Invoke-DiscoveryPhase {
 
 $targetVMNames = @(Resolve-VMTargetNames -SingleVMName $VMName -ManyVMNames $VMNames -ListPath $VMListPath)
 $hasExplicitSelectedUpdateKeys = $PSBoundParameters.ContainsKey('SelectedUpdateKeys')
-if ($PlanOnly) {
-    throw 'PlanOnly is not available until patch plan generation is implemented.'
-}
 
 if (-not [string]::IsNullOrWhiteSpace($InstallSelection)) {
     throw 'InstallSelection is not supported with grouped update selection. Use SelectedUpdateKeys instead.'
@@ -924,6 +1000,38 @@ try {
             }
 
             Write-Step -Message ('Selected update group key(s): {0}' -f @($selectedKeysForPlan).Count)
+
+            $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
+            $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
+            $patchPlanPath = Join-Path $runOutputDirectory 'patch-plan.json'
+            $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
+            Show-PatchPlan -PatchPlanRecords $patchPlanRecords
+
+            if ($PlanOnly) {
+                $scriptExitCode = 0
+            }
+            elseif (-not (Confirm-PatchPlan -SkipConfirmation:$SkipConfirmation)) {
+                Write-Warning 'Patch plan was not approved. Apply phase skipped.'
+                $scriptExitCode = 1
+            }
+            else {
+                Write-Warning 'Apply phase is not implemented yet. No changes were applied.'
+                if ($failedDiscoveryRecords.Count -gt 0) {
+                    $scriptExitCode = 1
+                }
+                else {
+                    $scriptExitCode = 0
+                }
+            }
+        }
+        elseif ($PlanOnly) {
+            $selectedKeysForPlan = @()
+            $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
+            $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
+            $patchPlanPath = Join-Path $runOutputDirectory 'patch-plan.json'
+            $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
+            Show-PatchPlan -PatchPlanRecords $patchPlanRecords
+            $scriptExitCode = 0
         }
     }
     else {
@@ -971,6 +1079,8 @@ try {
         PollSeconds = $PollSeconds
     }
 
+    $skipSingleVmValidationSummary = $false
+
     if ($SearchOnly) {
         $agentRun = Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SearchOnly -Description 'Starting guest WUA search.'
         $agentResult = $agentRun.AgentResult
@@ -978,16 +1088,29 @@ try {
         $discoveryRecords = @(New-DiscoveryRecord -VMName $VMName -Status $status -OutputDirectory $runOutputDirectory)
         $updateGroups = @(New-UpdateGroupRecords -DiscoveryRecords $discoveryRecords | Sort-Object kbText,title)
         Show-UpdateGroups -UpdateGroups $updateGroups
+
+        if ($PlanOnly) {
+            $selectedKeysForPlan = @()
+            $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
+            $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
+            $patchPlanPath = Join-Path $runOutputDirectory 'patch-plan.json'
+            $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
+            Show-PatchPlan -PatchPlanRecords $patchPlanRecords
+            $skipSingleVmValidationSummary = $true
+            $scriptExitCode = 0
+        }
     }
     else {
         $searchRun = Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SearchOnly -Description 'Starting guest WUA search.'
         $searchStatus = $searchRun.Status
         $searchOutcome = Get-ObjectPropertyValue -InputObject $searchStatus -Path @('outcome')
+        $searchDiscoverySucceeded = Test-IsSuccessfulDiscoveryOutcome -Outcome $searchOutcome
         $searchAvailableUpdateCount = [int](Get-ObjectPropertyValue -InputObject $searchStatus -Path @('availableUpdateCount') -DefaultValue 0)
         $failoverClusterDetected = [bool](Get-ObjectPropertyValue -InputObject $searchStatus -Path @('roleFlags', 'failoverCluster') -DefaultValue $false)
         $discoveryRecords = @(New-DiscoveryRecord -VMName $VMName -Status $searchStatus -OutputDirectory $runOutputDirectory)
         $updateGroups = @(New-UpdateGroupRecords -DiscoveryRecords $discoveryRecords | Sort-Object kbText,title)
         Show-UpdateGroups -UpdateGroups $updateGroups
+        $selectedKeysForPlan = @()
 
         if ($failoverClusterDetected) {
             Write-Warning 'Skipped: Failover Cluster detected. Please update manually one by one.'
@@ -1013,8 +1136,33 @@ try {
             $agentResult = $searchRun.AgentResult
             $status = $searchStatus
         }
+
+        $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
+        $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
+        $patchPlanPath = Join-Path $runOutputDirectory 'patch-plan.json'
+        $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
+        Show-PatchPlan -PatchPlanRecords $patchPlanRecords
+        $skipSingleVmValidationSummary = $true
+
+        if ($PlanOnly) {
+            $scriptExitCode = 0
+        }
+        elseif (-not (Confirm-PatchPlan -SkipConfirmation:$SkipConfirmation)) {
+            Write-Warning 'Patch plan was not approved. Apply phase skipped.'
+            $scriptExitCode = 1
+        }
+        else {
+            Write-Warning 'Apply phase is not implemented yet. No changes were applied.'
+            if ($searchDiscoverySucceeded) {
+                $scriptExitCode = 0
+            }
+            else {
+                $scriptExitCode = 1
+            }
+        }
     }
 
+    if (-not $skipSingleVmValidationSummary) {
     $outcome = Get-ObjectPropertyValue -InputObject $status -Path @('outcome')
     $isElevated = Get-ObjectPropertyValue -InputObject $status -Path @('isElevated')
     $availableUpdateCount = Get-ObjectPropertyValue -InputObject $status -Path @('availableUpdateCount')
@@ -1122,6 +1270,7 @@ try {
             Write-Warning 'The GuestOps process result timed out and status.json did not contain both a successful outcome and finishedAt.'
             $scriptExitCode = 1
         }
+    }
     }
     }
 }
