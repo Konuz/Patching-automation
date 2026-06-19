@@ -408,11 +408,14 @@ try {
         $selectedSearchIndexes = @()
         $selectedKeyLookup = @{}
         foreach ($selectedUpdateKey in @($SelectedUpdateKeys)) {
-            if ([string]::IsNullOrWhiteSpace([string]$selectedUpdateKey)) {
-                continue
-            }
+            foreach ($selectedUpdateKeyPart in @([string]$selectedUpdateKey -split ',')) {
+                $selectedKey = ([string]$selectedUpdateKeyPart).Trim()
+                if ([string]::IsNullOrWhiteSpace($selectedKey)) {
+                    continue
+                }
 
-            $selectedKeyLookup[[string]$selectedUpdateKey] = $true
+                $selectedKeyLookup[$selectedKey] = $true
+            }
         }
 
         $selectedIdLookup = @{}

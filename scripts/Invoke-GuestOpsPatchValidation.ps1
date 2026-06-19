@@ -869,6 +869,146 @@ function Invoke-VMAgentCycle {
     return Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -Description ('Starting guest WUA install for {0}.' -f $VMName)
 }
 
+function Test-ApplyResultsSuccessful {
+    param($ApplyResults)
+
+    $installFailures = @($ApplyResults | Where-Object { $_.action -eq 'Install' -and $_.outcome -ne 'InstallSucceeded' })
+    $discoveryFailureSkips = @($ApplyResults | Where-Object { $_.action -ne 'Install' -and $_.reason -eq 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.' })
+
+    return ($installFailures.Count -eq 0 -and $discoveryFailureSkips.Count -eq 0)
+}
+
+function Invoke-ApplyPhase {
+    param(
+        $PatchPlanRecords,
+        $Managers,
+        $GuestAuth,
+        [string]$CurlPath,
+        [string]$AgentPath,
+        [string]$GuestWorkingDirectory,
+        [int]$TimeoutSeconds,
+        [int]$PollSeconds,
+        [string]$CycleOutputDirectory
+    )
+
+    $results = @()
+    $recordNumber = 0
+
+    foreach ($record in @($PatchPlanRecords)) {
+        $recordNumber++
+
+        if ($record.action -ne 'Install') {
+            $results += [pscustomobject]@{
+                vmName = $record.vmName
+                action = $record.action
+                outcome = 'Skipped'
+                installResult = $null
+                reason = $record.reason
+                rebootRequired = $false
+                errors = @()
+            }
+            continue
+        }
+
+        $selectedKeys = @()
+        $seenSelectedKeys = @{}
+        foreach ($selectedUpdate in @($record.selectedUpdates)) {
+            $selectedKey = ([string](Get-ObjectPropertyValue -InputObject $selectedUpdate -Path @('identityKey'))).Trim()
+            if ([string]::IsNullOrWhiteSpace($selectedKey)) {
+                continue
+            }
+
+            if (-not $seenSelectedKeys.ContainsKey($selectedKey)) {
+                $seenSelectedKeys[$selectedKey] = $true
+                $selectedKeys += $selectedKey
+            }
+        }
+
+        $vmOutputDirectory = Join-Path $CycleOutputDirectory ('{0:D3}-apply-{1}' -f $recordNumber, (Get-SafeFileName -Value $record.vmName))
+        Write-Step -Message ('Apply starting for VM {0} with {1} selected update(s).' -f $record.vmName, $selectedKeys.Count)
+
+        if ($selectedKeys.Count -eq 0) {
+            $reason = 'No selected update keys were available for apply.'
+            $results += [pscustomobject]@{
+                vmName = $record.vmName
+                action = 'Install'
+                outcome = 'Failed'
+                installResult = $null
+                reason = $reason
+                rebootRequired = $false
+                errors = @($reason)
+            }
+            continue
+        }
+
+        try {
+            $cycle = Invoke-VMAgentCycle -VMName $record.vmName -Managers $Managers -GuestAuth $GuestAuth -CurlPath $CurlPath -AgentPath $AgentPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $vmOutputDirectory -MaxUpdates $selectedKeys.Count -SelectedUpdateKeys $selectedKeys -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
+            $status = $cycle.Status
+            $outcome = Get-ObjectPropertyValue -InputObject $status -Path @('outcome')
+            $installResult = Get-ObjectPropertyValue -InputObject $status -Path @('installResult', 'result')
+            $pendingAfter = [bool](Get-ObjectPropertyValue -InputObject $status -Path @('pendingRebootAfter', 'isPending') -DefaultValue $false)
+            $rebootFromInstall = [bool](Get-ObjectPropertyValue -InputObject $status -Path @('installResult', 'rebootRequired') -DefaultValue $false)
+            $rebootRequired = ($pendingAfter -or $rebootFromInstall)
+            $errors = @(Get-ObjectPropertyValue -InputObject $status -Path @('errors') -DefaultValue @())
+
+            if (-not $cycle.AgentResult.Completed) {
+                $reason = 'Apply guest process did not complete.'
+                $errors += $reason
+                $results += [pscustomobject]@{
+                    vmName = $record.vmName
+                    action = 'Install'
+                    outcome = 'Failed'
+                    installResult = $installResult
+                    reason = $reason
+                    rebootRequired = $rebootRequired
+                    errors = @($errors)
+                }
+                continue
+            }
+
+            if ($null -ne $cycle.AgentResult.ExitCode -and [int]$cycle.AgentResult.ExitCode -ne 0) {
+                $reason = 'Apply guest process exited with code {0}.' -f $cycle.AgentResult.ExitCode
+                $errors += $reason
+                $results += [pscustomobject]@{
+                    vmName = $record.vmName
+                    action = 'Install'
+                    outcome = 'Failed'
+                    installResult = $installResult
+                    reason = $reason
+                    rebootRequired = $rebootRequired
+                    errors = @($errors)
+                }
+                continue
+            }
+
+            $results += [pscustomobject]@{
+                vmName = $record.vmName
+                action = 'Install'
+                outcome = $outcome
+                installResult = $installResult
+                reason = ''
+                rebootRequired = $rebootRequired
+                errors = @($errors)
+            }
+        }
+        catch {
+            $results += [pscustomobject]@{
+                vmName = $record.vmName
+                action = 'Install'
+                outcome = 'Failed'
+                installResult = $null
+                reason = $_.Exception.Message
+                rebootRequired = $false
+                errors = @($_.Exception.Message)
+            }
+        }
+    }
+
+    $applyResultsPath = Join-Path $CycleOutputDirectory 'apply-results.json'
+    $results | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $applyResultsPath -Encoding UTF8
+    return @($results)
+}
+
 function Invoke-DiscoveryPhase {
     param(
         [string[]]$TargetVMNames,
@@ -1015,12 +1155,12 @@ try {
                 $scriptExitCode = 1
             }
             else {
-                Write-Warning 'Apply phase is not implemented yet. No changes were applied.'
-                if ($failedDiscoveryRecords.Count -gt 0) {
-                    $scriptExitCode = 1
+                $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestAuth $guestAuth -CurlPath $curlPath -AgentPath $AgentPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory)
+                if (Test-ApplyResultsSuccessful -ApplyResults $applyResults) {
+                    $scriptExitCode = 0
                 }
                 else {
-                    $scriptExitCode = 0
+                    $scriptExitCode = 1
                 }
             }
         }
@@ -1104,7 +1244,6 @@ try {
         $searchRun = Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SearchOnly -Description 'Starting guest WUA search.'
         $searchStatus = $searchRun.Status
         $searchOutcome = Get-ObjectPropertyValue -InputObject $searchStatus -Path @('outcome')
-        $searchDiscoverySucceeded = Test-IsSuccessfulDiscoveryOutcome -Outcome $searchOutcome
         $searchAvailableUpdateCount = [int](Get-ObjectPropertyValue -InputObject $searchStatus -Path @('availableUpdateCount') -DefaultValue 0)
         $failoverClusterDetected = [bool](Get-ObjectPropertyValue -InputObject $searchStatus -Path @('roleFlags', 'failoverCluster') -DefaultValue $false)
         $discoveryRecords = @(New-DiscoveryRecord -VMName $VMName -Status $searchStatus -OutputDirectory $runOutputDirectory)
@@ -1152,8 +1291,8 @@ try {
             $scriptExitCode = 1
         }
         else {
-            Write-Warning 'Apply phase is not implemented yet. No changes were applied.'
-            if ($searchDiscoverySucceeded) {
+            $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestAuth $guestAuth -CurlPath $curlPath -AgentPath $AgentPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory)
+            if (Test-ApplyResultsSuccessful -ApplyResults $applyResults) {
                 $scriptExitCode = 0
             }
             else {

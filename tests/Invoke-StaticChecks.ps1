@@ -82,6 +82,19 @@ function Assert-TextDoesNotMatch {
     }
 }
 
+function Assert-TextMatches {
+    param(
+        [string]$RelativePath,
+        [string]$Text,
+        [string]$Pattern,
+        [string]$Reason
+    )
+
+    if ($Text -notmatch $Pattern) {
+        Add-Failure -Message ("{0} does not match required pattern ({1}): {2}" -f $RelativePath, $Reason, $Pattern)
+    }
+}
+
 function Assert-NoForbiddenCommand {
     param(
         [System.Management.Automation.Language.Ast]$Ast,
@@ -202,6 +215,8 @@ if ($existingScripts.ContainsKey($agentPath)) {
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Get-OptionalPropertyValue'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'SelectedUpdateIds'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'SelectedUpdateKeys'
+    Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle '$selectedUpdateKeyPart'
+    Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle "-split ','"
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'identityKey'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'New-UpdateIdentityKey'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Get-ComCategoryCollection'
@@ -264,6 +279,21 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'selectedByDefault'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'New-DiscoveryRecord'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Invoke-VMAgentCycle'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Invoke-ApplyPhase'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'apply-results.json'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SelectedUpdateKeys'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'InstallSucceeded'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'RebootRequired'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Test-ApplyResultsSuccessful'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "`$_.action -eq 'Install' -and `$_.outcome -ne 'InstallSucceeded'"
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "`$_.action -ne 'Install' -and `$_.reason -eq 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.'"
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$cycle.AgentResult.Completed'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$cycle.AgentResult.ExitCode'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Apply guest process did not complete.'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Apply guest process exited with code'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'No selected update keys were available for apply.'
+    Assert-TextMatches -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)if\s*\(\$record\.action\s+-ne\s+''Install''\).*?outcome\s*=\s*''Skipped''.*?installResult\s*=\s*\$null.*?continue' -Reason 'skipped apply results include installResult'
+    Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '\$applyResults\s*\|\s*Where-Object\s*\{\s*\$_\.outcome\s+-in\s+@\(''Failed'',\s*''InstallFailed'',\s*''InstallSucceededWithErrors'',\s*''DownloadFailed''\)' -Reason 'apply exit must use explicit success criteria, not an outcome deny-list'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'New-UniqueOutputDirectory'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "'{0:D3}-{1}' -f"
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'DiscoveryFailed'
