@@ -306,12 +306,19 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'New-DiscoveryRecord'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Invoke-ApplyPhase'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'apply-results.json'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Write-FinalReport'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'summary.csv'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'summary.md'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'VMs requiring reboot'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'VMs rejected by Failover Cluster'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SelectedUpdateKeys'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'InstallSucceeded'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'RebootRequired'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Test-ApplyResultsSuccessful'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "`$_.action -eq 'Install' -and `$_.outcome -ne 'InstallSucceeded'"
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "`$_.action -ne 'Install' -and `$_.reason -eq 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.'"
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "`$ApplyResult.action -eq 'Install' -and `$ApplyResult.outcome -ne 'InstallSucceeded'"
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "`$ApplyResult.action -ne 'Install' -and `$ApplyResult.reason -eq 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.'"
+    Assert-TextMatches -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)function\s+Test-ApplyResultsSuccessful\b.*?Test-IsApplyResultError\s+-ApplyResult\s+\$_' -Reason 'apply success uses shared apply-result error semantics'
+    Assert-TextMatches -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)function\s+Write-FinalReport\b.*?\$errors\s*=\s*@\(\$ApplyResults\s*\|\s*Where-Object\s*\{\s*Test-IsApplyResultError\s+-ApplyResult\s+\$_\s*\}\)' -Reason 'final report errors use shared apply-result error semantics'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$cycle.AgentResult.Completed'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$cycle.AgentResult.ExitCode'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Apply guest process did not complete.'

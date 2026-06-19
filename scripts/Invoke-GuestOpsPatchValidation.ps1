@@ -681,13 +681,20 @@ function New-DiscoveryRecordFromAgentRun {
     return $record
 }
 
+function Test-IsApplyResultError {
+    param($ApplyResult)
+
+    return (
+        ($ApplyResult.action -eq 'Install' -and $ApplyResult.outcome -ne 'InstallSucceeded') -or
+        ($ApplyResult.action -ne 'Install' -and $ApplyResult.reason -eq 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.')
+    )
+}
+
 function Test-ApplyResultsSuccessful {
     param($ApplyResults)
 
-    $installFailures = @($ApplyResults | Where-Object { $_.action -eq 'Install' -and $_.outcome -ne 'InstallSucceeded' })
-    $discoveryFailureSkips = @($ApplyResults | Where-Object { $_.action -ne 'Install' -and $_.reason -eq 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.' })
-
-    return ($installFailures.Count -eq 0 -and $discoveryFailureSkips.Count -eq 0)
+    $errors = @($ApplyResults | Where-Object { Test-IsApplyResultError -ApplyResult $_ })
+    return ($errors.Count -eq 0)
 }
 
 function New-ApplyResultFromCycle {
@@ -902,6 +909,64 @@ function Invoke-ApplyPhase {
     return @($results)
 }
 
+function Write-FinalReport {
+    param(
+        $PatchPlanRecords,
+        $ApplyResults,
+        [string]$CycleOutputDirectory
+    )
+
+    $summaryRows = @(ConvertTo-PatchSummaryRows -PatchPlanRecords $PatchPlanRecords)
+    $csvPath = Join-Path $CycleOutputDirectory 'summary.csv'
+    $summaryRows | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
+
+    $patched = @($ApplyResults | Where-Object { $_.outcome -eq 'InstallSucceeded' })
+    $noUpdates = @($PatchPlanRecords | Where-Object { $_.action -eq 'NoSelectedUpdates' })
+    $skipped = @($PatchPlanRecords | Where-Object { $_.action -eq 'Skip' })
+    $rebootRequired = @($ApplyResults | Where-Object { $_.rebootRequired })
+    $errors = @($ApplyResults | Where-Object { Test-IsApplyResultError -ApplyResult $_ })
+    $clusters = @($PatchPlanRecords | Where-Object { $_.reason -eq 'Skipped: Failover Cluster detected. Please update manually one by one.' })
+
+    $lines = @()
+    $lines += '# Patch summary'
+    $lines += ''
+    $lines += ('Output directory: `{0}`' -f $CycleOutputDirectory)
+    $lines += ''
+    $lines += ('- VMs patched: {0}' -f $patched.Count)
+    $lines += ('- VMs without selected updates: {0}' -f $noUpdates.Count)
+    $lines += ('- VMs skipped: {0}' -f $skipped.Count)
+    $lines += ('- VMs requiring reboot: {0}' -f $rebootRequired.Count)
+    $lines += ('- VMs with errors: {0}' -f $errors.Count)
+    $lines += ('- VMs rejected by Failover Cluster: {0}' -f $clusters.Count)
+    $lines += ''
+
+    foreach ($section in @(
+        [pscustomobject]@{ Title = 'VMs requiring reboot'; Rows = $rebootRequired },
+        [pscustomobject]@{ Title = 'VMs with errors'; Rows = $errors },
+        [pscustomobject]@{ Title = 'VMs rejected by Failover Cluster'; Rows = $clusters }
+    )) {
+        $lines += ('## {0}' -f $section.Title)
+        if (@($section.Rows).Count -eq 0) {
+            $lines += '- none'
+        }
+        else {
+            foreach ($row in @($section.Rows)) {
+                $lines += ('- {0}' -f $row.vmName)
+            }
+        }
+        $lines += ''
+    }
+
+    $markdownPath = Join-Path $CycleOutputDirectory 'summary.md'
+    Set-Content -LiteralPath $markdownPath -Value $lines -Encoding UTF8
+
+    Write-Host ''
+    Write-Host 'Final report'
+    Write-Host '------------'
+    Write-Host ('Summary CSV: {0}' -f $csvPath)
+    Write-Host ('Summary Markdown: {0}' -f $markdownPath)
+}
+
 function Invoke-DiscoveryPhase {
     param(
         [string[]]$TargetVMNames,
@@ -1093,6 +1158,7 @@ try {
             }
             else {
                 $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit)
+                Write-FinalReport -PatchPlanRecords $patchPlanRecords -ApplyResults $applyResults -CycleOutputDirectory $runOutputDirectory
                 if (Test-ApplyResultsSuccessful -ApplyResults $applyResults) {
                     $scriptExitCode = 0
                 }
@@ -1229,6 +1295,7 @@ try {
         }
         else {
             $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit)
+            Write-FinalReport -PatchPlanRecords $patchPlanRecords -ApplyResults $applyResults -CycleOutputDirectory $runOutputDirectory
             if (Test-ApplyResultsSuccessful -ApplyResults $applyResults) {
                 $scriptExitCode = 0
             }
