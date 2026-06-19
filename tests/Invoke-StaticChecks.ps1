@@ -174,12 +174,13 @@ function Assert-NoReservedVariableName {
 
 $agentPath = 'guest\Run-LocalPatch.ps1'
 $orchestratorPath = 'scripts\Invoke-GuestOpsPatchValidation.ps1'
+$guestOpsLibPath = 'scripts\GuestOpsLib.ps1'
 $launcherPath = 'Start-PatchingGuestOps.ps1'
 $modelPath = 'scripts\PatchPlanModel.ps1'
 $modelTestPath = 'tests\Invoke-ModelChecks.ps1'
 
 $existingScripts = @{}
-foreach ($relativePath in @($agentPath, $orchestratorPath, $launcherPath, $modelPath, $modelTestPath)) {
+foreach ($relativePath in @($agentPath, $orchestratorPath, $guestOpsLibPath, $launcherPath, $modelPath, $modelTestPath)) {
     $path = Assert-FileExists -RelativePath $relativePath
     if ($path) {
         $existingScripts[$relativePath] = $path
@@ -227,6 +228,26 @@ if ($existingScripts.ContainsKey($agentPath)) {
     Assert-TextDoesNotMatch -RelativePath $agentPath -Text $agentText -Pattern '(?i)\$[a-z_][a-z0-9_]*\.HResult\b' -Reason 'WUA COM HResult can be absent under StrictMode'
 }
 
+if ($existingScripts.ContainsKey($guestOpsLibPath)) {
+    $guestOpsLibAst = Get-ScriptAst -RelativePath $guestOpsLibPath -Path $existingScripts[$guestOpsLibPath]
+    $guestOpsLibText = Get-ScriptText -Path $existingScripts[$guestOpsLibPath]
+
+    Assert-NoForbiddenCommand -Ast $guestOpsLibAst -RelativePath $guestOpsLibPath -ForbiddenNames $forbiddenCommands
+    Assert-NoForbiddenCommandLiteral -RelativePath $guestOpsLibPath -Text $guestOpsLibText -ForbiddenNames $forbiddenCommands
+    Assert-NoReservedVariableName -Ast $guestOpsLibAst -RelativePath $guestOpsLibPath -ReservedNames $reservedVariableNames
+    Assert-TextDoesNotMatch -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Invoke-VMAgentCycle'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Invoke-GuestAgentRun'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'New-GuestAuthentication'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Get-ObjectPropertyValue'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'StartProgramInGuest'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'ListProcessesInGuest'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'InitiateFileTransferToGuest'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'InitiateFileTransferFromGuest'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'SelectedUpdateIds'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle "@(`$SelectedUpdateIds) -join ','"
+}
+
 if ($existingScripts.ContainsKey($orchestratorPath)) {
     $orchestratorAst = Get-ScriptAst -RelativePath $orchestratorPath -Path $existingScripts[$orchestratorPath]
     $orchestratorText = Get-ScriptText -Path $existingScripts[$orchestratorPath]
@@ -235,10 +256,6 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-NoForbiddenCommandLiteral -RelativePath $orchestratorPath -Text $orchestratorText -ForbiddenNames $forbiddenCommands
     Assert-NoReservedVariableName -Ast $orchestratorAst -RelativePath $orchestratorPath -ReservedNames $reservedVariableNames
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'StartProgramInGuest'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'ListProcessesInGuest'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'InitiateFileTransferToGuest'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'InitiateFileTransferFromGuest'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'curl.exe'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Agent errors:'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Pending reboot checks:'
@@ -247,11 +264,20 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Read-UpdateSelection'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Available updates'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'A for all'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SelectedUpdateIds'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "@(`$SelectedUpdateIds) -join ','"
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'VMNames'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'VMListPath'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'ThrottleLimit'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Invoke-ThrottledJobs'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Start-Job'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Receive-Job'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'New-ThrottledJobErrorResult'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'StartedAt'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'JobTimeoutSeconds'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Stop-Job'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Receive-Job returned no output.'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'catch { }'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'GuestOpsLib.ps1'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$JobInput.GuestOpsLibPath'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'PlanOnly'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SkipConfirmation'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SelectedUpdateKeys'
@@ -278,7 +304,6 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Selected update key is not present in discovered update groups:'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'selectedByDefault'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'New-DiscoveryRecord'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Invoke-VMAgentCycle'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Invoke-ApplyPhase'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'apply-results.json'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SelectedUpdateKeys'
