@@ -517,6 +517,121 @@ function Read-UpdateSelection {
     }
 }
 
+function Show-UpdateGroups {
+    param($UpdateGroups)
+
+    Write-Host ''
+    Write-Host 'Available update groups'
+    Write-Host '-----------------------'
+
+    $index = 1
+    foreach ($group in @($UpdateGroups)) {
+        $mark = if ($group.selectedByDefault) { 'x' } else { ' ' }
+        $kbText = if ([string]::IsNullOrWhiteSpace([string]$group.kbText)) { 'No KB' } else { [string]$group.kbText }
+        Write-Host ('[{0}] {1}. {2} - {3}' -f $mark, $index, $kbText, $group.title)
+        Write-Host ('    Applies to: {0} VM; Patchable: {1} VM' -f $group.appliesToVmCount, $group.patchableVmCount)
+        Write-Host ('    Key: {0}' -f $group.identityKey)
+        $index++
+    }
+}
+
+function Resolve-SelectedUpdateKeys {
+    param(
+        $UpdateGroups,
+        [string[]]$ExplicitSelectedUpdateKeys = @()
+    )
+
+    $explicitKeyValues = @($ExplicitSelectedUpdateKeys)
+    if ($explicitKeyValues.Count -gt 0) {
+        $knownKeys = @{}
+        foreach ($group in @($UpdateGroups)) {
+            if ($null -eq $group) {
+                continue
+            }
+
+            $knownKey = ([string]$group.identityKey).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($knownKey)) {
+                $knownKeys[$knownKey] = $true
+            }
+        }
+
+        $selectedKeys = New-Object System.Collections.Generic.List[string]
+        $seenSelectedKeys = @{}
+        foreach ($explicitKey in $explicitKeyValues) {
+            $selectedKey = ([string]$explicitKey).Trim()
+            if ([string]::IsNullOrWhiteSpace($selectedKey)) {
+                continue
+            }
+
+            if (-not $seenSelectedKeys.ContainsKey($selectedKey)) {
+                $seenSelectedKeys[$selectedKey] = $true
+                [void]$selectedKeys.Add($selectedKey)
+            }
+        }
+
+        if ($selectedKeys.Count -eq 0) {
+            throw 'SelectedUpdateKeys did not contain any non-empty update keys.'
+        }
+
+        foreach ($selectedKey in @($selectedKeys.ToArray())) {
+            if (-not $knownKeys.ContainsKey($selectedKey)) {
+                throw ('Selected update key is not present in discovered update groups: {0}' -f $selectedKey)
+            }
+        }
+
+        return @($selectedKeys.ToArray())
+    }
+
+    return @(@($UpdateGroups) | Where-Object { $_.selectedByDefault } | ForEach-Object { [string]$_.identityKey })
+}
+
+function Read-UpdateGroupSelection {
+    param($UpdateGroups)
+
+    $groups = @($UpdateGroups)
+    $selected = @{}
+    for ($i = 0; $i -lt $groups.Count; $i++) {
+        $selected[$i] = [bool]$groups[$i].selectedByDefault
+    }
+
+    while ($true) {
+        Write-Host ''
+        Write-Host 'Toggle update groups by number, press Enter to accept current selection.'
+        for ($i = 0; $i -lt $groups.Count; $i++) {
+            $mark = if ($selected[$i]) { 'x' } else { ' ' }
+            Write-Host ('[{0}] {1}. {2}' -f $mark, ($i + 1), $groups[$i].title)
+        }
+
+        $inputText = Read-Host 'Group number to toggle'
+        if ([string]::IsNullOrWhiteSpace($inputText)) {
+            break
+        }
+
+        $displayNumber = 0
+        if (-not [int]::TryParse($inputText, [ref]$displayNumber)) {
+            Write-Warning ('Invalid group number: {0}' -f $inputText)
+            continue
+        }
+
+        if ($displayNumber -lt 1 -or $displayNumber -gt $groups.Count) {
+            Write-Warning ('Group number {0} is outside the range 1..{1}.' -f $displayNumber, $groups.Count)
+            continue
+        }
+
+        $selectedIndex = $displayNumber - 1
+        $selected[$selectedIndex] = -not $selected[$selectedIndex]
+    }
+
+    $selectedKeys = @()
+    for ($i = 0; $i -lt $groups.Count; $i++) {
+        if ($selected[$i]) {
+            $selectedKeys += [string]$groups[$i].identityKey
+        }
+    }
+
+    return $selectedKeys
+}
+
 function Invoke-GuestAgentRun {
     param(
         $ProcessManager,
@@ -736,12 +851,17 @@ function Invoke-DiscoveryPhase {
 }
 
 $targetVMNames = @(Resolve-VMTargetNames -SingleVMName $VMName -ManyVMNames $VMNames -ListPath $VMListPath)
+$hasExplicitSelectedUpdateKeys = $PSBoundParameters.ContainsKey('SelectedUpdateKeys')
 if ($PlanOnly) {
     throw 'PlanOnly is not available until patch plan generation is implemented.'
 }
 
-if ($SelectedUpdateKeys -and @($SelectedUpdateKeys).Count -gt 0) {
-    throw 'SelectedUpdateKeys is not available until patch plan application is implemented.'
+if (-not [string]::IsNullOrWhiteSpace($InstallSelection)) {
+    throw 'InstallSelection is not supported with grouped update selection. Use SelectedUpdateKeys instead.'
+}
+
+if ($hasExplicitSelectedUpdateKeys -and @($SelectedUpdateKeys).Count -eq 0) {
+    throw 'SelectedUpdateKeys did not contain any non-empty update keys.'
 }
 
 if ([string]::IsNullOrWhiteSpace($VMName)) {
@@ -787,6 +907,23 @@ try {
         }
         else {
             $scriptExitCode = 0
+        }
+
+        $updateGroups = @(New-UpdateGroupRecords -DiscoveryRecords $discoveryRecords | Sort-Object kbText,title)
+        Show-UpdateGroups -UpdateGroups $updateGroups
+
+        if (-not $SearchOnly) {
+            if ($hasExplicitSelectedUpdateKeys) {
+                $selectedKeysForPlan = Resolve-SelectedUpdateKeys -UpdateGroups $updateGroups -ExplicitSelectedUpdateKeys $SelectedUpdateKeys
+            }
+            elseif ($updateGroups.Count -gt 0) {
+                $selectedKeysForPlan = Read-UpdateGroupSelection -UpdateGroups $updateGroups
+            }
+            else {
+                $selectedKeysForPlan = @()
+            }
+
+            Write-Step -Message ('Selected update group key(s): {0}' -f @($selectedKeysForPlan).Count)
         }
     }
     else {
@@ -838,6 +975,9 @@ try {
         $agentRun = Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SearchOnly -Description 'Starting guest WUA search.'
         $agentResult = $agentRun.AgentResult
         $status = $agentRun.Status
+        $discoveryRecords = @(New-DiscoveryRecord -VMName $VMName -Status $status -OutputDirectory $runOutputDirectory)
+        $updateGroups = @(New-UpdateGroupRecords -DiscoveryRecords $discoveryRecords | Sort-Object kbText,title)
+        Show-UpdateGroups -UpdateGroups $updateGroups
     }
     else {
         $searchRun = Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SearchOnly -Description 'Starting guest WUA search.'
@@ -845,6 +985,9 @@ try {
         $searchOutcome = Get-ObjectPropertyValue -InputObject $searchStatus -Path @('outcome')
         $searchAvailableUpdateCount = [int](Get-ObjectPropertyValue -InputObject $searchStatus -Path @('availableUpdateCount') -DefaultValue 0)
         $failoverClusterDetected = [bool](Get-ObjectPropertyValue -InputObject $searchStatus -Path @('roleFlags', 'failoverCluster') -DefaultValue $false)
+        $discoveryRecords = @(New-DiscoveryRecord -VMName $VMName -Status $searchStatus -OutputDirectory $runOutputDirectory)
+        $updateGroups = @(New-UpdateGroupRecords -DiscoveryRecords $discoveryRecords | Sort-Object kbText,title)
+        Show-UpdateGroups -UpdateGroups $updateGroups
 
         if ($failoverClusterDetected) {
             Write-Warning 'Skipped: Failover Cluster detected. Please update manually one by one.'
@@ -856,40 +999,19 @@ try {
             $status = $searchStatus
         }
         else {
-            $availableUpdates = Get-ObjectPropertyValue -InputObject $searchStatus -Path @('updates')
-            if ($null -eq $availableUpdates) {
-                $availableUpdates = @()
+            if ($hasExplicitSelectedUpdateKeys) {
+                $selectedKeysForPlan = Resolve-SelectedUpdateKeys -UpdateGroups $updateGroups -ExplicitSelectedUpdateKeys $SelectedUpdateKeys
             }
-
-            Show-AvailableUpdates -Updates $availableUpdates
-
-            if ([string]::IsNullOrWhiteSpace($InstallSelection)) {
-                $selectedUpdateIndexes = Read-UpdateSelection -Updates $availableUpdates
+            elseif ($updateGroups.Count -gt 0) {
+                $selectedKeysForPlan = Read-UpdateGroupSelection -UpdateGroups $updateGroups
             }
             else {
-                $selectedUpdateIndexes = Resolve-UpdateSelection -Selection $InstallSelection -Updates $availableUpdates
+                $selectedKeysForPlan = @()
             }
 
-            $selectedDisplayNumbers = @($selectedUpdateIndexes | ForEach-Object { [string]($_ + 1) })
-            Write-Step -Message ('Selected update number(s): {0}' -f ($selectedDisplayNumbers -join ','))
-
-            # Translate the operator's positional choices into stable UpdateIDs so the
-            # install pass selects by identity, immune to WUA re-ordering between passes.
-            $availableUpdateList = @($availableUpdates)
-            $selectedUpdateIds = @()
-            foreach ($selectedUpdateIndex in @($selectedUpdateIndexes)) {
-                $selectedUpdate = $availableUpdateList[$selectedUpdateIndex]
-                $selectedUpdateId = Get-ObjectPropertyValue -InputObject $selectedUpdate -Path @('updateId')
-                if ([string]::IsNullOrWhiteSpace([string]$selectedUpdateId)) {
-                    throw ('Selected update number {0} has no updateId and cannot be installed reliably.' -f ($selectedUpdateIndex + 1))
-                }
-
-                $selectedUpdateIds += [string]$selectedUpdateId
-            }
-
-            $installRun = Invoke-GuestAgentRun @agentRunParams -MaxUpdates @($selectedUpdateIds).Count -SelectedUpdateIds $selectedUpdateIds -Description 'Starting guest WUA install.'
-            $agentResult = $installRun.AgentResult
-            $status = $installRun.Status
+            Write-Step -Message ('Selected update group key(s): {0}' -f @($selectedKeysForPlan).Count)
+            $agentResult = $searchRun.AgentResult
+            $status = $searchStatus
         }
     }
 

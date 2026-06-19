@@ -240,10 +240,20 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'PlanOnly'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SkipConfirmation'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SelectedUpdateKeys'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "PSBoundParameters.ContainsKey('SelectedUpdateKeys')"
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'InstallSelection is not supported with grouped update selection. Use SelectedUpdateKeys instead.'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Resolve-VMTargetNames'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Invoke-DiscoveryPhase'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'discovery.json'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Discovery summary'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Available update groups'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Show-UpdateGroups'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Read-UpdateGroupSelection'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Resolve-SelectedUpdateKeys'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '@($SelectedUpdateKeys).Count -eq 0'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SelectedUpdateKeys did not contain any non-empty update keys.'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Selected update key is not present in discovered update groups:'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'selectedByDefault'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'New-DiscoveryRecord'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Invoke-VMAgentCycle'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'New-UniqueOutputDirectory'
@@ -281,6 +291,7 @@ if ($existingScripts.ContainsKey($launcherPath)) {
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'PlanOnly'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'SkipConfirmation'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'SelectedUpdateKeys'
+    Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle "PSBoundParameters.ContainsKey('SelectedUpdateKeys')"
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Resolve-VMTargetNames'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle '$PSScriptRoot'
 }

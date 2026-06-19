@@ -156,7 +156,7 @@ if (-not [string]::IsNullOrWhiteSpace($InstallSelection)) {
     $orchestratorParams.InstallSelection = $InstallSelection
 }
 
-if ($SelectedUpdateKeys -and @($SelectedUpdateKeys).Count -gt 0) {
+if ($PSBoundParameters.ContainsKey('SelectedUpdateKeys')) {
     $orchestratorParams.SelectedUpdateKeys = $SelectedUpdateKeys
 }
 
