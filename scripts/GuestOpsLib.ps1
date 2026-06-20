@@ -16,16 +16,16 @@ function New-GuestAuthentication {
 function Get-ExactVM {
     param([string]$Name)
 
-    $matches = @(Get-VM -Name $Name -ErrorAction Stop | Where-Object { $_.Name -eq $Name })
-    if ($matches.Count -eq 0) {
+    $exactMatches = @(Get-VM -Name $Name -ErrorAction Stop | Where-Object { $_.Name -eq $Name })
+    if ($exactMatches.Count -eq 0) {
         throw ('VM not found: {0}' -f $Name)
     }
 
-    if ($matches.Count -gt 1) {
+    if ($exactMatches.Count -gt 1) {
         throw ('More than one VM matched exact name: {0}' -f $Name)
     }
 
-    return $matches[0]
+    return $exactMatches[0]
 }
 
 function Assert-VMReadyForGuestOps {

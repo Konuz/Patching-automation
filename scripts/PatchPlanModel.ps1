@@ -74,12 +74,23 @@ function Get-UpdateIdentityKey {
             throw 'Update identity requires both updateId and revisionNumber when either field is supplied.'
         }
 
+        $updateIdValue = [string](Get-ModelPropertyValue -InputObject $Update -Name 'updateId')
         $revisionNumber = Get-ModelPropertyValue -InputObject $Update -Name 'revisionNumber'
-        if ([string]::IsNullOrWhiteSpace([string]$revisionNumber)) {
+        $revisionIsBlank = [string]::IsNullOrWhiteSpace([string]$revisionNumber)
+
+        # The guest agent records updateId/revisionNumber as $null when the WUA COM
+        # Identity read fails (Run-LocalPatch.ps1 New-UpdateRecord catch branch). Such an
+        # update cannot be grouped or selected by identity; report it as keyless (callers
+        # skip it) instead of throwing and aborting planning for the whole batch.
+        if ([string]::IsNullOrWhiteSpace($updateIdValue) -and $revisionIsBlank) {
+            return $null
+        }
+
+        if ($revisionIsBlank) {
             throw 'RevisionNumber is required to build an update identity key.'
         }
 
-        $computedIdentityKey = New-UpdateIdentityKey -UpdateId ([string](Get-ModelPropertyValue -InputObject $Update -Name 'updateId')) -RevisionNumber ([int]$revisionNumber)
+        $computedIdentityKey = New-UpdateIdentityKey -UpdateId $updateIdValue -RevisionNumber ([int]$revisionNumber)
         if (-not [string]::IsNullOrWhiteSpace($identityKey) -and $identityKey -ne $computedIdentityKey) {
             throw ('Update identity key drift detected. Expected {0}; actual {1}.' -f $computedIdentityKey, $identityKey)
         }
@@ -138,7 +149,7 @@ function Get-DefaultUpdateSelection {
         return $false
     }
 
-    if ($text -match '(?i)browse[- ]only|optional') {
+    if ($text -match '(?i)browse[- ]only|\boptional\b') {
         return $false
     }
 
@@ -216,6 +227,11 @@ function New-UpdateGroupRecords {
             }
 
             $identityKey = Get-UpdateIdentityKey -Update $update
+            if ([string]::IsNullOrWhiteSpace($identityKey)) {
+                Write-Warning ('Skipping update without a resolvable identity key on VM {0}: {1}' -f $vmName, [string](Get-ModelPropertyValue -InputObject $update -Name 'title'))
+                continue
+            }
+
             if (-not $groups.ContainsKey($identityKey)) {
                 $title = Get-ModelPropertyValue -InputObject $update -Name 'title'
                 $categories = @(Get-ModelPropertyValue -InputObject $update -Name 'categories' -DefaultValue @())
@@ -229,7 +245,6 @@ function New-UpdateGroupRecords {
                     kbArticleIds = $kbArticleIds
                     kbText = Get-UpdateKbText -KbArticleIds $kbArticleIds
                     categories = $categories
-                    selectedByDefault = Get-DefaultUpdateSelection -Title ([string]$title) -Categories $categories
                     appliesToVmNames = New-Object System.Collections.Generic.List[string]
                     patchableVmNames = New-Object System.Collections.Generic.List[string]
                     appliesToVmLookup = @{}
@@ -260,6 +275,12 @@ function New-UpdateGroupRecords {
         $appliesToVmNames = @($group.appliesToVmNames.ToArray())
         $patchableVmNames = @($group.patchableVmNames.ToArray())
 
+        # Only preselect a group the default policy wants AND that has at least one
+        # patchable VM. A group whose sole applicable VM is a Failover Cluster (excluded
+        # from patchableVmNames) would otherwise show a checked box with "Patchable: 0 VM"
+        # and produce a default plan that installs on nothing.
+        $selectedByDefault = ([bool](Get-DefaultUpdateSelection -Title ([string]$group.title) -Categories $group.categories)) -and ($patchableVmNames.Count -gt 0)
+
         $records += [pscustomobject]@{
             identityKey = $group.identityKey
             updateId = $group.updateId
@@ -268,7 +289,7 @@ function New-UpdateGroupRecords {
             kbArticleIds = @($group.kbArticleIds)
             kbText = $group.kbText
             categories = @($group.categories)
-            selectedByDefault = [bool]$group.selectedByDefault
+            selectedByDefault = $selectedByDefault
             appliesToVmNames = $appliesToVmNames
             patchableVmNames = $patchableVmNames
             appliesToVmCount = $appliesToVmNames.Count
@@ -325,6 +346,10 @@ function New-PatchPlanRecords {
             }
 
             $identityKey = Get-UpdateIdentityKey -Update $update
+            if ([string]::IsNullOrWhiteSpace($identityKey)) {
+                continue
+            }
+
             if ($selectedKeyLookup.ContainsKey($identityKey)) {
                 $selectedUpdates += New-UpdatePlanRecord -Update $update -IdentityKey $identityKey
             }

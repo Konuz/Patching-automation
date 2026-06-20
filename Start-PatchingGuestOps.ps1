@@ -137,6 +137,13 @@ if (-not $SkipStaticChecks) {
 $VIServer = Read-RequiredValue -CurrentValue $VIServer -Prompt 'vCenter'
 $resolvedVMNames = @(Resolve-VMTargetNames -SingleVMName $VMName -ManyVMNames $VMNames -ListPath $VMListPath)
 
+# Index selection was replaced by grouped selection (-SelectedUpdateKeys); the
+# orchestrator throws on InstallSelection. Reject it here, before prompting for
+# credentials, so the operator is not asked for two credential sets only to fail.
+if (-not [string]::IsNullOrWhiteSpace($InstallSelection)) {
+    throw 'InstallSelection is not supported with grouped update selection. Use SelectedUpdateKeys instead.'
+}
+
 if (-not $VIServerCredential) {
     $VIServerCredential = Get-Credential -Message ('Credentials for vCenter {0}' -f $VIServer)
 }
@@ -157,10 +164,6 @@ $orchestratorParams = @{
     ThrottleLimit = $ThrottleLimit
     TimeoutMinutes = $TimeoutMinutes
     PollSeconds = $PollSeconds
-}
-
-if (-not [string]::IsNullOrWhiteSpace($InstallSelection)) {
-    $orchestratorParams.InstallSelection = $InstallSelection
 }
 
 if ($PSBoundParameters.ContainsKey('SelectedUpdateKeys')) {

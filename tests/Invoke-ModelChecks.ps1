@@ -168,6 +168,7 @@ Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title '2026-06 Preview
 Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Driver update for network adapter' -Categories @('Drivers'))) -Message 'driver update skipped by default'
 Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Feature update to Windows Server' -Categories @('Upgrades'))) -Message 'feature update skipped by default'
 Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Optional browse-only update' -Categories @('Updates'))) -Message 'optional browse-only update skipped by default'
+Assert-True -Condition (Get-DefaultUpdateSelection -Title 'Security Update applied optionally' -Categories @('Security Updates')) -Message 'embedded optional substring does not deselect a security update'
 
 Assert-Equal -Actual (Get-RoleFlagText -RoleFlags $null) -Expected 'unknown' -Message 'missing role flags are unknown'
 Assert-Equal -Actual (Get-RoleFlagText -RoleFlags ([pscustomobject]@{ detected = @() })) -Expected 'none' -Message 'empty role flags are none'
@@ -205,6 +206,75 @@ Assert-Equal -Actual $vm03.reason -Expected 'Skipped: Failover Cluster detected.
 
 $noSelectionPlan = @(New-PatchPlanRecords -DiscoveryRecords @($sampleDiscovery[0]) -SelectedUpdateKeys @('33333333-3333-3333-3333-333333333333|1'))
 Assert-Equal -Actual $noSelectionPlan[0].action -Expected 'NoSelectedUpdates' -Message 'VM with no selected applicable updates is marked'
+
+# An update whose COM identity could not be read by the agent is recorded with
+# null updateId/revisionNumber/identityKey. It must be skipped, not abort the batch.
+$keylessDiscovery = @(
+    [pscustomobject]@{
+        vmName = 'VM05'
+        computerName = 'HOST05'
+        outcome = 'SearchOnly'
+        roleFlags = [pscustomobject]@{
+            failoverCluster = $false
+            detected = @()
+        }
+        updates = @(
+            [pscustomobject]@{
+                title = 'Update with unreadable identity'
+                kbArticleIds = @('5061000')
+                updateId = $null
+                revisionNumber = $null
+                identityKey = $null
+                categories = @('Security Updates')
+            },
+            [pscustomobject]@{
+                title = '2026-06 Cumulative Update for Windows Server'
+                kbArticleIds = @('5060842')
+                updateId = '11111111-1111-1111-1111-111111111111'
+                revisionNumber = 205
+                identityKey = '11111111-1111-1111-1111-111111111111|205'
+                categories = @('Security Updates')
+            }
+        )
+    }
+)
+
+$keylessGroups = @(New-UpdateGroupRecords -DiscoveryRecords $keylessDiscovery 3>$null)
+Assert-Equal -Actual $keylessGroups.Count -Expected 1 -Message 'keyless update is skipped during grouping rather than aborting'
+Assert-Equal -Actual $keylessGroups[0].identityKey -Expected '11111111-1111-1111-1111-111111111111|205' -Message 'grouping keeps the keyable update'
+
+$keylessPlan = @(New-PatchPlanRecords -DiscoveryRecords $keylessDiscovery -SelectedUpdateKeys @('11111111-1111-1111-1111-111111111111|205'))
+Assert-Equal -Actual $keylessPlan[0].action -Expected 'Install' -Message 'keyless update does not abort planning; keyable update still installs'
+Assert-Equal -Actual (@($keylessPlan[0].selectedUpdates).Count) -Expected 1 -Message 'only the keyable update is planned'
+
+# A group whose only applicable VM is a Failover Cluster has zero patchable VMs and
+# must not be preselected, even though the policy would otherwise select it.
+$clusterOnlyDiscovery = @(
+    [pscustomobject]@{
+        vmName = 'VM06'
+        computerName = 'HOST06'
+        outcome = 'SearchOnly'
+        roleFlags = [pscustomobject]@{
+            failoverCluster = $true
+            detected = @('Failover Cluster')
+        }
+        updates = @(
+            [pscustomobject]@{
+                title = '2026-06 Cumulative Update for Windows Server'
+                kbArticleIds = @('5060842')
+                updateId = '66666666-6666-6666-6666-666666666666'
+                revisionNumber = 12
+                identityKey = '66666666-6666-6666-6666-666666666666|12'
+                categories = @('Security Updates')
+            }
+        )
+    }
+)
+
+$clusterOnlyGroups = @(New-UpdateGroupRecords -DiscoveryRecords $clusterOnlyDiscovery)
+Assert-Equal -Actual $clusterOnlyGroups.Count -Expected 1 -Message 'cluster-only update still forms a group'
+Assert-Equal -Actual $clusterOnlyGroups[0].patchableVmCount -Expected 0 -Message 'cluster-only group has zero patchable VMs'
+Assert-True -Condition (-not $clusterOnlyGroups[0].selectedByDefault) -Message 'cluster-only group is not preselected'
 
 $discoveryFailurePlan = @(
     [pscustomobject]@{

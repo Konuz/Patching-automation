@@ -196,7 +196,8 @@ $forbiddenCommands = @(
 )
 
 $reservedVariableNames = @(
-    'PID'
+    'PID',
+    'matches'
 )
 
 if ($existingScripts.ContainsKey($agentPath)) {

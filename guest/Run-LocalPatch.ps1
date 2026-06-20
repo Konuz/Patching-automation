@@ -420,11 +420,14 @@ try {
 
         $selectedIdLookup = @{}
         foreach ($selectedUpdateId in @($SelectedUpdateIds)) {
-            if ([string]::IsNullOrWhiteSpace([string]$selectedUpdateId)) {
-                continue
-            }
+            foreach ($selectedUpdateIdPart in @([string]$selectedUpdateId -split ',')) {
+                $selectedId = ([string]$selectedUpdateIdPart).Trim()
+                if ([string]::IsNullOrWhiteSpace($selectedId)) {
+                    continue
+                }
 
-            $selectedIdLookup[[string]$selectedUpdateId] = $true
+                $selectedIdLookup[$selectedId] = $true
+            }
         }
 
         $hasExplicitKeySelection = ($selectedKeyLookup.Count -gt 0)
