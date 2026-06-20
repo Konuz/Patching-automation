@@ -206,6 +206,23 @@ Assert-Equal -Actual $vm03.reason -Expected 'Skipped: Failover Cluster detected.
 $noSelectionPlan = @(New-PatchPlanRecords -DiscoveryRecords @($sampleDiscovery[0]) -SelectedUpdateKeys @('33333333-3333-3333-3333-333333333333|1'))
 Assert-Equal -Actual $noSelectionPlan[0].action -Expected 'NoSelectedUpdates' -Message 'VM with no selected applicable updates is marked'
 
+$discoveryFailurePlan = @(
+    [pscustomobject]@{
+        vmName = 'VM04'
+        computerName = 'HOST04'
+        action = 'Skip'
+        reason = 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.'
+        roleFlags = [pscustomobject]@{
+            failoverCluster = $false
+            detected = @()
+        }
+        selectedUpdates = @()
+    }
+)
+Assert-Equal -Actual (Get-PlanOnlyExitCode -PatchPlanRecords $discoveryFailurePlan) -Expected 1 -Message 'PlanOnly exits non-zero for discovery failure skip'
+Assert-Equal -Actual (Get-PlanOnlyExitCode -PatchPlanRecords $noSelectionPlan) -Expected 0 -Message 'PlanOnly exits zero for no selected updates'
+Assert-Equal -Actual (Get-PlanOnlyExitCode -PatchPlanRecords @($vm03)) -Expected 0 -Message 'PlanOnly exits zero for failover cluster skip'
+
 $summaryRows = @(ConvertTo-PatchSummaryRows -PatchPlanRecords $plan)
 $summaryVm01 = @($summaryRows | Where-Object { $_.VMName -eq 'VM01' })[0]
 $summaryVm03 = @($summaryRows | Where-Object { $_.VMName -eq 'VM03' })[0]

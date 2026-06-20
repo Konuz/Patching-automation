@@ -355,6 +355,26 @@ function New-PatchPlanRecords {
     return @($records)
 }
 
+function Test-IsDiscoveryFailurePatchPlanRecord {
+    param($PatchPlanRecord)
+
+    $action = [string](Get-ModelPropertyValue -InputObject $PatchPlanRecord -Name 'action')
+    $reason = [string](Get-ModelPropertyValue -InputObject $PatchPlanRecord -Name 'reason')
+
+    return ($action -eq 'Skip' -and $reason -eq 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.')
+}
+
+function Get-PlanOnlyExitCode {
+    param($PatchPlanRecords)
+
+    $discoveryFailureRecords = @($PatchPlanRecords | Where-Object { Test-IsDiscoveryFailurePatchPlanRecord -PatchPlanRecord $_ })
+    if ($discoveryFailureRecords.Count -gt 0) {
+        return 1
+    }
+
+    return 0
+}
+
 function ConvertTo-PatchSummaryRows {
     param($PatchPlanRecords)
 

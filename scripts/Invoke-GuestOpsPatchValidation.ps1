@@ -1150,7 +1150,7 @@ try {
             Show-PatchPlan -PatchPlanRecords $patchPlanRecords
 
             if ($PlanOnly) {
-                $scriptExitCode = 0
+                $scriptExitCode = Get-PlanOnlyExitCode -PatchPlanRecords $patchPlanRecords
             }
             elseif (-not (Confirm-PatchPlan -SkipConfirmation:$SkipConfirmation)) {
                 Write-Warning 'Patch plan was not approved. Apply phase skipped.'
@@ -1174,7 +1174,7 @@ try {
             $patchPlanPath = Join-Path $runOutputDirectory 'patch-plan.json'
             $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
             Show-PatchPlan -PatchPlanRecords $patchPlanRecords
-            $scriptExitCode = 0
+            $scriptExitCode = Get-PlanOnlyExitCode -PatchPlanRecords $patchPlanRecords
         }
     }
     else {
@@ -1240,7 +1240,7 @@ try {
             $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
             Show-PatchPlan -PatchPlanRecords $patchPlanRecords
             $skipSingleVmValidationSummary = $true
-            $scriptExitCode = 0
+            $scriptExitCode = Get-PlanOnlyExitCode -PatchPlanRecords $patchPlanRecords
         }
     }
     else {
@@ -1287,7 +1287,7 @@ try {
         $skipSingleVmValidationSummary = $true
 
         if ($PlanOnly) {
-            $scriptExitCode = 0
+            $scriptExitCode = Get-PlanOnlyExitCode -PatchPlanRecords $patchPlanRecords
         }
         elseif (-not (Confirm-PatchPlan -SkipConfirmation:$SkipConfirmation)) {
             Write-Warning 'Patch plan was not approved. Apply phase skipped.'
