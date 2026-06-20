@@ -352,6 +352,7 @@ if ($existingScripts.ContainsKey($launcherPath)) {
     Assert-NoReservedVariableName -Ast $launcherAst -RelativePath $launcherPath -ReservedNames $reservedVariableNames
     Assert-TextDoesNotMatch -RelativePath $launcherPath -Text $launcherText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Invoke-StaticChecks.ps1'
+    Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Invoke-ModelChecks.ps1'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Invoke-GuestOpsPatchValidation.ps1'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Get-Credential'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'InstallSelection'
