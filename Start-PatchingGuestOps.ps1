@@ -113,6 +113,7 @@ if ([string]::IsNullOrWhiteSpace($root)) {
 
 $staticCheckPath = Resolve-RequiredFile -Root $root -RelativePath 'tests\Invoke-StaticChecks.ps1'
 $modelCheckPath = Resolve-RequiredFile -Root $root -RelativePath 'tests\Invoke-ModelChecks.ps1'
+$runtimeCheckPath = Resolve-RequiredFile -Root $root -RelativePath 'tests\Invoke-RuntimeChecks.ps1'
 $orchestratorPath = Resolve-RequiredFile -Root $root -RelativePath 'scripts\Invoke-GuestOpsPatchValidation.ps1'
 $agentPath = Resolve-RequiredFile -Root $root -RelativePath 'guest\Run-LocalPatch.ps1'
 
@@ -129,6 +130,12 @@ if (-not $SkipStaticChecks) {
 
     Write-Host 'Running local model checks...'
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $modelCheckPath
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+
+    Write-Host 'Running local runtime checks...'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runtimeCheckPath
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }

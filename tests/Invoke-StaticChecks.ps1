@@ -178,9 +178,10 @@ $guestOpsLibPath = 'scripts\GuestOpsLib.ps1'
 $launcherPath = 'Start-PatchingGuestOps.ps1'
 $modelPath = 'scripts\PatchPlanModel.ps1'
 $modelTestPath = 'tests\Invoke-ModelChecks.ps1'
+$runtimeTestPath = 'tests\Invoke-RuntimeChecks.ps1'
 
 $existingScripts = @{}
-foreach ($relativePath in @($agentPath, $orchestratorPath, $guestOpsLibPath, $launcherPath, $modelPath, $modelTestPath)) {
+foreach ($relativePath in @($agentPath, $orchestratorPath, $guestOpsLibPath, $launcherPath, $modelPath, $modelTestPath, $runtimeTestPath)) {
     $path = Assert-FileExists -RelativePath $relativePath
     if ($path) {
         $existingScripts[$relativePath] = $path
@@ -392,6 +393,16 @@ if ($existingScripts.ContainsKey($modelTestPath)) {
     Assert-NoReservedVariableName -Ast $modelTestAst -RelativePath $modelTestPath -ReservedNames $reservedVariableNames
     Assert-TextContains -RelativePath $modelTestPath -Text $modelTestText -Needle 'PatchPlanModel.ps1'
     Assert-TextContains -RelativePath $modelTestPath -Text $modelTestText -Needle 'Model checks passed.'
+}
+
+if ($existingScripts.ContainsKey($runtimeTestPath)) {
+    $runtimeTestAst = Get-ScriptAst -RelativePath $runtimeTestPath -Path $existingScripts[$runtimeTestPath]
+    $runtimeTestText = Get-ScriptText -Path $existingScripts[$runtimeTestPath]
+
+    Assert-NoForbiddenCommand -Ast $runtimeTestAst -RelativePath $runtimeTestPath -ForbiddenNames $forbiddenCommands
+    Assert-NoForbiddenCommandLiteral -RelativePath $runtimeTestPath -Text $runtimeTestText -ForbiddenNames $forbiddenCommands
+    Assert-NoReservedVariableName -Ast $runtimeTestAst -RelativePath $runtimeTestPath -ReservedNames $reservedVariableNames
+    Assert-TextContains -RelativePath $runtimeTestPath -Text $runtimeTestText -Needle 'Runtime checks passed.'
 }
 
 if ($failures.Count -gt 0) {

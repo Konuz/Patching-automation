@@ -11,9 +11,10 @@ The committed code is the staged **full GuestOps patch orchestrator**: discovery
 ## Commands
 
 ```powershell
-# Static and model checks — the automated test gates. Run after EVERY change to the .ps1 scripts.
+# Static, model, and runtime checks — the automated test gates. Run after EVERY change to the .ps1 scripts.
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-StaticChecks.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-ModelChecks.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-RuntimeChecks.ps1
 
 # Full run via the central launcher (prompts for vCenter/VM/credentials; runs local checks first).
 .\Start-PatchingGuestOps.ps1

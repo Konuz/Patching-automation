@@ -214,11 +214,8 @@ function Receive-GuestFile {
     )
 }
 
-function Start-GuestAgent {
+function New-GuestAgentArguments {
     param(
-        $ProcessManager,
-        $VMView,
-        $GuestAuth,
         [string]$GuestAgentPath,
         [string]$GuestWorkingDirectory,
         [int]$MaxUpdates,
@@ -254,9 +251,25 @@ function Start-GuestAgent {
         $arguments += ($quotedSelectedUpdateKeys -join ',')
     }
 
+    return ($arguments -join ' ')
+}
+
+function Start-GuestAgent {
+    param(
+        $ProcessManager,
+        $VMView,
+        $GuestAuth,
+        [string]$GuestAgentPath,
+        [string]$GuestWorkingDirectory,
+        [int]$MaxUpdates,
+        [string[]]$SelectedUpdateIds = @(),
+        [string[]]$SelectedUpdateKeys = @(),
+        [switch]$SearchOnly
+    )
+
     $programSpec = New-Object VMware.Vim.GuestProgramSpec
     $programSpec.ProgramPath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
-    $programSpec.Arguments = ($arguments -join ' ')
+    $programSpec.Arguments = New-GuestAgentArguments -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateIds $SelectedUpdateIds -SelectedUpdateKeys $SelectedUpdateKeys -SearchOnly:$SearchOnly
     $programSpec.WorkingDirectory = $GuestWorkingDirectory
 
     return $ProcessManager.StartProgramInGuest($VMView.MoRef, $GuestAuth, $programSpec)
