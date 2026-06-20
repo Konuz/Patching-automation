@@ -214,6 +214,29 @@ function Receive-GuestFile {
     )
 }
 
+function New-UpdateSelectionDocument {
+    param([string[]]$SelectedUpdateKeys = @())
+
+    $keys = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+    foreach ($selectedUpdateKey in @($SelectedUpdateKeys)) {
+        $key = ([string]$selectedUpdateKey).Trim()
+        if ([string]::IsNullOrWhiteSpace($key)) {
+            continue
+        }
+
+        if (-not $seen.ContainsKey($key)) {
+            $seen[$key] = $true
+            [void]$keys.Add($key)
+        }
+    }
+
+    return [pscustomobject]@{
+        schemaVersion = 'selection-v1'
+        selectedUpdateKeys = @($keys.ToArray())
+    }
+}
+
 function New-GuestAgentArguments {
     param(
         [string]$GuestAgentPath,
@@ -221,6 +244,7 @@ function New-GuestAgentArguments {
         [int]$MaxUpdates,
         [string[]]$SelectedUpdateIds = @(),
         [string[]]$SelectedUpdateKeys = @(),
+        [string]$SelectionPath,
         [switch]$SearchOnly
     )
 
@@ -238,6 +262,11 @@ function New-GuestAgentArguments {
 
     if ($SearchOnly) {
         $arguments += '-SearchOnly'
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($SelectionPath)) {
+        $arguments += '-SelectionPath'
+        $arguments += ('"{0}"' -f $SelectionPath)
     }
 
     if (@($SelectedUpdateIds).Count -gt 0) {
@@ -264,12 +293,13 @@ function Start-GuestAgent {
         [int]$MaxUpdates,
         [string[]]$SelectedUpdateIds = @(),
         [string[]]$SelectedUpdateKeys = @(),
+        [string]$SelectionPath,
         [switch]$SearchOnly
     )
 
     $programSpec = New-Object VMware.Vim.GuestProgramSpec
     $programSpec.ProgramPath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
-    $programSpec.Arguments = New-GuestAgentArguments -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateIds $SelectedUpdateIds -SelectedUpdateKeys $SelectedUpdateKeys -SearchOnly:$SearchOnly
+    $programSpec.Arguments = New-GuestAgentArguments -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateIds $SelectedUpdateIds -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -SearchOnly:$SearchOnly
     $programSpec.WorkingDirectory = $GuestWorkingDirectory
 
     return $ProcessManager.StartProgramInGuest($VMView.MoRef, $GuestAuth, $programSpec)
@@ -316,6 +346,7 @@ function Invoke-GuestAgentRun {
         [int]$MaxUpdates,
         [string[]]$SelectedUpdateIds = @(),
         [string[]]$SelectedUpdateKeys = @(),
+        [string]$SelectionPath,
         [switch]$SearchOnly,
         [int]$TimeoutSeconds,
         [int]$PollSeconds,
@@ -323,7 +354,7 @@ function Invoke-GuestAgentRun {
     )
 
     Write-Step -Message $Description
-    $agentProcessId = Start-GuestAgent -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateIds $SelectedUpdateIds -SelectedUpdateKeys $SelectedUpdateKeys -SearchOnly:$SearchOnly
+    $agentProcessId = Start-GuestAgent -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateIds $SelectedUpdateIds -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -SearchOnly:$SearchOnly
     Write-Step -Message ('Guest agent PID: {0}' -f $agentProcessId)
 
     $agentResult = Wait-GuestProcess -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -ProcessId $agentProcessId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
@@ -371,6 +402,8 @@ function Invoke-VMAgentCycle {
         [string]$VMOutputDirectory,
         [int]$MaxUpdates,
         [string[]]$SelectedUpdateKeys = @(),
+        [string]$LocalSelectionPath,
+        [string]$SelectionPath,
         [switch]$SearchOnly,
         [int]$TimeoutSeconds,
         [int]$PollSeconds
@@ -400,6 +433,10 @@ function Invoke-VMAgentCycle {
 
     Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $AgentPath -GuestPath $guestAgentPath
 
+    if (-not [string]::IsNullOrWhiteSpace($LocalSelectionPath) -and -not [string]::IsNullOrWhiteSpace($SelectionPath)) {
+        Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $LocalSelectionPath -GuestPath $SelectionPath
+    }
+
     $agentRunParams = @{
         ProcessManager = $Managers.ProcessManager
         FileManager = $Managers.FileManager
@@ -421,5 +458,5 @@ function Invoke-VMAgentCycle {
         return Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SearchOnly -Description ('Starting guest WUA search for {0}.' -f $VMName)
     }
 
-    return Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -Description ('Starting guest WUA install for {0}.' -f $VMName)
+    return Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -Description ('Starting guest WUA install for {0}.' -f $VMName)
 }

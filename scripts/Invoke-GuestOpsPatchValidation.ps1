@@ -281,7 +281,9 @@ function Get-GuestOpsCycleJobScript {
             $connection = Connect-VIServer -Server $JobInput.VIServer -Credential $JobInput.VIServerCredential -ErrorAction Stop
             $managers = Get-GuestOpsManagers
             $guestAuth = New-GuestAuthentication -Credential $JobInput.GuestCredential
-            $cycle = Invoke-VMAgentCycle -VMName $JobInput.VMName -Managers $managers -GuestAuth $guestAuth -CurlPath $JobInput.CurlPath -AgentPath $JobInput.AgentPath -GuestWorkingDirectory $JobInput.GuestWorkingDirectory -VMOutputDirectory $JobInput.VMOutputDirectory -MaxUpdates $JobInput.MaxUpdates -SelectedUpdateKeys @($JobInput.SelectedUpdateKeys) -SearchOnly:$JobInput.SearchOnly -TimeoutSeconds $JobInput.TimeoutSeconds -PollSeconds $JobInput.PollSeconds
+            $jobLocalSelectionPath = [string](Get-ObjectPropertyValue -InputObject $JobInput -Path @('LocalSelectionPath'))
+            $jobGuestSelectionPath = [string](Get-ObjectPropertyValue -InputObject $JobInput -Path @('GuestSelectionPath'))
+            $cycle = Invoke-VMAgentCycle -VMName $JobInput.VMName -Managers $managers -GuestAuth $guestAuth -CurlPath $JobInput.CurlPath -AgentPath $JobInput.AgentPath -GuestWorkingDirectory $JobInput.GuestWorkingDirectory -VMOutputDirectory $JobInput.VMOutputDirectory -MaxUpdates $JobInput.MaxUpdates -LocalSelectionPath $jobLocalSelectionPath -SelectionPath $jobGuestSelectionPath -SearchOnly:$JobInput.SearchOnly -TimeoutSeconds $JobInput.TimeoutSeconds -PollSeconds $JobInput.PollSeconds
             return [pscustomobject]@{
                 Sequence = $JobInput.Sequence
                 VMName = $JobInput.VMName
@@ -810,6 +812,14 @@ function Invoke-ApplyPhase {
         $vmOutputDirectory = Join-Path $CycleOutputDirectory ('{0:D3}-apply-{1}' -f $recordNumber, (Get-SafeFileName -Value $record.vmName))
         Write-Step -Message ('Apply starting for VM {0} with {1} selected update(s).' -f $record.vmName, $selectedKeys.Count)
 
+        if ($selectedKeys.Count -gt 0) {
+            New-Item -ItemType Directory -Force -Path $vmOutputDirectory | Out-Null
+            $selectionDocument = New-UpdateSelectionDocument -SelectedUpdateKeys $selectedKeys
+            $localSelectionPath = Join-Path $vmOutputDirectory 'selection.json'
+            $selectionDocument | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $localSelectionPath -Encoding UTF8
+            $guestSelectionPath = Join-Path $GuestWorkingDirectory 'selection.json'
+        }
+
         if ($selectedKeys.Count -eq 0) {
             $reason = 'No selected update keys were available for apply.'
             $resultEntries += [pscustomobject]@{
@@ -829,7 +839,7 @@ function Invoke-ApplyPhase {
 
         if ($ThrottleLimit -le 1) {
             try {
-                $cycle = Invoke-VMAgentCycle -VMName $record.vmName -Managers $Managers -GuestAuth $GuestAuth -CurlPath $CurlPath -AgentPath $AgentPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $vmOutputDirectory -MaxUpdates $selectedKeys.Count -SelectedUpdateKeys $selectedKeys -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
+                $cycle = Invoke-VMAgentCycle -VMName $record.vmName -Managers $Managers -GuestAuth $GuestAuth -CurlPath $CurlPath -AgentPath $AgentPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $vmOutputDirectory -MaxUpdates $selectedKeys.Count -LocalSelectionPath $localSelectionPath -SelectionPath $guestSelectionPath -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
                 $resultEntries += [pscustomobject]@{
                     Sequence = $recordNumber
                     Result = New-ApplyResultFromCycle -VMName $record.vmName -Cycle $cycle
@@ -864,7 +874,8 @@ function Invoke-ApplyPhase {
                 GuestWorkingDirectory = $GuestWorkingDirectory
                 VMOutputDirectory = $vmOutputDirectory
                 MaxUpdates = $selectedKeys.Count
-                SelectedUpdateKeys = @($selectedKeys)
+                LocalSelectionPath = $localSelectionPath
+                GuestSelectionPath = $guestSelectionPath
                 SearchOnly = $false
                 TimeoutSeconds = $TimeoutSeconds
                 PollSeconds = $PollSeconds

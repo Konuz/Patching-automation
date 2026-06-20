@@ -4,6 +4,7 @@ param(
     [int]$MaxUpdates = 1,
     [string[]]$SelectedUpdateIds = @(),
     [string[]]$SelectedUpdateKeys = @(),
+    [string]$SelectionPath,
     [switch]$SearchOnly,
     [string]$SearchCriteria = "IsInstalled=0 and IsHidden=0 and Type='Software'"
 )
@@ -94,6 +95,34 @@ function Get-ComStringCollection {
     }
 
     return $values
+}
+
+function Read-SelectionDocumentKeys {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return @()
+    }
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw ('Selection document was not found: {0}' -f $Path)
+    }
+
+    $document = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    $schemaVersion = [string]$document.schemaVersion
+    if ($schemaVersion -ne 'selection-v1') {
+        throw ('Unsupported selection document schemaVersion: {0}' -f $schemaVersion)
+    }
+
+    $keys = @()
+    foreach ($selectedUpdateKey in @($document.selectedUpdateKeys)) {
+        $key = ([string]$selectedUpdateKey).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($key)) {
+            $keys += $key
+        }
+    }
+
+    return @($keys)
 }
 
 function New-UpdateIdentityKey {
@@ -334,6 +363,7 @@ $status = [ordered]@{
     maxUpdates = $MaxUpdates
     selectedUpdateIds = @($SelectedUpdateIds)
     selectedUpdateKeys = @($SelectedUpdateKeys)
+    selectionPath = $SelectionPath
     searchOnly = [bool]$SearchOnly
     services = @()
     systemDriveFreeGB = $null
@@ -406,8 +436,14 @@ try {
     else {
         $selectedUpdates = New-Object -ComObject Microsoft.Update.UpdateColl
         $selectedSearchIndexes = @()
+        $effectiveSelectedUpdateKeys = @($SelectedUpdateKeys)
+        if (-not [string]::IsNullOrWhiteSpace($SelectionPath)) {
+            $effectiveSelectedUpdateKeys = @(Read-SelectionDocumentKeys -Path $SelectionPath)
+            $status.selectedUpdateKeys = @($effectiveSelectedUpdateKeys)
+            Save-Status -Status $status
+        }
         $selectedKeyLookup = @{}
-        foreach ($selectedUpdateKey in @($SelectedUpdateKeys)) {
+        foreach ($selectedUpdateKey in @($effectiveSelectedUpdateKeys)) {
             foreach ($selectedUpdateKeyPart in @([string]$selectedUpdateKey -split ',')) {
                 $selectedKey = ([string]$selectedUpdateKeyPart).Trim()
                 if ([string]::IsNullOrWhiteSpace($selectedKey)) {
