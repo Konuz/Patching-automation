@@ -220,8 +220,6 @@ if ($existingScripts.ContainsKey($agentPath)) {
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Get-OptionalPropertyValue'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'SelectedUpdateIds'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'SelectedUpdateKeys'
-    Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle '$selectedUpdateKeyPart'
-    Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle "-split ','"
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'identityKey'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'New-CanonicalUpdateIdentityKey'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Get-ComCategoryCollection'
@@ -249,7 +247,6 @@ if ($existingScripts.ContainsKey($guestOpsLibPath)) {
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'InitiateFileTransferToGuest'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'InitiateFileTransferFromGuest'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'SelectedUpdateIds'
-    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle "@(`$SelectedUpdateIds) -join ','"
 }
 
 if ($existingScripts.ContainsKey($orchestratorPath)) {
@@ -300,7 +297,6 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '@($SelectedUpdateKeys).Count -eq 0'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SelectedUpdateKeys did not contain any non-empty update keys.'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Selected update key is not present in discovered update groups:'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'selectedByDefault'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'New-DiscoveryRecord'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'ConvertTo-PatchPlanRecords'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Patch plan file not found:'

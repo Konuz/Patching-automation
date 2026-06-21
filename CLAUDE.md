@@ -72,7 +72,7 @@ These are not style preferences — the static check **fails the build** on them
 - **Agent must not reference `$x.HResult` directly** — WUA COM objects can lack `HResult` under StrictMode. Go through `Get-OptionalPropertyValue` / `Format-HResult`.
 - **Orchestrator must not use `$kbArticleIds.Count`** — `ConvertFrom-Json` collapses a single KB id to a scalar under StrictMode. Wrap in `@(...)` first.
 - **Orchestrator apply must pass selected updates by `UpdateID|RevisionNumber` keys through `-SelectedUpdateKeys`** — never by display index. Guest argument values are joined into one comma-delimited argument to avoid PowerShell binding extra tokens as positional `SearchCriteria`.
-- Plus **required-text needles**: the check asserts that key WUA/GuestOps calls and UI strings are *present*. This means a refactor that renames or removes one of those strings will fail static checks even when the logic is correct. After any edit, re-run the static check and preserve the asserted call sites.
+- Static checks protect hard constraints and architectural boundaries. Behavior belongs in `Invoke-ModelChecks.ps1` and `Invoke-RuntimeChecks.ps1`; do not add a text needle when a small offline behavior test can cover the rule.
 
 Runtime and model scripts run under `Set-StrictMode -Version 2.0` + `$ErrorActionPreference = 'Stop'`. That is *why* the defensive property-access helpers exist — keep using them rather than touching COM/JSON properties directly.
 
