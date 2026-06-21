@@ -84,6 +84,41 @@ function Get-OptionalPropertyValue {
     }
 }
 
+function Get-OptionalStringPropertyValue {
+    param(
+        $InputObject,
+        [string]$Name
+    )
+
+    $value = Get-OptionalPropertyValue -InputObject $InputObject -Name $Name
+    if ($null -eq $value) {
+        return $null
+    }
+
+    $text = ([string]$value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return $null
+    }
+
+    return $text
+}
+
+function ConvertTo-UpdateTypeName {
+    param($TypeValue)
+
+    if ($null -eq $TypeValue) {
+        return $null
+    }
+
+    $text = ([string]$TypeValue).Trim()
+    switch ($text) {
+        '1' { return 'Software' }
+        '2' { return 'Driver' }
+        '' { return $null }
+        default { return $text }
+    }
+}
+
 function Get-ComStringCollection {
     param($Collection)
 
@@ -282,6 +317,9 @@ function New-UpdateRecord {
         $categories = @()
     }
 
+    $msrcSeverity = Get-OptionalStringPropertyValue -InputObject $Update -Name 'MsrcSeverity'
+    $updateType = ConvertTo-UpdateTypeName -TypeValue (Get-OptionalPropertyValue -InputObject $Update -Name 'Type')
+
     return [ordered]@{
         index = $Index
         title = [string]$Update.Title
@@ -290,6 +328,8 @@ function New-UpdateRecord {
         revisionNumber = $revisionNumber
         identityKey = $identityKey
         categories = $categories
+        msrcSeverity = $msrcSeverity
+        updateType = $updateType
         selected = $false
         eulaAccepted = [bool]$Update.EulaAccepted
         isDownloadedBeforeRun = [bool]$Update.IsDownloaded

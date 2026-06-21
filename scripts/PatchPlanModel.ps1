@@ -117,10 +117,17 @@ function Get-UpdateKbText {
 function Get-DefaultUpdateSelection {
     param(
         [string]$Title,
-        [string[]]$Categories = @()
+        [string[]]$Categories = @(),
+        [string]$MsrcSeverity,
+        [string]$UpdateType
     )
 
     $text = ('{0} {1}' -f $Title, (@($Categories) -join ' '))
+
+    # Exclusions first — these veto selection regardless of MSRC severity.
+    if ([string]$UpdateType -match '(?i)^(driver|2)$') {
+        return $false
+    }
 
     if ($text -match '(?i)\bpreview\b') {
         return $false
@@ -136,6 +143,11 @@ function Get-DefaultUpdateSelection {
 
     if ($text -match '(?i)browse[- ]only|\boptional\b') {
         return $false
+    }
+
+    # Structured inclusion — selected MSRC severity, after exclusions have had their say.
+    if ([string]$MsrcSeverity -match '(?i)^(critical|important)$') {
+        return $true
     }
 
     if ($text -match '(?i)cumulative|security|critical|update rollup|malicious software removal tool') {
@@ -179,6 +191,8 @@ function New-UpdatePlanRecord {
 
     $kbArticleIds = @(Get-ModelPropertyValue -InputObject $Update -Name 'kbArticleIds' -DefaultValue @())
     $categories = @(Get-ModelPropertyValue -InputObject $Update -Name 'categories' -DefaultValue @())
+    $msrcSeverity = Get-ModelPropertyValue -InputObject $Update -Name 'msrcSeverity'
+    $updateType = Get-ModelPropertyValue -InputObject $Update -Name 'updateType'
 
     return [pscustomobject]@{
         identityKey = $IdentityKey
@@ -188,6 +202,8 @@ function New-UpdatePlanRecord {
         kbArticleIds = $kbArticleIds
         kbText = Get-UpdateKbText -KbArticleIds $kbArticleIds
         categories = $categories
+        msrcSeverity = $msrcSeverity
+        updateType = $updateType
     }
 }
 
@@ -221,6 +237,8 @@ function New-UpdateGroupRecords {
                 $title = Get-ModelPropertyValue -InputObject $update -Name 'title'
                 $categories = @(Get-ModelPropertyValue -InputObject $update -Name 'categories' -DefaultValue @())
                 $kbArticleIds = @(Get-ModelPropertyValue -InputObject $update -Name 'kbArticleIds' -DefaultValue @())
+                $msrcSeverity = Get-ModelPropertyValue -InputObject $update -Name 'msrcSeverity'
+                $updateType = Get-ModelPropertyValue -InputObject $update -Name 'updateType'
 
                 $groups[$identityKey] = [pscustomobject]@{
                     identityKey = $identityKey
@@ -230,6 +248,8 @@ function New-UpdateGroupRecords {
                     kbArticleIds = $kbArticleIds
                     kbText = Get-UpdateKbText -KbArticleIds $kbArticleIds
                     categories = $categories
+                    msrcSeverity = $msrcSeverity
+                    updateType = $updateType
                     appliesToVmNames = New-Object System.Collections.Generic.List[string]
                     patchableVmNames = New-Object System.Collections.Generic.List[string]
                     appliesToVmLookup = @{}
@@ -264,7 +284,7 @@ function New-UpdateGroupRecords {
         # patchable VM. A group whose sole applicable VM is a Failover Cluster (excluded
         # from patchableVmNames) would otherwise show a checked box with "Patchable: 0 VM"
         # and produce a default plan that installs on nothing.
-        $selectedByDefault = ([bool](Get-DefaultUpdateSelection -Title ([string]$group.title) -Categories $group.categories)) -and ($patchableVmNames.Count -gt 0)
+        $selectedByDefault = ([bool](Get-DefaultUpdateSelection -Title ([string]$group.title) -Categories $group.categories -MsrcSeverity ([string]$group.msrcSeverity) -UpdateType ([string]$group.updateType))) -and ($patchableVmNames.Count -gt 0)
 
         $records += [pscustomobject]@{
             identityKey = $group.identityKey
@@ -274,6 +294,8 @@ function New-UpdateGroupRecords {
             kbArticleIds = @($group.kbArticleIds)
             kbText = $group.kbText
             categories = @($group.categories)
+            msrcSeverity = $group.msrcSeverity
+            updateType = $group.updateType
             selectedByDefault = $selectedByDefault
             appliesToVmNames = $appliesToVmNames
             patchableVmNames = $patchableVmNames

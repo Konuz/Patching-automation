@@ -85,6 +85,8 @@ $sampleDiscovery = @(
                 revisionNumber = 205
                 identityKey = '11111111-1111-1111-1111-111111111111|205'
                 categories = @('Security Updates')
+                msrcSeverity = 'Important'
+                updateType = 'Software'
             },
             [pscustomobject]@{
                 title = '2026-06 Preview Cumulative Update for Windows Server'
@@ -93,6 +95,8 @@ $sampleDiscovery = @(
                 revisionNumber = 17
                 identityKey = '22222222-2222-2222-2222-222222222222|17'
                 categories = @('Updates')
+                msrcSeverity = ''
+                updateType = 'Software'
             }
         )
     },
@@ -112,6 +116,8 @@ $sampleDiscovery = @(
                 updateId = '11111111-1111-1111-1111-111111111111'
                 revisionNumber = 205
                 categories = @('Security Updates')
+                msrcSeverity = 'Important'
+                updateType = 'Software'
             }
         )
     },
@@ -132,6 +138,8 @@ $sampleDiscovery = @(
                 revisionNumber = 205
                 identityKey = '11111111-1111-1111-1111-111111111111|205'
                 categories = @('Security Updates')
+                msrcSeverity = 'Important'
+                updateType = 'Software'
             }
         )
     }
@@ -153,6 +161,8 @@ $driftDiscovery = @(
                 revisionNumber = 9
                 identityKey = '44444444-4444-4444-4444-444444444444|8'
                 categories = @('Critical Updates')
+                msrcSeverity = 'Important'
+                updateType = 'Software'
             }
         )
     }
@@ -175,6 +185,12 @@ Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Driver update f
 Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Feature update to Windows Server' -Categories @('Upgrades'))) -Message 'feature update skipped by default'
 Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Optional browse-only update' -Categories @('Updates'))) -Message 'optional browse-only update skipped by default'
 Assert-True -Condition (Get-DefaultUpdateSelection -Title 'Security Update applied optionally' -Categories @('Security Updates')) -Message 'embedded optional substring does not deselect a security update'
+
+Assert-True -Condition (Get-DefaultUpdateSelection -Title 'Localized package title' -Categories @('Updates') -MsrcSeverity 'Critical' -UpdateType 'Software') -Message 'critical MSRC severity is selected even when title is not English'
+Assert-True -Condition (Get-DefaultUpdateSelection -Title 'Localized package title' -Categories @('Updates') -MsrcSeverity 'Important' -UpdateType 'Software') -Message 'important MSRC severity is selected even when title is not English'
+Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Security-like driver title' -Categories @('Security Updates') -MsrcSeverity 'Critical' -UpdateType 'Driver')) -Message 'driver update type is skipped even when severity is critical'
+Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Localized package title' -Categories @('Updates') -MsrcSeverity 'Critical' -UpdateType '2')) -Message 'integer driver enum value is skipped like the Driver string'
+Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title '2026-06 Preview Cumulative Update for Windows Server' -Categories @('Updates') -MsrcSeverity 'Critical' -UpdateType 'Software')) -Message 'critical severity does not override the preview exclusion'
 
 Assert-Equal -Actual (Get-RoleFlagText -RoleFlags $null) -Expected 'unknown' -Message 'missing role flags are unknown'
 Assert-Equal -Actual (Get-RoleFlagText -RoleFlags ([pscustomobject]@{ detected = @() })) -Expected 'none' -Message 'empty role flags are none'
@@ -232,6 +248,8 @@ $keylessDiscovery = @(
                 revisionNumber = $null
                 identityKey = $null
                 categories = @('Security Updates')
+                msrcSeverity = 'Important'
+                updateType = 'Software'
             },
             [pscustomobject]@{
                 title = '2026-06 Cumulative Update for Windows Server'
@@ -240,6 +258,8 @@ $keylessDiscovery = @(
                 revisionNumber = 205
                 identityKey = '11111111-1111-1111-1111-111111111111|205'
                 categories = @('Security Updates')
+                msrcSeverity = 'Important'
+                updateType = 'Software'
             }
         )
     }
@@ -272,6 +292,8 @@ $clusterOnlyDiscovery = @(
                 revisionNumber = 12
                 identityKey = '66666666-6666-6666-6666-666666666666|12'
                 categories = @('Security Updates')
+                msrcSeverity = 'Important'
+                updateType = 'Software'
             }
         )
     }
