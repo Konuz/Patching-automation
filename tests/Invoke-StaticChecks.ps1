@@ -175,6 +175,7 @@ function Assert-NoReservedVariableName {
 $agentPath = 'guest\Run-LocalPatch.ps1'
 $identityHelperPath = 'guest\UpdateIdentity.ps1'
 $orchestratorPath = 'scripts\Invoke-GuestOpsPatchValidation.ps1'
+$runtimeHelperPath = 'scripts\OrchestratorRuntime.ps1'
 $guestOpsLibPath = 'scripts\GuestOpsLib.ps1'
 $launcherPath = 'Start-PatchingGuestOps.ps1'
 $modelPath = 'scripts\PatchPlanModel.ps1'
@@ -182,7 +183,7 @@ $modelTestPath = 'tests\Invoke-ModelChecks.ps1'
 $runtimeTestPath = 'tests\Invoke-RuntimeChecks.ps1'
 
 $existingScripts = @{}
-foreach ($relativePath in @($agentPath, $identityHelperPath, $orchestratorPath, $guestOpsLibPath, $launcherPath, $modelPath, $modelTestPath, $runtimeTestPath)) {
+foreach ($relativePath in @($agentPath, $identityHelperPath, $orchestratorPath, $runtimeHelperPath, $guestOpsLibPath, $launcherPath, $modelPath, $modelTestPath, $runtimeTestPath)) {
     $path = Assert-FileExists -RelativePath $relativePath
     if ($path) {
         $existingScripts[$relativePath] = $path
@@ -271,13 +272,7 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'VMListPath'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'ThrottleLimit'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Invoke-ThrottledJobs'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Start-Job'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Receive-Job'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'New-ThrottledJobErrorResult'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'StartedAt'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'JobTimeoutSeconds'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Stop-Job'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Receive-Job returned no output.'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'catch { }'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'GuestOpsLib.ps1'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$JobInput.GuestOpsLibPath'
@@ -318,9 +313,6 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'InstallSucceeded'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'RebootRequired'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Test-ApplyResultsSuccessful'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "`$ApplyResult.action -eq 'Install' -and `$ApplyResult.outcome -ne 'InstallSucceeded'"
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "`$ApplyResult.action -ne 'Install' -and `$ApplyResult.reason -eq 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.'"
-    Assert-TextMatches -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)function\s+Test-ApplyResultsSuccessful\b.*?Test-IsApplyResultError\s+-ApplyResult\s+\$_' -Reason 'apply success uses shared apply-result error semantics'
     Assert-TextMatches -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)function\s+Write-FinalReport\b.*?\$errors\s*=\s*@\(\$ApplyResults\s*\|\s*Where-Object\s*\{\s*Test-IsApplyResultError\s+-ApplyResult\s+\$_\s*\}\)' -Reason 'final report errors use shared apply-result error semantics'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$cycle.AgentResult.Completed'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$cycle.AgentResult.ExitCode'
@@ -344,6 +336,28 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Skipped: Failover Cluster detected. Please update manually one by one.'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern "(?i)'-SelectedUpdateIds'\s+(foreach|for)\b" -Reason 'SelectedUpdateIds must be one joined argument, not appended per element (PowerShell would bind them as positional SearchCriteria)'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?i)\$kbArticleIds\.Count\b' -Reason 'ConvertFrom-Json can collapse one KB article id to a scalar under StrictMode'
+}
+
+if ($existingScripts.ContainsKey($runtimeHelperPath)) {
+    $runtimeHelperAst = Get-ScriptAst -RelativePath $runtimeHelperPath -Path $existingScripts[$runtimeHelperPath]
+    $runtimeHelperText = Get-ScriptText -Path $existingScripts[$runtimeHelperPath]
+
+    Assert-NoForbiddenCommand -Ast $runtimeHelperAst -RelativePath $runtimeHelperPath -ForbiddenNames $forbiddenCommands
+    Assert-NoForbiddenCommandLiteral -RelativePath $runtimeHelperPath -Text $runtimeHelperText -ForbiddenNames $forbiddenCommands
+    Assert-NoReservedVariableName -Ast $runtimeHelperAst -RelativePath $runtimeHelperPath -ReservedNames $reservedVariableNames
+    Assert-TextDoesNotMatch -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Invoke-ThrottledJobs'
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Test-IsApplyResultError'
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Start-Job'
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Receive-Job'
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'New-ThrottledJobErrorResult'
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'StartedAt'
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Stop-Job'
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Receive-Job returned no output.'
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Test-ApplyResultsSuccessful'
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle "`$ApplyResult.action -eq 'Install' -and `$ApplyResult.outcome -ne 'InstallSucceeded'"
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle "`$ApplyResult.action -ne 'Install' -and `$ApplyResult.reason -eq 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.'"
+    Assert-TextMatches -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Pattern '(?s)function\s+Test-ApplyResultsSuccessful\b.*?Test-IsApplyResultError\s+-ApplyResult\s+\$_' -Reason 'apply success uses shared apply-result error semantics'
 }
 
 if ($existingScripts.ContainsKey($launcherPath)) {

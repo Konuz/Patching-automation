@@ -120,151 +120,6 @@ function Assert-LocalPrerequisites {
     return $curlCommand.Source
 }
 
-function New-ThrottledJobErrorResult {
-    param(
-        $InputObject,
-        [string]$ErrorMessage
-    )
-
-    return [pscustomobject]@{
-        Sequence = $InputObject.Sequence
-        VMName = $InputObject.VMName
-        VMOutputDirectory = $InputObject.VMOutputDirectory
-        Status = $null
-        AgentResult = $null
-        Error = $ErrorMessage
-    }
-}
-
-function Remove-ThrottledJobSafe {
-    param($Job)
-
-    if ($null -eq $Job) {
-        return
-    }
-
-    try {
-        Remove-Job -Job $Job -Force -ErrorAction SilentlyContinue
-    }
-    catch { }
-}
-
-function Stop-ThrottledJobSafe {
-    param($Job)
-
-    if ($null -eq $Job) {
-        return
-    }
-
-    try {
-        Stop-Job -Job $Job -ErrorAction SilentlyContinue
-    }
-    catch { }
-}
-
-function Invoke-ThrottledJobs {
-    param(
-        [object[]]$Items,
-        [int]$ThrottleLimit,
-        [int]$JobTimeoutSeconds,
-        [scriptblock]$ScriptBlock
-    )
-
-    if ($ThrottleLimit -lt 1) {
-        throw 'ThrottleLimit must be greater than or equal to 1.'
-    }
-
-    if ($JobTimeoutSeconds -lt 1) {
-        throw 'JobTimeoutSeconds must be greater than or equal to 1.'
-    }
-
-    $pending = New-Object System.Collections.Queue
-    foreach ($item in @($Items)) {
-        $pending.Enqueue($item)
-    }
-
-    $running = @()
-    $results = @()
-
-    try {
-        while ($pending.Count -gt 0 -or $running.Count -gt 0) {
-            while ($pending.Count -gt 0 -and $running.Count -lt $ThrottleLimit) {
-                $item = $pending.Dequeue()
-                try {
-                    $job = Start-Job -ScriptBlock $ScriptBlock -ArgumentList $item
-                    $running += [pscustomobject]@{
-                        Job = $job
-                        Input = $item
-                        StartedAt = Get-Date
-                    }
-                }
-                catch {
-                    $results += New-ThrottledJobErrorResult -InputObject $item -ErrorMessage ('Start-Job failed: {0}' -f $_.Exception.Message)
-                }
-            }
-
-            $now = Get-Date
-            $timedOut = @($running | Where-Object {
-                $_.Job.State -notin @('Completed', 'Failed', 'Stopped') -and
-                (($now - $_.StartedAt).TotalSeconds -ge $JobTimeoutSeconds)
-            })
-            $timedOutJobIds = @{}
-            foreach ($entry in $timedOut) {
-                $timedOutJobIds[[string]$entry.Job.Id] = $true
-                Stop-ThrottledJobSafe -Job $entry.Job
-                try {
-                    Receive-Job -Job $entry.Job -ErrorAction SilentlyContinue | Out-Null
-                }
-                catch { }
-                $results += New-ThrottledJobErrorResult -InputObject $entry.Input -ErrorMessage ('Job timed out after {0} seconds.' -f $JobTimeoutSeconds)
-                Remove-ThrottledJobSafe -Job $entry.Job
-            }
-
-            $completed = @($running | Where-Object { $_.Job.State -in @('Completed', 'Failed', 'Stopped') -and -not $timedOutJobIds.ContainsKey([string]$_.Job.Id) })
-            foreach ($entry in $completed) {
-                $jobState = [string]$entry.Job.State
-                $receiveFailed = $false
-                $received = @()
-                try {
-                    $received = @(Receive-Job -Job $entry.Job -ErrorAction Stop)
-                }
-                catch {
-                    $receiveFailed = $true
-                    $results += New-ThrottledJobErrorResult -InputObject $entry.Input -ErrorMessage ('Receive-Job failed: {0}' -f $_.Exception.Message)
-                }
-
-                if (-not $receiveFailed) {
-                    if ($jobState -in @('Failed', 'Stopped')) {
-                        $results += New-ThrottledJobErrorResult -InputObject $entry.Input -ErrorMessage ('Job finished in state {0}.' -f $jobState)
-                    }
-                    elseif ($received.Count -eq 0 -or $null -eq $received[0]) {
-                        $results += New-ThrottledJobErrorResult -InputObject $entry.Input -ErrorMessage 'Receive-Job returned no output.'
-                    }
-                    else {
-                        $results += $received[0]
-                    }
-                }
-
-                Remove-ThrottledJobSafe -Job $entry.Job
-            }
-
-            $running = @($running | Where-Object { $_.Job.State -notin @('Completed', 'Failed', 'Stopped') -and -not $timedOutJobIds.ContainsKey([string]$_.Job.Id) })
-
-            if ($pending.Count -gt 0 -or $running.Count -gt 0) {
-                Start-Sleep -Seconds 2
-            }
-        }
-    }
-    finally {
-        foreach ($entry in @($running)) {
-            Stop-ThrottledJobSafe -Job $entry.Job
-            Remove-ThrottledJobSafe -Job $entry.Job
-        }
-    }
-
-    return @($results)
-}
-
 function Get-GuestOpsCycleJobScript {
     return {
         param($JobInput)
@@ -685,22 +540,6 @@ function New-DiscoveryRecordFromAgentRun {
     return $record
 }
 
-function Test-IsApplyResultError {
-    param($ApplyResult)
-
-    return (
-        ($ApplyResult.action -eq 'Install' -and $ApplyResult.outcome -ne 'InstallSucceeded') -or
-        ($ApplyResult.action -ne 'Install' -and $ApplyResult.reason -eq 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.')
-    )
-}
-
-function Test-ApplyResultsSuccessful {
-    param($ApplyResults)
-
-    $errors = @($ApplyResults | Where-Object { Test-IsApplyResultError -ApplyResult $_ })
-    return ($errors.Count -eq 0)
-}
-
 function New-ApplyResultFromCycle {
     param(
         [string]$VMName,
@@ -1112,6 +951,7 @@ if (-not $GuestCredential) {
 }
 
 . (Join-Path $PSScriptRoot 'PatchPlanModel.ps1')
+. (Join-Path $PSScriptRoot 'OrchestratorRuntime.ps1')
 
 $curlPath = Assert-LocalPrerequisites -LocalAgentPath $AgentPath
 
