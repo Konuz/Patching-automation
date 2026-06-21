@@ -14,6 +14,7 @@ param(
     [int]$PollSeconds = 15,
     [string]$GuestWorkingDirectory = 'C:\ProgramData\PatchingGuestOps',
     [string]$LocalOutputDirectory,
+    [string]$PatchPlanPath,
     [switch]$SearchOnly,
     [switch]$PlanOnly,
     [switch]$SkipConfirmation,
@@ -175,6 +176,10 @@ $orchestratorParams = @{
 
 if ($PSBoundParameters.ContainsKey('SelectedUpdateKeys')) {
     $orchestratorParams.SelectedUpdateKeys = $SelectedUpdateKeys
+}
+
+if (-not [string]::IsNullOrWhiteSpace($PatchPlanPath)) {
+    $orchestratorParams.PatchPlanPath = $PatchPlanPath
 }
 
 if ($SearchOnly) {

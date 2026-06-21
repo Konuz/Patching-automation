@@ -330,6 +330,36 @@ Assert-Equal -Actual $summaryVm01.RoleFlags -Expected 'SQL' -Message 'summary in
 Assert-Equal -Actual $summaryVm01.SelectedUpdateCount -Expected 1 -Message 'summary counts selected updates'
 Assert-Equal -Actual $summaryVm03.Action -Expected 'Skip' -Message 'summary includes skipped cluster action'
 
+$rawPatchPlan = @(
+    [pscustomobject]@{
+        vmName = 'VM01'
+        computerName = 'HOST01'
+        action = 'Install'
+        reason = ''
+        roleFlags = [pscustomobject]@{
+            failoverCluster = $false
+            detected = @()
+        }
+        selectedUpdates = @(
+            [pscustomobject]@{
+                identityKey = '11111111-1111-1111-1111-111111111111|205'
+                updateId = '11111111-1111-1111-1111-111111111111'
+                revisionNumber = 205
+                title = '2026-06 Cumulative Update for Windows Server'
+                kbArticleIds = @('5060842')
+                kbText = 'KB5060842'
+                categories = @('Security Updates')
+            }
+        )
+    }
+)
+
+$normalizedPatchPlan = @(ConvertTo-PatchPlanRecords -InputObject $rawPatchPlan)
+Assert-Equal -Actual $normalizedPatchPlan.Count -Expected 1 -Message 'resume plan normalization preserves VM count'
+Assert-Equal -Actual $normalizedPatchPlan[0].action -Expected 'Install' -Message 'resume plan normalization preserves action'
+Assert-Equal -Actual @($normalizedPatchPlan[0].selectedUpdates).Count -Expected 1 -Message 'resume plan normalization preserves selected update array'
+Assert-Equal -Actual $normalizedPatchPlan[0].selectedUpdates[0].identityKey -Expected '11111111-1111-1111-1111-111111111111|205' -Message 'resume plan normalization preserves selected identity key'
+
 if ($failures.Count -gt 0) {
     Write-Host 'Model checks failed:'
     foreach ($failure in $failures) {

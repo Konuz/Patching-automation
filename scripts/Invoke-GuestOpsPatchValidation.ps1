@@ -19,6 +19,8 @@ param(
 
     [string]$LocalOutputDirectory = (Join-Path (Split-Path -Parent $PSScriptRoot) 'out'),
 
+    [string]$PatchPlanPath,
+
     [int]$MaxUpdates = 1,
 
     [string]$InstallSelection,
@@ -970,6 +972,37 @@ try {
 
     $guestAuth = New-GuestAuthentication -Credential $GuestCredential
     $managers = Get-GuestOpsManagers
+
+    if (-not [string]::IsNullOrWhiteSpace($PatchPlanPath)) {
+        if (-not (Test-Path -LiteralPath $PatchPlanPath -PathType Leaf)) {
+            throw ('Patch plan file not found: {0}' -f $PatchPlanPath)
+        }
+
+        $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $runOutputDirectory = New-UniqueOutputDirectory -BasePath (Join-Path $LocalOutputDirectory $timestamp)
+        $patchPlanRecords = @(ConvertTo-PatchPlanRecords -InputObject (Get-Content -LiteralPath $PatchPlanPath -Raw | ConvertFrom-Json))
+        Show-PatchPlan -PatchPlanRecords $patchPlanRecords
+
+        if ($PlanOnly) {
+            $scriptExitCode = Get-PlanOnlyExitCode -PatchPlanRecords $patchPlanRecords
+        }
+        elseif (-not (Confirm-PatchPlan -SkipConfirmation:$SkipConfirmation)) {
+            Write-Warning 'Patch plan was not approved. Apply phase skipped.'
+            $scriptExitCode = 1
+        }
+        else {
+            $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit)
+            Write-FinalReport -PatchPlanRecords $patchPlanRecords -ApplyResults $applyResults -CycleOutputDirectory $runOutputDirectory
+            if (Test-ApplyResultsSuccessful -ApplyResults $applyResults) {
+                $scriptExitCode = 0
+            }
+            else {
+                $scriptExitCode = 1
+            }
+        }
+
+        return
+    }
 
     if ($targetVMNames.Count -gt 1) {
         $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'

@@ -302,6 +302,8 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Selected update key is not present in discovered update groups:'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'selectedByDefault'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'New-DiscoveryRecord'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'ConvertTo-PatchPlanRecords'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Patch plan file not found:'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Invoke-ApplyPhase'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'apply-results.json'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Write-FinalReport'
@@ -380,6 +382,7 @@ if ($existingScripts.ContainsKey($launcherPath)) {
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'SkipConfirmation'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'SelectedUpdateKeys'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle "PSBoundParameters.ContainsKey('SelectedUpdateKeys')"
+    Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'PatchPlanPath'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Resolve-VMTargetNames'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle '$PSScriptRoot'
 }
@@ -396,6 +399,7 @@ if ($existingScripts.ContainsKey($modelPath)) {
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'New-UpdateGroupRecords'
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'Get-DefaultUpdateSelection'
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'New-PatchPlanRecords'
+    Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'ConvertTo-PatchPlanRecords'
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'ConvertTo-PatchSummaryRows'
 }
 

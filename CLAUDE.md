@@ -28,6 +28,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-RuntimeCh
 # Skip the pre-run local checks (static + model; e.g. when iterating against a live VM):
 .\Start-PatchingGuestOps.ps1 -SkipStaticChecks
 
+# Resume/apply from an existing patch plan:
+.\Start-PatchingGuestOps.ps1 -PatchPlanPath .\out\<run>\patch-plan.json
+
 # Run the orchestrator directly, bypassing the launcher:
 .\scripts\Invoke-GuestOpsPatchValidation.ps1 -VIServer <vc> -VMName <vm> -SearchOnly -IgnoreVCenterCertificate
 ```
@@ -44,7 +47,7 @@ The hard-won insight (validated empirically, see `spec/spec-patching-guestops.md
 Execution flows through layered runtime scripts plus the offline planning model and tests:
 
 1. **`Start-PatchingGuestOps.ps1`** (root launcher) — prompts for any missing params, runs static + model checks unless `-SkipStaticChecks`, rejects legacy `-InstallSelection` before credential prompts, then splats everything into the orchestrator. This is the single entry point; users should never have to call the orchestrator directly.
-2. **`scripts/Invoke-GuestOpsPatchValidation.ps1`** (orchestrator, runs on the stepping stone) — resolves one or many VM targets, runs discovery cycles over GuestOps, builds grouped update records, resolves selection from explicit `-SelectedUpdateKeys` or interactive grouped selection, writes a per-VM patch plan, asks for final confirmation, then applies selected groups. With `-ThrottleLimit > 1`, child jobs reconnect to vCenter and dot-source GuestOps helpers independently. Pure throttling and apply-result semantics live in `scripts/OrchestratorRuntime.ps1` and are covered by `tests/Invoke-RuntimeChecks.ps1`; keep PowerCLI-specific work outside that helper.
+2. **`scripts/Invoke-GuestOpsPatchValidation.ps1`** (orchestrator, runs on the stepping stone) — resolves one or many VM targets, runs discovery cycles over GuestOps, builds grouped update records, resolves selection from explicit `-SelectedUpdateKeys` or interactive grouped selection, writes a per-VM patch plan, asks for final confirmation, then applies selected groups. With `-ThrottleLimit > 1`, child jobs reconnect to vCenter and dot-source GuestOps helpers independently. Pure throttling and apply-result semantics live in `scripts/OrchestratorRuntime.ps1` and are covered by `tests/Invoke-RuntimeChecks.ps1`; keep PowerCLI-specific work outside that helper. `-PatchPlanPath` resumes from a saved `patch-plan.json`: it skips discovery and group selection, shows the saved plan, asks for confirmation unless `-SkipConfirmation` is set, and runs apply against the selected updates in the plan.
 3. **`scripts/PatchPlanModel.ps1`** (offline model) — pure planning/reporting logic for update identity validation, default group selection, Failover Cluster skips, per-VM patch plans, summaries, and PlanOnly exit semantics. Keep it free of PowerCLI, GuestOps calls, `Read-Host`, and top-level runtime flow.
 4. **`scripts/GuestOpsLib.ps1`** (GuestOps helpers) — shared PowerCLI/GuestOps file transfer and process-run helpers used by direct and throttled apply/discovery cycles.
 5. **`guest/Run-LocalPatch.ps1`** (agent, runs *inside* the guest) — WUA COM only: `Microsoft.Update.Session` → searcher → downloader → installer. Writes `status.json` + `agent.log` to the working directory (`C:\ProgramData\PatchingGuestOps`). **Never reboots** — it only reports `pendingReboot`.

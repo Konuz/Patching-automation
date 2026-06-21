@@ -407,6 +407,52 @@ function Get-PlanOnlyExitCode {
     return 0
 }
 
+function ConvertTo-PatchPlanRecords {
+    param($InputObject)
+
+    $records = @()
+    foreach ($record in @($InputObject)) {
+        if ($null -eq $record) {
+            continue
+        }
+
+        $selectedUpdates = @()
+        foreach ($selectedUpdate in @(Get-ModelPropertyValue -InputObject $record -Name 'selectedUpdates' -DefaultValue @())) {
+            if ($null -eq $selectedUpdate) {
+                continue
+            }
+
+            $identityKey = [string](Get-ModelPropertyValue -InputObject $selectedUpdate -Name 'identityKey')
+            if ([string]::IsNullOrWhiteSpace($identityKey)) {
+                continue
+            }
+
+            $selectedUpdates += [pscustomobject]@{
+                identityKey = $identityKey
+                updateId = Get-ModelPropertyValue -InputObject $selectedUpdate -Name 'updateId'
+                revisionNumber = Get-ModelPropertyValue -InputObject $selectedUpdate -Name 'revisionNumber'
+                title = Get-ModelPropertyValue -InputObject $selectedUpdate -Name 'title'
+                kbArticleIds = @(Get-ModelPropertyValue -InputObject $selectedUpdate -Name 'kbArticleIds' -DefaultValue @())
+                kbText = Get-ModelPropertyValue -InputObject $selectedUpdate -Name 'kbText'
+                categories = @(Get-ModelPropertyValue -InputObject $selectedUpdate -Name 'categories' -DefaultValue @())
+                msrcSeverity = Get-ModelPropertyValue -InputObject $selectedUpdate -Name 'msrcSeverity'
+                updateType = Get-ModelPropertyValue -InputObject $selectedUpdate -Name 'updateType'
+            }
+        }
+
+        $records += [pscustomobject]@{
+            vmName = Get-ModelPropertyValue -InputObject $record -Name 'vmName'
+            computerName = Get-ModelPropertyValue -InputObject $record -Name 'computerName'
+            action = Get-ModelPropertyValue -InputObject $record -Name 'action'
+            reason = Get-ModelPropertyValue -InputObject $record -Name 'reason'
+            roleFlags = Get-ModelPropertyValue -InputObject $record -Name 'roleFlags'
+            selectedUpdates = @($selectedUpdates)
+        }
+    }
+
+    return @($records)
+}
+
 function ConvertTo-PatchSummaryRows {
     param($PatchPlanRecords)
 
