@@ -2,7 +2,6 @@
 param(
     [string]$WorkingDirectory = 'C:\ProgramData\PatchingGuestOps',
     [int]$MaxUpdates = 1,
-    [string[]]$SelectedUpdateIds = @(),
     [string[]]$SelectedUpdateKeys = @(),
     [string]$SelectionPath,
     [switch]$SearchOnly,
@@ -390,7 +389,6 @@ $status = [ordered]@{
     workingDirectory = $WorkingDirectory
     searchCriteria = $SearchCriteria
     maxUpdates = $MaxUpdates
-    selectedUpdateIds = @($SelectedUpdateIds)
     selectedUpdateKeys = @($SelectedUpdateKeys)
     selectionPath = $SelectionPath
     searchOnly = [bool]$SearchOnly
@@ -483,20 +481,7 @@ try {
             }
         }
 
-        $selectedIdLookup = @{}
-        foreach ($selectedUpdateId in @($SelectedUpdateIds)) {
-            foreach ($selectedUpdateIdPart in @([string]$selectedUpdateId -split ',')) {
-                $selectedId = ([string]$selectedUpdateIdPart).Trim()
-                if ([string]::IsNullOrWhiteSpace($selectedId)) {
-                    continue
-                }
-
-                $selectedIdLookup[$selectedId] = $true
-            }
-        }
-
         $hasExplicitKeySelection = ($selectedKeyLookup.Count -gt 0)
-        $hasExplicitIdSelection = ($selectedIdLookup.Count -gt 0)
         $selectionLimit = [Math]::Min($MaxUpdates, [int]$searchResult.Updates.Count)
         $seenSelectedLookupKeys = @{}
 
@@ -509,12 +494,6 @@ try {
                 $shouldSelectUpdate = ($null -ne $record.identityKey -and $selectedKeyLookup.ContainsKey([string]$record.identityKey))
                 if ($shouldSelectUpdate) {
                     $seenSelectedLookupKeys[[string]$record.identityKey] = $true
-                }
-            }
-            elseif ($hasExplicitIdSelection) {
-                $shouldSelectUpdate = ($null -ne $record.updateId -and $selectedIdLookup.ContainsKey([string]$record.updateId))
-                if ($shouldSelectUpdate) {
-                    $seenSelectedLookupKeys[[string]$record.updateId] = $true
                 }
             }
             else {
@@ -555,12 +534,6 @@ try {
             $missingUpdateKeys = @(@($selectedKeyLookup.Keys) | Where-Object { -not $seenSelectedLookupKeys.ContainsKey([string]$_) })
             if ($missingUpdateKeys.Count -gt 0) {
                 throw ('Selected update key(s) not present in the current search result (search/selection drift): {0}' -f ($missingUpdateKeys -join ', '))
-            }
-        }
-        elseif ($hasExplicitIdSelection) {
-            $missingUpdateIds = @(@($selectedIdLookup.Keys) | Where-Object { -not $seenSelectedLookupKeys.ContainsKey([string]$_) })
-            if ($missingUpdateIds.Count -gt 0) {
-                throw ('Selected update id(s) not present in the current search result (search/selection drift): {0}' -f ($missingUpdateIds -join ', '))
             }
         }
 

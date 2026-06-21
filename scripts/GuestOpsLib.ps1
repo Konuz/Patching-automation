@@ -242,7 +242,6 @@ function New-GuestAgentArguments {
         [string]$GuestAgentPath,
         [string]$GuestWorkingDirectory,
         [int]$MaxUpdates,
-        [string[]]$SelectedUpdateIds = @(),
         [string[]]$SelectedUpdateKeys = @(),
         [string]$SelectionPath,
         [switch]$SearchOnly
@@ -269,11 +268,6 @@ function New-GuestAgentArguments {
         $arguments += ('"{0}"' -f $SelectionPath)
     }
 
-    if (@($SelectedUpdateIds).Count -gt 0) {
-        $arguments += '-SelectedUpdateIds'
-        $arguments += (@($SelectedUpdateIds) -join ',')
-    }
-
     if (@($SelectedUpdateKeys).Count -gt 0) {
         $quotedSelectedUpdateKeys = @($SelectedUpdateKeys | ForEach-Object { '"{0}"' -f (([string]$_) -replace '"', '`"') })
         $arguments += '-SelectedUpdateKeys'
@@ -291,7 +285,6 @@ function Start-GuestAgent {
         [string]$GuestAgentPath,
         [string]$GuestWorkingDirectory,
         [int]$MaxUpdates,
-        [string[]]$SelectedUpdateIds = @(),
         [string[]]$SelectedUpdateKeys = @(),
         [string]$SelectionPath,
         [switch]$SearchOnly
@@ -299,7 +292,7 @@ function Start-GuestAgent {
 
     $programSpec = New-Object VMware.Vim.GuestProgramSpec
     $programSpec.ProgramPath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
-    $programSpec.Arguments = New-GuestAgentArguments -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateIds $SelectedUpdateIds -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -SearchOnly:$SearchOnly
+    $programSpec.Arguments = New-GuestAgentArguments -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -SearchOnly:$SearchOnly
     $programSpec.WorkingDirectory = $GuestWorkingDirectory
 
     return $ProcessManager.StartProgramInGuest($VMView.MoRef, $GuestAuth, $programSpec)
@@ -344,7 +337,6 @@ function Invoke-GuestAgentRun {
         [string]$LocalStatusPath,
         [string]$LocalLogPath,
         [int]$MaxUpdates,
-        [string[]]$SelectedUpdateIds = @(),
         [string[]]$SelectedUpdateKeys = @(),
         [string]$SelectionPath,
         [switch]$SearchOnly,
@@ -354,7 +346,7 @@ function Invoke-GuestAgentRun {
     )
 
     Write-Step -Message $Description
-    $agentProcessId = Start-GuestAgent -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateIds $SelectedUpdateIds -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -SearchOnly:$SearchOnly
+    $agentProcessId = Start-GuestAgent -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -SearchOnly:$SearchOnly
     Write-Step -Message ('Guest agent PID: {0}' -f $agentProcessId)
 
     $agentResult = Wait-GuestProcess -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -ProcessId $agentProcessId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds

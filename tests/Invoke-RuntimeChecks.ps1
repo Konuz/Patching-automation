@@ -54,7 +54,6 @@ $argumentText = New-GuestAgentArguments -GuestAgentPath 'C:\ProgramData\Patching
 
 Assert-Contains -Text $argumentText -Needle '-SelectedUpdateKeys' -Message 'selected update keys flag is present'
 Assert-Contains -Text $argumentText -Needle '"11111111-1111-1111-1111-111111111111|205","22222222-2222-2222-2222-222222222222|17"' -Message 'selected update keys are quoted and comma joined as one argument'
-Assert-NotContains -Text $argumentText -Needle '-SelectedUpdateIds' -Message 'selected update ids are not emitted when only keys are supplied'
 
 $searchOnlyText = New-GuestAgentArguments -GuestAgentPath 'C:\ProgramData\PatchingGuestOps\Run-LocalPatch.ps1' -GuestWorkingDirectory 'C:\ProgramData\PatchingGuestOps' -MaxUpdates 5 -SearchOnly
 Assert-Contains -Text $searchOnlyText -Needle '-SearchOnly' -Message 'search-only flag is present'

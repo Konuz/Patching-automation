@@ -218,7 +218,6 @@ if ($existingScripts.ContainsKey($agentPath)) {
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'ConvertTo-Json'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Test-PendingReboot'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Get-OptionalPropertyValue'
-    Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'SelectedUpdateIds'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'SelectedUpdateKeys'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'identityKey'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'New-CanonicalUpdateIdentityKey'
@@ -246,7 +245,6 @@ if ($existingScripts.ContainsKey($guestOpsLibPath)) {
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'ListProcessesInGuest'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'InitiateFileTransferToGuest'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'InitiateFileTransferFromGuest'
-    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'SelectedUpdateIds'
 }
 
 if ($existingScripts.ContainsKey($orchestratorPath)) {
@@ -332,7 +330,6 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Role flags:'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'failoverCluster'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Skipped: Failover Cluster detected. Please update manually one by one.'
-    Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern "(?i)'-SelectedUpdateIds'\s+(foreach|for)\b" -Reason 'SelectedUpdateIds must be one joined argument, not appended per element (PowerShell would bind them as positional SearchCriteria)'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?i)\$kbArticleIds\.Count\b' -Reason 'ConvertFrom-Json can collapse one KB article id to a scalar under StrictMode'
 }
 
