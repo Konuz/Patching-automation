@@ -360,6 +360,25 @@ Assert-Equal -Actual $normalizedPatchPlan[0].action -Expected 'Install' -Message
 Assert-Equal -Actual @($normalizedPatchPlan[0].selectedUpdates).Count -Expected 1 -Message 'resume plan normalization preserves selected update array'
 Assert-Equal -Actual $normalizedPatchPlan[0].selectedUpdates[0].identityKey -Expected '11111111-1111-1111-1111-111111111111|205' -Message 'resume plan normalization preserves selected identity key'
 
+# A hand-edited or corrupted plan whose selected update lost its identityKey: the keyless
+# entry is dropped (with a warning) and the keyed one survives.
+$keylessPlanInput = @(
+    [pscustomobject]@{
+        vmName = 'VM09'
+        computerName = 'HOST09'
+        action = 'Install'
+        reason = ''
+        roleFlags = [pscustomobject]@{ failoverCluster = $false; detected = @() }
+        selectedUpdates = @(
+            [pscustomobject]@{ identityKey = '99999999-9999-9999-9999-999999999999|3'; updateId = '99999999-9999-9999-9999-999999999999'; revisionNumber = 3 },
+            [pscustomobject]@{ identityKey = ''; updateId = $null; revisionNumber = $null }
+        )
+    }
+)
+$normalizedKeylessPlan = @(ConvertTo-PatchPlanRecords -InputObject $keylessPlanInput 3>$null)
+Assert-Equal -Actual @($normalizedKeylessPlan[0].selectedUpdates).Count -Expected 1 -Message 'resume plan normalization drops a selected update without an identity key'
+Assert-Equal -Actual $normalizedKeylessPlan[0].selectedUpdates[0].identityKey -Expected '99999999-9999-9999-9999-999999999999|3' -Message 'resume plan normalization keeps the keyed selected update'
+
 if ($failures.Count -gt 0) {
     Write-Host 'Model checks failed:'
     foreach ($failure in $failures) {

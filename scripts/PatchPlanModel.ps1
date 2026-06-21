@@ -424,6 +424,7 @@ function ConvertTo-PatchPlanRecords {
 
             $identityKey = [string](Get-ModelPropertyValue -InputObject $selectedUpdate -Name 'identityKey')
             if ([string]::IsNullOrWhiteSpace($identityKey)) {
+                Write-Warning ('Skipping a selected update without an identityKey while loading the saved patch plan for VM {0}.' -f [string](Get-ModelPropertyValue -InputObject $record -Name 'vmName'))
                 continue
             }
 

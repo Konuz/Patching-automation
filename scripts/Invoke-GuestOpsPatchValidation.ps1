@@ -1137,6 +1137,10 @@ try {
         }
     }
     else {
+        # Two-pass single-VM validation: this is the search-only pass; the apply branch below
+        # runs the guest agent a SECOND time via Invoke-ApplyPhase (re-upload + a fresh
+        # search+install cycle that re-derives selection by identity). The double pass is
+        # intentional validation scaffolding; the multi-VM path is the production shape.
         $searchRun = Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SearchOnly -Description 'Starting guest WUA search.'
         $searchStatus = $searchRun.Status
         $searchOutcome = Get-ObjectPropertyValue -InputObject $searchStatus -Path @('outcome')
