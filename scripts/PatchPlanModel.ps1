@@ -1,6 +1,8 @@
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path (Split-Path -Parent $PSScriptRoot) 'guest\UpdateIdentity.ps1')
+
 function Get-ModelPropertyValue {
     param(
         $InputObject,
@@ -45,23 +47,6 @@ function Test-ModelPropertyExists {
     return ($null -ne $InputObject.PSObject.Properties[$Name])
 }
 
-function New-UpdateIdentityKey {
-    param(
-        [string]$UpdateId,
-        [int]$RevisionNumber
-    )
-
-    if ([string]::IsNullOrWhiteSpace($UpdateId)) {
-        throw 'UpdateId is required to build an update identity key.'
-    }
-
-    if ($RevisionNumber -lt 0) {
-        throw 'RevisionNumber must be greater than or equal to 0.'
-    }
-
-    return ('{0}|{1}' -f $UpdateId, $RevisionNumber)
-}
-
 function Get-UpdateIdentityKey {
     param($Update)
 
@@ -90,7 +75,7 @@ function Get-UpdateIdentityKey {
             throw 'RevisionNumber is required to build an update identity key.'
         }
 
-        $computedIdentityKey = New-UpdateIdentityKey -UpdateId $updateIdValue -RevisionNumber ([int]$revisionNumber)
+        $computedIdentityKey = New-CanonicalUpdateIdentityKey -UpdateId $updateIdValue -RevisionNumber $revisionNumber
         if (-not [string]::IsNullOrWhiteSpace($identityKey) -and $identityKey -ne $computedIdentityKey) {
             throw ('Update identity key drift detected. Expected {0}; actual {1}.' -f $computedIdentityKey, $identityKey)
         }
@@ -102,7 +87,7 @@ function Get-UpdateIdentityKey {
         return $identityKey
     }
 
-    return New-UpdateIdentityKey -UpdateId ([string](Get-ModelPropertyValue -InputObject $Update -Name 'updateId')) -RevisionNumber ([int](Get-ModelPropertyValue -InputObject $Update -Name 'revisionNumber' -DefaultValue 0))
+    return New-CanonicalUpdateIdentityKey -UpdateId ([string](Get-ModelPropertyValue -InputObject $Update -Name 'updateId')) -RevisionNumber (Get-ModelPropertyValue -InputObject $Update -Name 'revisionNumber' -DefaultValue 0)
 }
 
 function Get-UpdateKbText {

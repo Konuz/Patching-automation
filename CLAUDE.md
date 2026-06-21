@@ -57,6 +57,8 @@ Canonical update identity is **`UpdateID|RevisionNumber`**. Discovery writes `up
 
 Subtle point inside the agent: it maintains `selectedSearchIndexes`, mapping a *selected-collection* index back to its *search-collection* index, so per-update download/install results land on the correct `$status.updates[$searchIndex]`.
 
+`guest/UpdateIdentity.ps1` is uploaded with the guest agent and is also dot-sourced by the offline model, so identity formatting and missing-field semantics stay shared across producer and consumer.
+
 ## Hard constraints (enforced by Invoke-StaticChecks.ps1)
 
 These are not style preferences — the static check **fails the build** on them, and several encode real bugs already fixed. Treat them as load-bearing:

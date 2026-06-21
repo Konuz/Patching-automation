@@ -48,6 +48,8 @@ $ErrorActionPreference = 'Stop'
 $guestOpsLibPath = Join-Path $PSScriptRoot 'GuestOpsLib.ps1'
 . $guestOpsLibPath
 
+$identityHelperPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'guest\UpdateIdentity.ps1'
+
 function Resolve-VMTargetNames {
     param(
         [string]$SingleVMName,
@@ -283,7 +285,7 @@ function Get-GuestOpsCycleJobScript {
             $guestAuth = New-GuestAuthentication -Credential $JobInput.GuestCredential
             $jobLocalSelectionPath = [string](Get-ObjectPropertyValue -InputObject $JobInput -Path @('LocalSelectionPath'))
             $jobGuestSelectionPath = [string](Get-ObjectPropertyValue -InputObject $JobInput -Path @('GuestSelectionPath'))
-            $cycle = Invoke-VMAgentCycle -VMName $JobInput.VMName -Managers $managers -GuestAuth $guestAuth -CurlPath $JobInput.CurlPath -AgentPath $JobInput.AgentPath -GuestWorkingDirectory $JobInput.GuestWorkingDirectory -VMOutputDirectory $JobInput.VMOutputDirectory -MaxUpdates $JobInput.MaxUpdates -LocalSelectionPath $jobLocalSelectionPath -SelectionPath $jobGuestSelectionPath -SearchOnly:$JobInput.SearchOnly -TimeoutSeconds $JobInput.TimeoutSeconds -PollSeconds $JobInput.PollSeconds
+            $cycle = Invoke-VMAgentCycle -VMName $JobInput.VMName -Managers $managers -GuestAuth $guestAuth -CurlPath $JobInput.CurlPath -AgentPath $JobInput.AgentPath -IdentityHelperPath $JobInput.IdentityHelperPath -GuestWorkingDirectory $JobInput.GuestWorkingDirectory -VMOutputDirectory $JobInput.VMOutputDirectory -MaxUpdates $JobInput.MaxUpdates -LocalSelectionPath $jobLocalSelectionPath -SelectionPath $jobGuestSelectionPath -SearchOnly:$JobInput.SearchOnly -TimeoutSeconds $JobInput.TimeoutSeconds -PollSeconds $JobInput.PollSeconds
             return [pscustomobject]@{
                 Sequence = $JobInput.Sequence
                 VMName = $JobInput.VMName
@@ -765,6 +767,7 @@ function Invoke-ApplyPhase {
         [string]$GuestOpsLibPath,
         [string]$CurlPath,
         [string]$AgentPath,
+        [string]$IdentityHelperPath,
         [string]$GuestWorkingDirectory,
         [int]$TimeoutSeconds,
         [int]$PollSeconds,
@@ -839,7 +842,7 @@ function Invoke-ApplyPhase {
 
         if ($ThrottleLimit -le 1) {
             try {
-                $cycle = Invoke-VMAgentCycle -VMName $record.vmName -Managers $Managers -GuestAuth $GuestAuth -CurlPath $CurlPath -AgentPath $AgentPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $vmOutputDirectory -MaxUpdates $selectedKeys.Count -LocalSelectionPath $localSelectionPath -SelectionPath $guestSelectionPath -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
+                $cycle = Invoke-VMAgentCycle -VMName $record.vmName -Managers $Managers -GuestAuth $GuestAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $vmOutputDirectory -MaxUpdates $selectedKeys.Count -LocalSelectionPath $localSelectionPath -SelectionPath $guestSelectionPath -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
                 $resultEntries += [pscustomobject]@{
                     Sequence = $recordNumber
                     Result = New-ApplyResultFromCycle -VMName $record.vmName -Cycle $cycle
@@ -871,6 +874,7 @@ function Invoke-ApplyPhase {
                 GuestOpsLibPath = $GuestOpsLibPath
                 CurlPath = $CurlPath
                 AgentPath = $AgentPath
+                IdentityHelperPath = $IdentityHelperPath
                 GuestWorkingDirectory = $GuestWorkingDirectory
                 VMOutputDirectory = $vmOutputDirectory
                 MaxUpdates = $selectedKeys.Count
@@ -990,6 +994,7 @@ function Invoke-DiscoveryPhase {
         [string]$GuestOpsLibPath,
         [string]$CurlPath,
         [string]$AgentPath,
+        [string]$IdentityHelperPath,
         [string]$GuestWorkingDirectory,
         [int]$MaxUpdates,
         [int]$TimeoutSeconds,
@@ -1007,7 +1012,7 @@ function Invoke-DiscoveryPhase {
 
         if ($ThrottleLimit -le 1) {
             try {
-                $agentRun = Invoke-VMAgentCycle -VMName $targetVMName -Managers $Managers -GuestAuth $GuestAuth -CurlPath $CurlPath -AgentPath $AgentPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $vmOutputDirectory -MaxUpdates $MaxUpdates -SearchOnly -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
+                $agentRun = Invoke-VMAgentCycle -VMName $targetVMName -Managers $Managers -GuestAuth $GuestAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $vmOutputDirectory -MaxUpdates $MaxUpdates -SearchOnly -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
                 $recordEntries += [pscustomobject]@{
                     Sequence = $targetNumber
                     Record = New-DiscoveryRecordFromAgentRun -VMName $targetVMName -AgentRun $agentRun -OutputDirectory $vmOutputDirectory
@@ -1033,6 +1038,7 @@ function Invoke-DiscoveryPhase {
                 GuestOpsLibPath = $GuestOpsLibPath
                 CurlPath = $CurlPath
                 AgentPath = $AgentPath
+                IdentityHelperPath = $IdentityHelperPath
                 GuestWorkingDirectory = $GuestWorkingDirectory
                 VMOutputDirectory = $vmOutputDirectory
                 MaxUpdates = $MaxUpdates
@@ -1129,7 +1135,7 @@ try {
         $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
         $runOutputDirectory = New-UniqueOutputDirectory -BasePath (Join-Path $LocalOutputDirectory $timestamp)
 
-        $discoveryRecords = Invoke-DiscoveryPhase -TargetVMNames $targetVMNames -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit
+        $discoveryRecords = Invoke-DiscoveryPhase -TargetVMNames $targetVMNames -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit
         $failedDiscoveryRecords = @($discoveryRecords | Where-Object { @($_.errors).Count -gt 0 })
         if ($failedDiscoveryRecords.Count -gt 0) {
             $scriptExitCode = 1
@@ -1168,7 +1174,7 @@ try {
                 $scriptExitCode = 1
             }
             else {
-                $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit)
+                $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit)
                 Write-FinalReport -PatchPlanRecords $patchPlanRecords -ApplyResults $applyResults -CycleOutputDirectory $runOutputDirectory
                 if (Test-ApplyResultsSuccessful -ApplyResults $applyResults) {
                     $scriptExitCode = 0
@@ -1215,6 +1221,9 @@ try {
     }
 
     Send-GuestFile -FileManager $managers.FileManager -VMView $vmView -GuestAuth $guestAuth -HostName $hostName -CurlPath $curlPath -LocalPath $AgentPath -GuestPath $guestAgentPath
+
+    $guestIdentityHelperPath = Join-Path $GuestWorkingDirectory 'UpdateIdentity.ps1'
+    Send-GuestFile -FileManager $managers.FileManager -VMView $vmView -GuestAuth $guestAuth -HostName $hostName -CurlPath $curlPath -LocalPath $identityHelperPath -GuestPath $guestIdentityHelperPath
 
     $agentRunParams = @{
         ProcessManager = $managers.ProcessManager
@@ -1305,7 +1314,7 @@ try {
             $scriptExitCode = 1
         }
         else {
-            $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit)
+            $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit)
             Write-FinalReport -PatchPlanRecords $patchPlanRecords -ApplyResults $applyResults -CycleOutputDirectory $runOutputDirectory
             if (Test-ApplyResultsSuccessful -ApplyResults $applyResults) {
                 $scriptExitCode = 0

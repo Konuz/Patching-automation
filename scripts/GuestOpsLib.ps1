@@ -398,6 +398,7 @@ function Invoke-VMAgentCycle {
         $GuestAuth,
         [string]$CurlPath,
         [string]$AgentPath,
+        [string]$IdentityHelperPath,
         [string]$GuestWorkingDirectory,
         [string]$VMOutputDirectory,
         [int]$MaxUpdates,
@@ -432,6 +433,9 @@ function Invoke-VMAgentCycle {
     }
 
     Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $AgentPath -GuestPath $guestAgentPath
+
+    $guestIdentityHelperPath = Join-Path $GuestWorkingDirectory 'UpdateIdentity.ps1'
+    Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $IdentityHelperPath -GuestPath $guestIdentityHelperPath
 
     if (-not [string]::IsNullOrWhiteSpace($LocalSelectionPath) -and -not [string]::IsNullOrWhiteSpace($SelectionPath)) {
         Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $LocalSelectionPath -GuestPath $SelectionPath

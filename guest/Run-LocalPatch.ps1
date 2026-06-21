@@ -12,6 +12,8 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot 'UpdateIdentity.ps1')
+
 if (-not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) {
     New-Item -ItemType Directory -Force -Path $WorkingDirectory | Out-Null
 }
@@ -123,19 +125,6 @@ function Read-SelectionDocumentKeys {
     }
 
     return @($keys)
-}
-
-function New-UpdateIdentityKey {
-    param(
-        [string]$UpdateId,
-        [int]$RevisionNumber
-    )
-
-    if ([string]::IsNullOrWhiteSpace($UpdateId)) {
-        return $null
-    }
-
-    return ('{0}|{1}' -f $UpdateId, $RevisionNumber)
 }
 
 function Get-ComCategoryCollection {
@@ -275,7 +264,7 @@ function New-UpdateRecord {
         $revisionNumber = $null
     }
 
-    $identityKey = New-UpdateIdentityKey -UpdateId $updateId -RevisionNumber $revisionNumber
+    $identityKey = New-CanonicalUpdateIdentityKey -UpdateId $updateId -RevisionNumber $revisionNumber -AllowMissing
 
     $rebootBehavior = $null
     try {

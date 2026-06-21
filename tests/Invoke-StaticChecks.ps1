@@ -173,6 +173,7 @@ function Assert-NoReservedVariableName {
 }
 
 $agentPath = 'guest\Run-LocalPatch.ps1'
+$identityHelperPath = 'guest\UpdateIdentity.ps1'
 $orchestratorPath = 'scripts\Invoke-GuestOpsPatchValidation.ps1'
 $guestOpsLibPath = 'scripts\GuestOpsLib.ps1'
 $launcherPath = 'Start-PatchingGuestOps.ps1'
@@ -181,7 +182,7 @@ $modelTestPath = 'tests\Invoke-ModelChecks.ps1'
 $runtimeTestPath = 'tests\Invoke-RuntimeChecks.ps1'
 
 $existingScripts = @{}
-foreach ($relativePath in @($agentPath, $orchestratorPath, $guestOpsLibPath, $launcherPath, $modelPath, $modelTestPath, $runtimeTestPath)) {
+foreach ($relativePath in @($agentPath, $identityHelperPath, $orchestratorPath, $guestOpsLibPath, $launcherPath, $modelPath, $modelTestPath, $runtimeTestPath)) {
     $path = Assert-FileExists -RelativePath $relativePath
     if ($path) {
         $existingScripts[$relativePath] = $path
@@ -221,7 +222,7 @@ if ($existingScripts.ContainsKey($agentPath)) {
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle '$selectedUpdateKeyPart'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle "-split ','"
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'identityKey'
-    Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'New-UpdateIdentityKey'
+    Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'New-CanonicalUpdateIdentityKey'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Get-ComCategoryCollection'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'revisionNumber'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Get-RoleFlags'
@@ -377,7 +378,7 @@ if ($existingScripts.ContainsKey($modelPath)) {
     Assert-NoForbiddenCommandLiteral -RelativePath $modelPath -Text $modelText -ForbiddenNames $forbiddenCommands
     Assert-NoReservedVariableName -Ast $modelAst -RelativePath $modelPath -ReservedNames $reservedVariableNames
     Assert-TextDoesNotMatch -RelativePath $modelPath -Text $modelText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
-    Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'New-UpdateIdentityKey'
+    Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'New-CanonicalUpdateIdentityKey'
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'New-UpdateGroupRecords'
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'Get-DefaultUpdateSelection'
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'New-PatchPlanRecords'
@@ -393,6 +394,16 @@ if ($existingScripts.ContainsKey($modelTestPath)) {
     Assert-NoReservedVariableName -Ast $modelTestAst -RelativePath $modelTestPath -ReservedNames $reservedVariableNames
     Assert-TextContains -RelativePath $modelTestPath -Text $modelTestText -Needle 'PatchPlanModel.ps1'
     Assert-TextContains -RelativePath $modelTestPath -Text $modelTestText -Needle 'Model checks passed.'
+}
+
+if ($existingScripts.ContainsKey($identityHelperPath)) {
+    $identityHelperAst = Get-ScriptAst -RelativePath $identityHelperPath -Path $existingScripts[$identityHelperPath]
+    $identityHelperText = Get-ScriptText -Path $existingScripts[$identityHelperPath]
+
+    Assert-NoForbiddenCommand -Ast $identityHelperAst -RelativePath $identityHelperPath -ForbiddenNames $forbiddenCommands
+    Assert-NoForbiddenCommandLiteral -RelativePath $identityHelperPath -Text $identityHelperText -ForbiddenNames $forbiddenCommands
+    Assert-NoReservedVariableName -Ast $identityHelperAst -RelativePath $identityHelperPath -ReservedNames $reservedVariableNames
+    Assert-TextContains -RelativePath $identityHelperPath -Text $identityHelperText -Needle 'New-CanonicalUpdateIdentityKey'
 }
 
 if ($existingScripts.ContainsKey($runtimeTestPath)) {

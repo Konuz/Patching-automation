@@ -61,6 +61,12 @@ function Assert-Throws {
     }
 }
 
+Assert-Equal -Actual (New-CanonicalUpdateIdentityKey -UpdateId '11111111-1111-1111-1111-111111111111' -RevisionNumber 205) -Expected '11111111-1111-1111-1111-111111111111|205' -Message 'canonical identity helper formats update id and revision'
+Assert-Equal -Actual (New-CanonicalUpdateIdentityKey -UpdateId $null -RevisionNumber $null -AllowMissing) -Expected $null -Message 'canonical identity helper returns null for fully missing identity when allowed'
+Assert-Throws -ScriptBlock { New-CanonicalUpdateIdentityKey -UpdateId $null -RevisionNumber 1 } -Message 'canonical identity helper rejects missing update id in strict mode'
+Assert-Throws -ScriptBlock { New-CanonicalUpdateIdentityKey -UpdateId '11111111-1111-1111-1111-111111111111' -RevisionNumber $null } -Message 'canonical identity helper rejects missing revision in strict mode'
+Assert-Throws -ScriptBlock { New-CanonicalUpdateIdentityKey -UpdateId '11111111-1111-1111-1111-111111111111' -RevisionNumber -1 } -Message 'canonical identity helper rejects negative revision'
+
 $sampleDiscovery = @(
     [pscustomobject]@{
         vmName = 'VM01'
@@ -152,10 +158,10 @@ $driftDiscovery = @(
     }
 )
 
-$key = New-UpdateIdentityKey -UpdateId '11111111-1111-1111-1111-111111111111' -RevisionNumber 205
+$key = New-CanonicalUpdateIdentityKey -UpdateId '11111111-1111-1111-1111-111111111111' -RevisionNumber 205
 Assert-Equal -Actual $key -Expected '11111111-1111-1111-1111-111111111111|205' -Message 'identity key uses update id and revision'
-Assert-Throws -ScriptBlock { New-UpdateIdentityKey -UpdateId '' -RevisionNumber 205 } -Message 'blank update id throws'
-Assert-Throws -ScriptBlock { New-UpdateIdentityKey -UpdateId '11111111-1111-1111-1111-111111111111' -RevisionNumber -1 } -Message 'negative revision throws'
+Assert-Throws -ScriptBlock { New-CanonicalUpdateIdentityKey -UpdateId '' -RevisionNumber 205 } -Message 'blank update id throws'
+Assert-Throws -ScriptBlock { New-CanonicalUpdateIdentityKey -UpdateId '11111111-1111-1111-1111-111111111111' -RevisionNumber -1 } -Message 'negative revision throws'
 
 Assert-Equal -Actual (Get-UpdateKbText -KbArticleIds $null) -Expected '' -Message 'empty KB list becomes empty text'
 Assert-Equal -Actual (Get-UpdateKbText -KbArticleIds @('5060842', '5060821')) -Expected 'KB5060842,KB5060821' -Message 'KB list gets KB prefixes'
