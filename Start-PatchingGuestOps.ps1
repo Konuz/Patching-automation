@@ -57,6 +57,36 @@ function Read-RequiredValue {
     return $value
 }
 
+function Get-UniqueTrimmedNames {
+    param(
+        [string[]]$Names
+    )
+
+    $uniqueNames = @()
+    $seenNames = @{}
+    foreach ($name in @($Names)) {
+        $nameText = ([string]$name).Trim()
+        if ([string]::IsNullOrWhiteSpace($nameText)) {
+            continue
+        }
+
+        if (-not $seenNames.ContainsKey($nameText)) {
+            $seenNames[$nameText] = $true
+            $uniqueNames += $nameText
+        }
+    }
+
+    return $uniqueNames
+}
+
+function Split-VMNameInput {
+    param(
+        [string]$InputText
+    )
+
+    return @(Get-UniqueTrimmedNames -Names ($InputText -split '[,;]'))
+}
+
 function Resolve-VMTargetNames {
     param(
         [string]$SingleVMName,
@@ -86,22 +116,12 @@ function Resolve-VMTargetNames {
         } | ForEach-Object { ([string]$_).Trim() })
     }
 
-    $uniqueTargets = @()
-    $seenTargets = @{}
-    foreach ($target in @($targets)) {
-        $targetText = ([string]$target).Trim()
-        if ([string]::IsNullOrWhiteSpace($targetText)) {
-            continue
-        }
-
-        if (-not $seenTargets.ContainsKey($targetText)) {
-            $seenTargets[$targetText] = $true
-            $uniqueTargets += $targetText
-        }
-    }
+    $uniqueTargets = @(Get-UniqueTrimmedNames -Names $targets)
 
     if ($uniqueTargets.Count -eq 0) {
-        $uniqueTargets += (Read-RequiredValue -CurrentValue $null -Prompt 'Non-production VM name')
+        do {
+            $uniqueTargets = @(Split-VMNameInput -InputText (Read-Host 'Non-production VM name(s), separated by , or ;'))
+        } while ($uniqueTargets.Count -eq 0)
     }
 
     return $uniqueTargets

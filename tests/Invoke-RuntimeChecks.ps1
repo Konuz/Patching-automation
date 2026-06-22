@@ -161,6 +161,62 @@ finally {
     Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# --- Launcher VM-target parsing (Start-PatchingGuestOps.ps1) ---
+# The launcher has top-level side effects (static checks, credential prompts), so it
+# cannot be dot-sourced wholesale. Extract just the helper function texts via the AST
+# and define them in this scope so their behavior can be tested.
+$launcherPath = Join-Path $repoRoot 'Start-PatchingGuestOps.ps1'
+$launcherTokens = $null
+$launcherErrors = $null
+$launcherAst = [System.Management.Automation.Language.Parser]::ParseFile($launcherPath, [ref]$launcherTokens, [ref]$launcherErrors)
+$launcherFunctions = @($launcherAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+
+foreach ($launcherFunctionName in @('Get-UniqueTrimmedNames', 'Split-VMNameInput', 'Resolve-VMTargetNames')) {
+    $definition = @($launcherFunctions | Where-Object { $_.Name -eq $launcherFunctionName })
+    if ($definition.Count -eq 0) {
+        Add-Failure -Message ('Launcher function not found: {0}' -f $launcherFunctionName)
+        continue
+    }
+
+    . ([scriptblock]::Create($definition[0].Extent.Text))
+}
+
+$splitMixed = @(Split-VMNameInput -InputText 'VM01, VM02; VM03')
+Assert-Equal -Actual ($splitMixed -join ',') -Expected 'VM01,VM02,VM03' -Message 'fallback splits VM names on comma and semicolon and trims whitespace'
+
+$splitEmpties = @(Split-VMNameInput -InputText ' VM01 ,, ;  ; VM02 ')
+Assert-Equal -Actual ($splitEmpties -join ',') -Expected 'VM01,VM02' -Message 'fallback skips empty and whitespace-only tokens'
+
+$splitDuplicates = @(Split-VMNameInput -InputText 'VM01; VM02; VM01')
+Assert-Equal -Actual ($splitDuplicates -join ',') -Expected 'VM01,VM02' -Message 'fallback removes duplicate VM names'
+
+$splitSingle = @(Split-VMNameInput -InputText '  VM01  ')
+Assert-Equal -Actual $splitSingle.Count -Expected 1 -Message 'fallback treats one name as a single-element list'
+Assert-Equal -Actual $splitSingle[0] -Expected 'VM01' -Message 'single fallback name is returned trimmed'
+
+$splitBlank = @(Split-VMNameInput -InputText '   ')
+Assert-Equal -Actual $splitBlank.Count -Expected 0 -Message 'whitespace-only fallback input yields no names'
+
+$uniqueNames = @(Get-UniqueTrimmedNames -Names @('VM01', ' VM02 ', '', '  ', 'VM01', 'VM03'))
+Assert-Equal -Actual ($uniqueNames -join ',') -Expected 'VM01,VM02,VM03' -Message 'name normalization trims, drops blanks, and removes duplicates in order'
+
+# The empty-source fallback must loop until at least one name is supplied. Override
+# Read-Host (interactive, so unavoidable to mock) with scripted responses.
+$script:fallbackPrompts = @()
+$fallbackResponses = New-Object System.Collections.Queue
+$fallbackResponses.Enqueue('   ')
+$fallbackResponses.Enqueue('VM01; VM02, VM01')
+function Read-Host {
+    param([Parameter(Position = 0)][string]$Prompt)
+    $script:fallbackPrompts += $Prompt
+    return $fallbackResponses.Dequeue()
+}
+
+$fallbackTargets = @(Resolve-VMTargetNames -SingleVMName '' -ManyVMNames @() -ListPath '')
+Assert-Equal -Actual ($fallbackTargets -join ',') -Expected 'VM01,VM02' -Message 'empty sources prompt for any number of VM names, split and deduplicated'
+Assert-Equal -Actual $script:fallbackPrompts.Count -Expected 2 -Message 'blank fallback input re-prompts until a name is provided'
+Assert-Equal -Actual $script:fallbackPrompts[0] -Expected 'Non-production VM name(s), separated by , or ;' -Message 'fallback prompt asks for comma or semicolon separated names'
+
 if ($failures.Count -gt 0) {
     Write-Host 'Runtime checks failed:'
     foreach ($failure in $failures) {
