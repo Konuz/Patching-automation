@@ -83,15 +83,23 @@ serwer-b
 serwer-c
 ```
 
+Plik możesz trzymać **gdziekolwiek** — liczy się ścieżka podana w `-VMListPath` (względna
+do katalogu, z którego uruchamiasz skrypt, albo bezwzględna). Zapis `.\vms.txt` w przykładach
+oznacza plik w **bieżącym katalogu** — zwykle katalog repo, obok `Start-PatchingGuestOps.ps1`.
+
 ---
 
 ## Workflow administratora
 
 ```mermaid
 flowchart TD
-    A["Uruchom launcher: Start-PatchingGuestOps.ps1"] --> B["Podaj: vCenter, nazwy VM, poświadczenia"]
-    B --> C["Lokalne testy: static + model + runtime"]
-    C --> D["Discovery: agent WUA na każdej VM (skan)"]
+    A["Uruchom launcher: Start-PatchingGuestOps.ps1"] --> C["Lokalne testy: static + model + runtime"]
+    C --> V["Pytanie: adres vCenter (jeśli nie podano parametrem)"]
+    V --> Q{"Podano VM przez -VMName / -VMNames / -VMListPath?"}
+    Q -->|"Tak"| CR["Pytanie: poświadczenia vCenter i gościa"]
+    Q -->|"Nie"| ASK["Pytanie: nazwy VM (jedna lub wiele, oddzielone , lub ;)"]
+    ASK --> CR
+    CR --> D["Discovery: agent WUA na każdej VM (skan)"]
     D --> E["Lista grup aktualizacji (klucz: UpdateID + RevisionNumber)"]
     E --> F{"Wybór grup"}
     F -->|"interaktywnie"| G["Zaznacz / odznacz grupy"]
@@ -112,8 +120,11 @@ Krok po kroku:
 
 1. **Uruchom** `.\Start-PatchingGuestOps.ps1`. Skrypt najpierw odpala lokalne testy (chyba że
    dodasz `-SkipStaticChecks`).
-2. **Podaj cele i poświadczenia** — vCenter, nazwy VM, konto do vCenter i konto lokalnego
-   admina gości.
+2. **Odpowiedz na pytania o brakujące dane.** Skrypt pyta po kolei: najpierw o adres
+   **vCenter**, potem — **tylko jeśli nie podałeś żadnej maszyny** przez `-VMName`, `-VMNames`
+   ani `-VMListPath` — **o nazwy VM** (możesz wpisać wiele naraz, oddzielone `,` lub `;`),
+   a na końcu o poświadczenia do vCenter i lokalnego admina gości. Cokolwiek przekażesz
+   parametrem, o to skrypt nie pyta.
 3. **Discovery** — agent skanuje WUA na każdej maszynie i zwraca listę dostępnych aktualizacji
    oraz flagi ról (np. Failover Cluster, SQL).
 4. **Wybór grup** — aktualizacje są pogrupowane i identyfikowane technicznie przez
@@ -172,8 +183,12 @@ Każdą grupę możesz ręcznie dozaznaczyć lub odznaczyć w kroku wyboru.
 
 ## Co powstaje po uruchomieniu
 
-Każdy przebieg tworzy katalog `out\<znacznik-czasu>\` z artefaktami (katalog `out\` jest
-w `.gitignore`):
+Wszystkie pliki wynikowe powstają **na maszynie sterującej** (stepping stone) — **nie** na
+serwerach-gościach. Domyślnie trafiają do katalogu **`out\` obok `Start-PatchingGuestOps.ps1`**
+(czyli w katalogu repo), w podkatalogu `out\<znacznik-czasu>\`. Katalog `out\` jest
+w `.gitignore`. Inną lokalizację ustawisz parametrem `-LocalOutputDirectory`.
+
+Zawartość katalogu przebiegu:
 
 | Plik | Zawartość |
 |------|-----------|
@@ -186,6 +201,11 @@ w `.gitignore`):
 
 `status.json` i `agent.log` to podstawowe źródło do diagnostyki, jeśli coś pójdzie nie tak na
 konkretnej maszynie.
+
+> Na samym gościu narzędzie używa tylko katalogu roboczego `C:\ProgramData\PatchingGuestOps`
+> (tam agent zapisuje `status.json` i `agent.log`). Te pliki są automatycznie ściągane na
+> maszynę sterującą do `out\<znacznik-czasu>\NNN-<vm>\`, więc raporty zbierasz w jednym
+> miejscu — lokalnie.
 
 ---
 
