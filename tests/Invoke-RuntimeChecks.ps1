@@ -161,24 +161,39 @@ finally {
     Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# --- Launcher VM-target parsing (Start-PatchingGuestOps.ps1) ---
-# The launcher has top-level side effects (static checks, credential prompts), so it
-# cannot be dot-sourced wholesale. Extract just the helper function texts via the AST
-# and define them in this scope so their behavior can be tested.
+# --- Shared VM-target parsing (scripts/VMTargetLib.ps1 + launcher prompt wrapper) ---
+# The pure helpers live in a dot-sourceable lib; the launcher's Resolve-VMTargetNames adds
+# the interactive prompt loop on top and has top-level side effects, so it is extracted via
+# the AST and exercised with a Read-Host override.
+. (Join-Path $repoRoot 'scripts\VMTargetLib.ps1')
+
 $launcherPath = Join-Path $repoRoot 'Start-PatchingGuestOps.ps1'
 $launcherTokens = $null
 $launcherErrors = $null
 $launcherAst = [System.Management.Automation.Language.Parser]::ParseFile($launcherPath, [ref]$launcherTokens, [ref]$launcherErrors)
 $launcherFunctions = @($launcherAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+$resolveDefinition = @($launcherFunctions | Where-Object { $_.Name -eq 'Resolve-VMTargetNames' })
+if ($resolveDefinition.Count -eq 0) {
+    Add-Failure -Message 'Launcher function not found: Resolve-VMTargetNames'
+}
+else {
+    . ([scriptblock]::Create($resolveDefinition[0].Extent.Text))
+}
 
-foreach ($launcherFunctionName in @('Get-UniqueTrimmedNames', 'Split-VMNameInput', 'Resolve-VMTargetNames')) {
-    $definition = @($launcherFunctions | Where-Object { $_.Name -eq $launcherFunctionName })
-    if ($definition.Count -eq 0) {
-        Add-Failure -Message ('Launcher function not found: {0}' -f $launcherFunctionName)
-        continue
-    }
+$fromSourcesEmpty = @(Resolve-VMTargetNamesFromSources -SingleVMName '' -ManyVMNames @() -ListPath '')
+Assert-Equal -Actual $fromSourcesEmpty.Count -Expected 0 -Message 'no sources yields an empty target list (no prompt, no throw)'
 
-    . ([scriptblock]::Create($definition[0].Extent.Text))
+$fromSourcesMerged = @(Resolve-VMTargetNamesFromSources -SingleVMName 'VM01' -ManyVMNames @('VM02', 'VM01') -ListPath '')
+Assert-Equal -Actual ($fromSourcesMerged -join ',') -Expected 'VM01,VM02' -Message 'sources merge across single and many, deduplicated in order'
+
+$vmListPath = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-vmlist-' + [guid]::NewGuid().ToString('N') + '.txt')
+Set-Content -LiteralPath $vmListPath -Value @('# comment', 'VM03', '', '  VM04  ', 'VM03') -Encoding UTF8
+try {
+    $fromList = @(Resolve-VMTargetNamesFromSources -SingleVMName '' -ManyVMNames @() -ListPath $vmListPath)
+    Assert-Equal -Actual ($fromList -join ',') -Expected 'VM03,VM04' -Message 'VM-list file is read, comment/blank lines skipped, names trimmed and deduplicated'
+}
+finally {
+    Remove-Item -LiteralPath $vmListPath -Force -ErrorAction SilentlyContinue
 }
 
 $splitMixed = @(Split-VMNameInput -InputText 'VM01, VM02; VM03')

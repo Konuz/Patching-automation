@@ -178,12 +178,13 @@ $orchestratorPath = 'scripts\Invoke-GuestOpsPatchValidation.ps1'
 $runtimeHelperPath = 'scripts\OrchestratorRuntime.ps1'
 $guestOpsLibPath = 'scripts\GuestOpsLib.ps1'
 $launcherPath = 'Start-PatchingGuestOps.ps1'
+$vmTargetLibPath = 'scripts\VMTargetLib.ps1'
 $modelPath = 'scripts\PatchPlanModel.ps1'
 $modelTestPath = 'tests\Invoke-ModelChecks.ps1'
 $runtimeTestPath = 'tests\Invoke-RuntimeChecks.ps1'
 
 $existingScripts = @{}
-foreach ($relativePath in @($agentPath, $identityHelperPath, $orchestratorPath, $runtimeHelperPath, $guestOpsLibPath, $launcherPath, $modelPath, $modelTestPath, $runtimeTestPath)) {
+foreach ($relativePath in @($agentPath, $identityHelperPath, $orchestratorPath, $runtimeHelperPath, $guestOpsLibPath, $vmTargetLibPath, $launcherPath, $modelPath, $modelTestPath, $runtimeTestPath)) {
     $path = Assert-FileExists -RelativePath $relativePath
     if ($path) {
         $existingScripts[$relativePath] = $path
@@ -250,6 +251,19 @@ if ($existingScripts.ContainsKey($guestOpsLibPath)) {
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Invoke-VMGuestReboot'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'C:\Windows\System32\shutdown.exe'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'PatchingGuestOps reboot after updates'
+}
+
+if ($existingScripts.ContainsKey($vmTargetLibPath)) {
+    $vmTargetLibAst = Get-ScriptAst -RelativePath $vmTargetLibPath -Path $existingScripts[$vmTargetLibPath]
+    $vmTargetLibText = Get-ScriptText -Path $existingScripts[$vmTargetLibPath]
+
+    Assert-NoForbiddenCommand -Ast $vmTargetLibAst -RelativePath $vmTargetLibPath -ForbiddenNames $forbiddenCommands
+    Assert-NoForbiddenCommandLiteral -RelativePath $vmTargetLibPath -Text $vmTargetLibText -ForbiddenNames $forbiddenCommands
+    Assert-NoReservedVariableName -Ast $vmTargetLibAst -RelativePath $vmTargetLibPath -ReservedNames $reservedVariableNames
+    Assert-TextDoesNotMatch -RelativePath $vmTargetLibPath -Text $vmTargetLibText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
+    Assert-TextContains -RelativePath $vmTargetLibPath -Text $vmTargetLibText -Needle 'Get-UniqueTrimmedNames'
+    Assert-TextContains -RelativePath $vmTargetLibPath -Text $vmTargetLibText -Needle 'Split-VMNameInput'
+    Assert-TextContains -RelativePath $vmTargetLibPath -Text $vmTargetLibText -Needle 'Resolve-VMTargetNamesFromSources'
 }
 
 if ($existingScripts.ContainsKey($orchestratorPath)) {
