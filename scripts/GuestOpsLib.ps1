@@ -277,6 +277,28 @@ function New-GuestAgentArguments {
     return ($arguments -join ' ')
 }
 
+function New-GuestRebootArguments {
+    param([string]$Comment = 'PatchingGuestOps reboot after updates')
+
+    $safeComment = ([string]$Comment) -replace '"', "'"
+    return ('/r /t 0 /c "{0}"' -f $safeComment)
+}
+
+function Start-GuestReboot {
+    param(
+        $ProcessManager,
+        $VMView,
+        $GuestAuth,
+        [string]$Comment = 'PatchingGuestOps reboot after updates'
+    )
+
+    $programSpec = New-Object VMware.Vim.GuestProgramSpec
+    $programSpec.ProgramPath = 'C:\Windows\System32\shutdown.exe'
+    $programSpec.Arguments = New-GuestRebootArguments -Comment $Comment
+
+    return $ProcessManager.StartProgramInGuest($VMView.MoRef, $GuestAuth, $programSpec)
+}
+
 function Start-GuestAgent {
     param(
         $ProcessManager,
@@ -455,4 +477,25 @@ function Invoke-VMAgentCycle {
     }
 
     return Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -Description ('Starting guest WUA install for {0}.' -f $VMName)
+}
+
+function Invoke-VMGuestReboot {
+    param(
+        [string]$VMName,
+        $Managers,
+        $GuestAuth
+    )
+
+    Write-Step -Message ('Resolving VM {0} for guest reboot.' -f $VMName)
+    $vm = Get-ExactVM -Name $VMName
+    Assert-VMReadyForGuestOps -VM $vm
+
+    $vmView = Get-View $vm.Id
+    Write-Step -Message ('Initiating guest reboot for VM {0}.' -f $VMName)
+    $rebootProcessId = Start-GuestReboot -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth
+
+    return [pscustomobject]@{
+        VMName = $VMName
+        ProcessId = $rebootProcessId
+    }
 }

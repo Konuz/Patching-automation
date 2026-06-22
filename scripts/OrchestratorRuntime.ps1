@@ -157,3 +157,93 @@ function Test-ApplyResultsSuccessful {
     $errors = @($ApplyResults | Where-Object { Test-IsApplyResultError -ApplyResult $_ })
     return ($errors.Count -eq 0)
 }
+
+function Select-RebootRequiredApplyResults {
+    param($ApplyResults)
+
+    return @($ApplyResults | Where-Object { [bool]$_.rebootRequired })
+}
+
+function New-RebootActionRecord {
+    param(
+        [string]$VMName,
+        [string]$Action,
+        $ProcessId = $null,
+        [string]$ErrorMessage = $null
+    )
+
+    return [pscustomobject]@{
+        vmName = $VMName
+        rebootRequired = $true
+        action = $Action
+        processId = $ProcessId
+        errorMessage = $ErrorMessage
+    }
+}
+
+function New-SkippedRebootActionRecords {
+    param($RebootTargets)
+
+    $records = @()
+    foreach ($target in @($RebootTargets)) {
+        $records += New-RebootActionRecord -VMName ([string]$target.vmName) -Action 'SkippedByOperator'
+    }
+
+    return @($records)
+}
+
+function Test-RebootActionsSuccessful {
+    param($RebootActions)
+
+    $failed = @($RebootActions | Where-Object { $_.action -eq 'Failed' })
+    return ($failed.Count -eq 0)
+}
+
+function Write-RebootActionArtifacts {
+    param(
+        [string]$CycleOutputDirectory,
+        $RebootActions
+    )
+
+    $actions = @($RebootActions)
+    $artifactPath = Join-Path $CycleOutputDirectory 'reboot-actions.json'
+    $actions | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $artifactPath -Encoding UTF8
+
+    $summaryPath = Join-Path $CycleOutputDirectory 'summary.md'
+    $initiated = @($actions | Where-Object { $_.action -eq 'Initiated' })
+    $skipped = @($actions | Where-Object { $_.action -eq 'SkippedByOperator' })
+    $failed = @($actions | Where-Object { $_.action -eq 'Failed' })
+
+    $lines = @()
+    $lines += ''
+    $lines += '## Guest reboot actions'
+    $lines += ''
+    $lines += ('- VMs with reboot initiated: {0}' -f $initiated.Count)
+    $lines += ('- VMs with reboot skipped by operator: {0}' -f $skipped.Count)
+    $lines += ('- VMs with reboot initiation errors: {0}' -f $failed.Count)
+    $lines += ''
+
+    foreach ($section in @(
+        [pscustomobject]@{ Title = 'VMs with reboot initiated'; Rows = $initiated },
+        [pscustomobject]@{ Title = 'VMs with reboot skipped by operator'; Rows = $skipped },
+        [pscustomobject]@{ Title = 'VMs with reboot initiation errors'; Rows = $failed }
+    )) {
+        $lines += ('### {0}' -f $section.Title)
+        if (@($section.Rows).Count -eq 0) {
+            $lines += '- none'
+        }
+        else {
+            foreach ($row in @($section.Rows)) {
+                if ([string]::IsNullOrWhiteSpace([string]$row.errorMessage)) {
+                    $lines += ('- {0}' -f $row.vmName)
+                }
+                else {
+                    $lines += ('- {0}: {1}' -f $row.vmName, $row.errorMessage)
+                }
+            }
+        }
+        $lines += ''
+    }
+
+    Add-Content -LiteralPath $summaryPath -Value $lines -Encoding UTF8
+}

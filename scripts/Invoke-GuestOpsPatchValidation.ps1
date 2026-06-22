@@ -173,6 +173,52 @@ function Get-GuestOpsCycleJobScript {
     }
 }
 
+function Get-GuestRebootJobScript {
+    return {
+        param($JobInput)
+
+        Set-StrictMode -Version 2.0
+        $ErrorActionPreference = 'Stop'
+
+        $connection = $null
+        try {
+            Import-Module VMware.PowerCLI -ErrorAction Stop
+            if ($JobInput.IgnoreVCenterCertificate) {
+                Set-PowerCLIConfiguration -Scope Session -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
+            }
+            . $JobInput.GuestOpsLibPath
+
+            $connection = Connect-VIServer -Server $JobInput.VIServer -Credential $JobInput.VIServerCredential -ErrorAction Stop
+            $managers = Get-GuestOpsManagers
+            $guestAuth = New-GuestAuthentication -Credential $JobInput.GuestCredential
+            $rebootResult = Invoke-VMGuestReboot -VMName $JobInput.VMName -Managers $managers -GuestAuth $guestAuth
+
+            return [pscustomobject]@{
+                Sequence = $JobInput.Sequence
+                VMName = $JobInput.VMName
+                ProcessId = $rebootResult.ProcessId
+                Error = $null
+            }
+        }
+        catch {
+            return [pscustomobject]@{
+                Sequence = $JobInput.Sequence
+                VMName = $JobInput.VMName
+                ProcessId = $null
+                Error = $_.Exception.Message
+            }
+        }
+        finally {
+            if ($null -ne $connection) {
+                try {
+                    Disconnect-VIServer -Server $connection -Confirm:$false | Out-Null
+                }
+                catch { }
+            }
+        }
+    }
+}
+
 function Get-SafeFileName {
     param([string]$Value)
     return ($Value -replace '[^a-zA-Z0-9_.-]', '_')
@@ -442,6 +488,25 @@ function Confirm-PatchPlan {
 
     $answer = Read-Host 'Proceed with this plan? [Y/N]'
     return ($answer -ieq 'Y' -or $answer -ieq 'Yes')
+}
+
+function Confirm-GuestReboot {
+    param($RebootTargets)
+
+    $targets = @($RebootTargets)
+    if ($targets.Count -eq 0) {
+        return $false
+    }
+
+    Write-Host ''
+    Write-Host ('Reboot required on {0} VM(s):' -f $targets.Count)
+    foreach ($target in $targets) {
+        Write-Host ('- {0}' -f $target.vmName)
+    }
+    Write-Host ''
+
+    $answer = Read-Host 'Initiate guest reboot now? Type REBOOT to continue'
+    return (([string]$answer).Trim() -ceq 'REBOOT')
 }
 
 function Update-PatchPlanWithDiscoveryFailures {
@@ -765,6 +830,78 @@ function Invoke-ApplyPhase {
     return @($results)
 }
 
+function Invoke-GuestRebootPhase {
+    param(
+        $RebootTargets,
+        $Managers,
+        $GuestAuth,
+        [string]$VIServer,
+        [pscredential]$VIServerCredential,
+        [pscredential]$GuestCredential,
+        [switch]$IgnoreVCenterCertificate,
+        [string]$GuestOpsLibPath,
+        [int]$ThrottleLimit = 1
+    )
+
+    $resultEntries = @()
+    $jobInputs = @()
+    $sequence = 0
+
+    foreach ($target in @($RebootTargets)) {
+        $sequence++
+        $vmName = [string]$target.vmName
+
+        if ($ThrottleLimit -le 1) {
+            try {
+                $rebootResult = Invoke-VMGuestReboot -VMName $vmName -Managers $Managers -GuestAuth $GuestAuth
+                $resultEntries += [pscustomobject]@{
+                    Sequence = $sequence
+                    Result = New-RebootActionRecord -VMName $vmName -Action 'Initiated' -ProcessId $rebootResult.ProcessId
+                }
+            }
+            catch {
+                $resultEntries += [pscustomobject]@{
+                    Sequence = $sequence
+                    Result = New-RebootActionRecord -VMName $vmName -Action 'Failed' -ErrorMessage $_.Exception.Message
+                }
+            }
+        }
+        else {
+            $jobInputs += [pscustomobject]@{
+                Sequence = $sequence
+                VMName = $vmName
+                VIServer = $VIServer
+                VIServerCredential = $VIServerCredential
+                GuestCredential = $GuestCredential
+                IgnoreVCenterCertificate = [bool]$IgnoreVCenterCertificate
+                GuestOpsLibPath = $GuestOpsLibPath
+                VMOutputDirectory = ''
+            }
+        }
+    }
+
+    if ($ThrottleLimit -gt 1 -and $jobInputs.Count -gt 0) {
+        $jobScript = Get-GuestRebootJobScript
+        $jobResults = @(Invoke-ThrottledJobs -Items $jobInputs -ThrottleLimit $ThrottleLimit -JobTimeoutSeconds 300 -ScriptBlock $jobScript)
+        foreach ($jobResult in @($jobResults | Sort-Object Sequence)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$jobResult.Error)) {
+                $resultEntries += [pscustomobject]@{
+                    Sequence = $jobResult.Sequence
+                    Result = New-RebootActionRecord -VMName $jobResult.VMName -Action 'Failed' -ErrorMessage $jobResult.Error
+                }
+                continue
+            }
+
+            $resultEntries += [pscustomobject]@{
+                Sequence = $jobResult.Sequence
+                Result = New-RebootActionRecord -VMName $jobResult.VMName -Action 'Initiated' -ProcessId $jobResult.ProcessId
+            }
+        }
+    }
+
+    return @($resultEntries | Sort-Object Sequence | ForEach-Object { $_.Result })
+}
+
 function Write-FinalReport {
     param(
         $PatchPlanRecords,
@@ -821,6 +958,50 @@ function Write-FinalReport {
     Write-Host '------------'
     Write-Host ('Summary CSV: {0}' -f $csvPath)
     Write-Host ('Summary Markdown: {0}' -f $markdownPath)
+}
+
+function Invoke-ApplyAndOptionalReboot {
+    param(
+        $PatchPlanRecords,
+        $Managers,
+        $GuestAuth,
+        [string]$VIServer,
+        [pscredential]$VIServerCredential,
+        [pscredential]$GuestCredential,
+        [switch]$IgnoreVCenterCertificate,
+        [string]$GuestOpsLibPath,
+        [string]$CurlPath,
+        [string]$AgentPath,
+        [string]$IdentityHelperPath,
+        [string]$GuestWorkingDirectory,
+        [int]$TimeoutSeconds,
+        [int]$PollSeconds,
+        [string]$CycleOutputDirectory,
+        [int]$ThrottleLimit
+    )
+
+    $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $PatchPlanRecords -Managers $Managers -GuestAuth $GuestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $GuestOpsLibPath -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -CycleOutputDirectory $CycleOutputDirectory -ThrottleLimit $ThrottleLimit)
+    Write-FinalReport -PatchPlanRecords $PatchPlanRecords -ApplyResults $applyResults -CycleOutputDirectory $CycleOutputDirectory
+
+    $rebootActions = @()
+    $rebootTargets = @(Select-RebootRequiredApplyResults -ApplyResults $applyResults)
+    if ($rebootTargets.Count -gt 0) {
+        if (Confirm-GuestReboot -RebootTargets $rebootTargets) {
+            $rebootActions = @(Invoke-GuestRebootPhase -RebootTargets $rebootTargets -Managers $Managers -GuestAuth $GuestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $GuestOpsLibPath -ThrottleLimit $ThrottleLimit)
+        }
+        else {
+            Write-Warning 'Guest reboot was not approved. Reboot phase skipped.'
+            $rebootActions = @(New-SkippedRebootActionRecords -RebootTargets $rebootTargets)
+        }
+
+        Write-RebootActionArtifacts -CycleOutputDirectory $CycleOutputDirectory -RebootActions $rebootActions
+    }
+
+    if ((Test-ApplyResultsSuccessful -ApplyResults $applyResults) -and (Test-RebootActionsSuccessful -RebootActions $rebootActions)) {
+        return 0
+    }
+
+    return 1
 }
 
 function Invoke-DiscoveryPhase {
@@ -991,17 +1172,10 @@ try {
             $scriptExitCode = 1
         }
         else {
-            $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit)
-            Write-FinalReport -PatchPlanRecords $patchPlanRecords -ApplyResults $applyResults -CycleOutputDirectory $runOutputDirectory
-            if (Test-ApplyResultsSuccessful -ApplyResults $applyResults) {
-                $scriptExitCode = 0
-            }
-            else {
-                $scriptExitCode = 1
-            }
+            $scriptExitCode = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit
         }
 
-        return
+        exit $scriptExitCode
     }
 
     if ($targetVMNames.Count -gt 1) {
@@ -1047,14 +1221,7 @@ try {
                 $scriptExitCode = 1
             }
             else {
-                $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit)
-                Write-FinalReport -PatchPlanRecords $patchPlanRecords -ApplyResults $applyResults -CycleOutputDirectory $runOutputDirectory
-                if (Test-ApplyResultsSuccessful -ApplyResults $applyResults) {
-                    $scriptExitCode = 0
-                }
-                else {
-                    $scriptExitCode = 1
-                }
+                $scriptExitCode = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit
             }
         }
         elseif ($PlanOnly) {
@@ -1191,14 +1358,7 @@ try {
             $scriptExitCode = 1
         }
         else {
-            $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit)
-            Write-FinalReport -PatchPlanRecords $patchPlanRecords -ApplyResults $applyResults -CycleOutputDirectory $runOutputDirectory
-            if (Test-ApplyResultsSuccessful -ApplyResults $applyResults) {
-                $scriptExitCode = 0
-            }
-            else {
-                $scriptExitCode = 1
-            }
+            $scriptExitCode = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit
         }
     }
 

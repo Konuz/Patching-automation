@@ -245,6 +245,11 @@ if ($existingScripts.ContainsKey($guestOpsLibPath)) {
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'ListProcessesInGuest'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'InitiateFileTransferToGuest'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'InitiateFileTransferFromGuest'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'New-GuestRebootArguments'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Start-GuestReboot'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Invoke-VMGuestReboot'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'C:\Windows\System32\shutdown.exe'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'PatchingGuestOps reboot after updates'
 }
 
 if ($existingScripts.ContainsKey($orchestratorPath)) {
@@ -331,6 +336,16 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'failoverCluster'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Skipped: Failover Cluster detected. Please update manually one by one.'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?i)\$kbArticleIds\.Count\b' -Reason 'ConvertFrom-Json can collapse one KB article id to a scalar under StrictMode'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Confirm-GuestReboot'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Type REBOOT to continue'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Invoke-GuestRebootPhase'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Invoke-ApplyAndOptionalReboot'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Get-GuestRebootJobScript'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Write-RebootActionArtifacts'
+    Assert-TextMatches -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)function\s+Confirm-GuestReboot\b.*?Read-Host.*?REBOOT' -Reason 'reboot confirmation is an explicit REBOOT prompt'
+    Assert-TextMatches -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)function\s+Invoke-GuestRebootPhase\b.*?Invoke-ThrottledJobs.*?-ThrottleLimit\s+\$ThrottleLimit' -Reason 'reboot phase uses the existing ThrottleLimit'
+    Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)function\s+Confirm-GuestReboot\b(?:(?!\bfunction\b).)*?SkipConfirmation' -Reason 'reboot confirmation must not honor -SkipConfirmation'
+    Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)IsNullOrWhiteSpace\(\$PatchPlanPath\)\).*?\breturn\b' -Reason 'resume branch must exit with the computed code, not return before the final exit'
 }
 
 if ($existingScripts.ContainsKey($runtimeHelperPath)) {
@@ -353,6 +368,12 @@ if ($existingScripts.ContainsKey($runtimeHelperPath)) {
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle "`$ApplyResult.action -eq 'Install' -and `$ApplyResult.outcome -ne 'InstallSucceeded'"
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle "`$ApplyResult.action -ne 'Install' -and `$ApplyResult.reason -eq 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.'"
     Assert-TextMatches -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Pattern '(?s)function\s+Test-ApplyResultsSuccessful\b.*?Test-IsApplyResultError\s+-ApplyResult\s+\$_' -Reason 'apply success uses shared apply-result error semantics'
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Select-RebootRequiredApplyResults'
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'New-RebootActionRecord'
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'New-SkippedRebootActionRecords'
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Test-RebootActionsSuccessful'
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Write-RebootActionArtifacts'
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'reboot-actions.json'
 }
 
 if ($existingScripts.ContainsKey($launcherPath)) {
