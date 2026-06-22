@@ -75,6 +75,14 @@ $selectionArgumentText = New-GuestAgentArguments -GuestAgentPath 'C:\ProgramData
 Assert-Contains -Text $selectionArgumentText -Needle '-SelectionPath "C:\ProgramData\PatchingGuestOps\selection.json"' -Message 'selection path is passed as a quoted argument'
 Assert-NotContains -Text $selectionArgumentText -Needle '-SelectedUpdateKeys' -Message 'selection path replaces selected update key CLI payload'
 
+$rebootArgumentText = New-GuestRebootArguments
+Assert-Contains -Text $rebootArgumentText -Needle '/r' -Message 'guest reboot arguments request restart'
+Assert-Contains -Text $rebootArgumentText -Needle '/t 0' -Message 'guest reboot arguments request immediate reboot'
+Assert-Contains -Text $rebootArgumentText -Needle '/c "PatchingGuestOps reboot after updates"' -Message 'guest reboot arguments include stable comment'
+
+$quotedRebootArgumentText = New-GuestRebootArguments -Comment 'Reboot after "updates"'
+Assert-Contains -Text $quotedRebootArgumentText -Needle '/c "Reboot after ''updates''"' -Message 'guest reboot comment replaces embedded double quotes'
+
 . (Join-Path $repoRoot 'scripts\OrchestratorRuntime.ps1')
 
 $items = @(
