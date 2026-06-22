@@ -50,6 +50,8 @@ $ErrorActionPreference = 'Stop'
 $guestOpsLibPath = Join-Path $PSScriptRoot 'GuestOpsLib.ps1'
 . $guestOpsLibPath
 
+. (Join-Path $PSScriptRoot 'VMTargetLib.ps1')
+
 $identityHelperPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'guest\UpdateIdentity.ps1'
 
 function Resolve-VMTargetNames {
@@ -59,41 +61,7 @@ function Resolve-VMTargetNames {
         [string]$ListPath
     )
 
-    $targets = @()
-
-    if (-not [string]::IsNullOrWhiteSpace($SingleVMName)) {
-        $targets += $SingleVMName
-    }
-
-    foreach ($name in @($ManyVMNames)) {
-        if (-not [string]::IsNullOrWhiteSpace([string]$name)) {
-            $targets += [string]$name
-        }
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($ListPath)) {
-        if (-not (Test-Path -LiteralPath $ListPath -PathType Leaf)) {
-            throw ('VM list file not found: {0}' -f $ListPath)
-        }
-
-        $targets += @(Get-Content -LiteralPath $ListPath | Where-Object {
-            -not [string]::IsNullOrWhiteSpace([string]$_) -and -not ([string]$_).TrimStart().StartsWith('#')
-        } | ForEach-Object { ([string]$_).Trim() })
-    }
-
-    $uniqueTargets = @()
-    $seenTargets = @{}
-    foreach ($target in @($targets)) {
-        $targetText = ([string]$target).Trim()
-        if ([string]::IsNullOrWhiteSpace($targetText)) {
-            continue
-        }
-
-        if (-not $seenTargets.ContainsKey($targetText)) {
-            $seenTargets[$targetText] = $true
-            $uniqueTargets += $targetText
-        }
-    }
+    $uniqueTargets = @(Resolve-VMTargetNamesFromSources -SingleVMName $SingleVMName -ManyVMNames $ManyVMNames -ListPath $ListPath)
 
     if ($uniqueTargets.Count -eq 0) {
         throw 'At least one VM target is required. Use -VMName, -VMNames, or -VMListPath.'

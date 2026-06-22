@@ -57,36 +57,6 @@ function Read-RequiredValue {
     return $value
 }
 
-function Get-UniqueTrimmedNames {
-    param(
-        [string[]]$Names
-    )
-
-    $uniqueNames = @()
-    $seenNames = @{}
-    foreach ($name in @($Names)) {
-        $nameText = ([string]$name).Trim()
-        if ([string]::IsNullOrWhiteSpace($nameText)) {
-            continue
-        }
-
-        if (-not $seenNames.ContainsKey($nameText)) {
-            $seenNames[$nameText] = $true
-            $uniqueNames += $nameText
-        }
-    }
-
-    return $uniqueNames
-}
-
-function Split-VMNameInput {
-    param(
-        [string]$InputText
-    )
-
-    return @(Get-UniqueTrimmedNames -Names ($InputText -split '[,;]'))
-}
-
 function Resolve-VMTargetNames {
     param(
         [string]$SingleVMName,
@@ -94,29 +64,7 @@ function Resolve-VMTargetNames {
         [string]$ListPath
     )
 
-    $targets = @()
-
-    if (-not [string]::IsNullOrWhiteSpace($SingleVMName)) {
-        $targets += $SingleVMName
-    }
-
-    foreach ($name in @($ManyVMNames)) {
-        if (-not [string]::IsNullOrWhiteSpace([string]$name)) {
-            $targets += [string]$name
-        }
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($ListPath)) {
-        if (-not (Test-Path -LiteralPath $ListPath -PathType Leaf)) {
-            throw ('VM list file not found: {0}' -f $ListPath)
-        }
-
-        $targets += @(Get-Content -LiteralPath $ListPath | Where-Object {
-            -not [string]::IsNullOrWhiteSpace([string]$_) -and -not ([string]$_).TrimStart().StartsWith('#')
-        } | ForEach-Object { ([string]$_).Trim() })
-    }
-
-    $uniqueTargets = @(Get-UniqueTrimmedNames -Names $targets)
+    $uniqueTargets = @(Resolve-VMTargetNamesFromSources -SingleVMName $SingleVMName -ManyVMNames $ManyVMNames -ListPath $ListPath)
 
     if ($uniqueTargets.Count -eq 0) {
         do {
@@ -131,6 +79,8 @@ $root = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($root)) {
     $root = (Get-Location).Path
 }
+
+. (Resolve-RequiredFile -Root $root -RelativePath 'scripts\VMTargetLib.ps1')
 
 $staticCheckPath = Resolve-RequiredFile -Root $root -RelativePath 'tests\Invoke-StaticChecks.ps1'
 $modelCheckPath = Resolve-RequiredFile -Root $root -RelativePath 'tests\Invoke-ModelChecks.ps1'
