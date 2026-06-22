@@ -1083,177 +1083,39 @@ try {
         exit $scriptExitCode
     }
 
-    if ($targetVMNames.Count -gt 1) {
-        $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-        $runOutputDirectory = New-UniqueOutputDirectory -BasePath (Join-Path $LocalOutputDirectory $timestamp)
-
-        $discoveryRecords = Invoke-DiscoveryPhase -TargetVMNames $targetVMNames -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit
-        $failedDiscoveryRecords = @($discoveryRecords | Where-Object { @($_.errors).Count -gt 0 })
-        if ($failedDiscoveryRecords.Count -gt 0) {
-            $scriptExitCode = 1
-        }
-        else {
-            $scriptExitCode = 0
-        }
-
-        $updateGroups = @(New-UpdateGroupRecords -DiscoveryRecords $discoveryRecords | Sort-Object kbText,title)
-        Show-UpdateGroups -UpdateGroups $updateGroups
-
-        if (-not $SearchOnly) {
-            if ($hasExplicitSelectedUpdateKeys) {
-                $selectedKeysForPlan = Resolve-SelectedUpdateKeys -UpdateGroups $updateGroups -ExplicitSelectedUpdateKeys $SelectedUpdateKeys
-            }
-            elseif ($updateGroups.Count -gt 0) {
-                $selectedKeysForPlan = Read-UpdateGroupSelection -UpdateGroups $updateGroups
-            }
-            else {
-                $selectedKeysForPlan = @()
-            }
-
-            Write-Step -Message ('Selected update group key(s): {0}' -f @($selectedKeysForPlan).Count)
-
-            $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
-            $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
-            $patchPlanPath = Join-Path $runOutputDirectory 'patch-plan.json'
-            $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
-            Show-PatchPlan -PatchPlanRecords $patchPlanRecords
-
-            if ($PlanOnly) {
-                $scriptExitCode = Get-PlanOnlyExitCode -PatchPlanRecords $patchPlanRecords
-            }
-            elseif (-not (Confirm-PatchPlan -SkipConfirmation:$SkipConfirmation)) {
-                Write-Warning 'Patch plan was not approved. Apply phase skipped.'
-                $scriptExitCode = 1
-            }
-            else {
-                $scriptExitCode = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit
-            }
-        }
-        elseif ($PlanOnly) {
-            $selectedKeysForPlan = @()
-            $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
-            $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
-            $patchPlanPath = Join-Path $runOutputDirectory 'patch-plan.json'
-            $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
-            Show-PatchPlan -PatchPlanRecords $patchPlanRecords
-            $scriptExitCode = Get-PlanOnlyExitCode -PatchPlanRecords $patchPlanRecords
-        }
-    }
-    else {
-    Write-Step -Message ('Resolving VM {0}.' -f $VMName)
-    $vm = Get-ExactVM -Name $VMName
-    Assert-VMReadyForGuestOps -VM $vm
-
-    $vmView = Get-View $vm.Id
-    $hostName = Get-VMHostNameForTransfer -VMView $vmView
-
     $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $safeVmName = Get-SafeFileName -Value $VMName
-    $runOutputDirectory = Join-Path $LocalOutputDirectory ('{0}-{1}' -f $timestamp, $safeVmName)
-    New-Item -ItemType Directory -Force -Path $runOutputDirectory | Out-Null
+    $runOutputDirectory = New-UniqueOutputDirectory -BasePath (Join-Path $LocalOutputDirectory $timestamp)
 
-    $guestAgentPath = Join-Path $GuestWorkingDirectory 'Run-LocalPatch.ps1'
-    $guestStatusPath = Join-Path $GuestWorkingDirectory 'status.json'
-    $guestLogPath = Join-Path $GuestWorkingDirectory 'agent.log'
-    $localStatusPath = Join-Path $runOutputDirectory 'status.json'
-    $localLogPath = Join-Path $runOutputDirectory 'agent.log'
-
-    Write-Step -Message ('Creating guest working directory {0}.' -f $GuestWorkingDirectory)
-    $mkdirProcessId = New-GuestDirectory -ProcessManager $managers.ProcessManager -VMView $vmView -GuestAuth $guestAuth -DirectoryPath $GuestWorkingDirectory
-    $mkdirResult = Wait-GuestProcess -ProcessManager $managers.ProcessManager -VMView $vmView -GuestAuth $guestAuth -ProcessId $mkdirProcessId -TimeoutSeconds 120 -PollSeconds 5
-    if (-not $mkdirResult.Completed -or ($null -ne $mkdirResult.ExitCode -and $mkdirResult.ExitCode -ne 0)) {
-        throw ('Failed to create guest working directory. Completed={0}; ExitCode={1}' -f $mkdirResult.Completed, $mkdirResult.ExitCode)
-    }
-
-    Send-GuestFile -FileManager $managers.FileManager -VMView $vmView -GuestAuth $guestAuth -HostName $hostName -CurlPath $curlPath -LocalPath $AgentPath -GuestPath $guestAgentPath
-
-    $guestIdentityHelperPath = Join-Path $GuestWorkingDirectory 'UpdateIdentity.ps1'
-    Send-GuestFile -FileManager $managers.FileManager -VMView $vmView -GuestAuth $guestAuth -HostName $hostName -CurlPath $curlPath -LocalPath $identityHelperPath -GuestPath $guestIdentityHelperPath
-
-    $agentRunParams = @{
-        ProcessManager = $managers.ProcessManager
-        FileManager = $managers.FileManager
-        VMView = $vmView
-        GuestAuth = $guestAuth
-        HostName = $hostName
-        CurlPath = $curlPath
-        GuestAgentPath = $guestAgentPath
-        GuestWorkingDirectory = $GuestWorkingDirectory
-        GuestStatusPath = $guestStatusPath
-        GuestLogPath = $guestLogPath
-        LocalStatusPath = $localStatusPath
-        LocalLogPath = $localLogPath
-        TimeoutSeconds = ($TimeoutMinutes * 60)
-        PollSeconds = $PollSeconds
-    }
-
-    $skipSingleVmValidationSummary = $false
-
-    if ($SearchOnly) {
-        $agentRun = Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SearchOnly -Description 'Starting guest WUA search.'
-        $agentResult = $agentRun.AgentResult
-        $status = $agentRun.Status
-        $discoveryRecords = @(New-DiscoveryRecord -VMName $VMName -Status $status -OutputDirectory $runOutputDirectory)
-        $updateGroups = @(New-UpdateGroupRecords -DiscoveryRecords $discoveryRecords | Sort-Object kbText,title)
-        Show-UpdateGroups -UpdateGroups $updateGroups
-
-        if ($PlanOnly) {
-            $selectedKeysForPlan = @()
-            $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
-            $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
-            $patchPlanPath = Join-Path $runOutputDirectory 'patch-plan.json'
-            $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
-            Show-PatchPlan -PatchPlanRecords $patchPlanRecords
-            $skipSingleVmValidationSummary = $true
-            $scriptExitCode = Get-PlanOnlyExitCode -PatchPlanRecords $patchPlanRecords
-        }
+    $discoveryRecords = Invoke-DiscoveryPhase -TargetVMNames $targetVMNames -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit
+    $failedDiscoveryRecords = @($discoveryRecords | Where-Object { @($_.errors).Count -gt 0 })
+    if ($failedDiscoveryRecords.Count -gt 0) {
+        $scriptExitCode = 1
     }
     else {
-        # Two-pass single-VM validation: this is the search-only pass; the apply branch below
-        # runs the guest agent a SECOND time via Invoke-ApplyPhase (re-upload + a fresh
-        # search+install cycle that re-derives selection by identity). The double pass is
-        # intentional validation scaffolding; the multi-VM path is the production shape.
-        $searchRun = Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SearchOnly -Description 'Starting guest WUA search.'
-        $searchStatus = $searchRun.Status
-        $searchOutcome = Get-ObjectPropertyValue -InputObject $searchStatus -Path @('outcome')
-        $searchAvailableUpdateCount = [int](Get-ObjectPropertyValue -InputObject $searchStatus -Path @('availableUpdateCount') -DefaultValue 0)
-        $failoverClusterDetected = [bool](Get-ObjectPropertyValue -InputObject $searchStatus -Path @('roleFlags', 'failoverCluster') -DefaultValue $false)
-        $discoveryRecords = @(New-DiscoveryRecord -VMName $VMName -Status $searchStatus -OutputDirectory $runOutputDirectory)
-        $updateGroups = @(New-UpdateGroupRecords -DiscoveryRecords $discoveryRecords | Sort-Object kbText,title)
-        Show-UpdateGroups -UpdateGroups $updateGroups
-        $selectedKeysForPlan = @()
+        $scriptExitCode = 0
+    }
 
-        if ($failoverClusterDetected) {
-            Write-Warning 'Skipped: Failover Cluster detected. Please update manually one by one.'
-            $agentResult = $searchRun.AgentResult
-            $status = $searchStatus
+    $updateGroups = @(New-UpdateGroupRecords -DiscoveryRecords $discoveryRecords | Sort-Object kbText,title)
+    Show-UpdateGroups -UpdateGroups $updateGroups
+
+    if (-not $SearchOnly) {
+        if ($hasExplicitSelectedUpdateKeys) {
+            $selectedKeysForPlan = Resolve-SelectedUpdateKeys -UpdateGroups $updateGroups -ExplicitSelectedUpdateKeys $SelectedUpdateKeys
         }
-        elseif ($searchOutcome -ne 'SearchOnly' -or $searchAvailableUpdateCount -eq 0) {
-            $agentResult = $searchRun.AgentResult
-            $status = $searchStatus
+        elseif ($updateGroups.Count -gt 0) {
+            $selectedKeysForPlan = Read-UpdateGroupSelection -UpdateGroups $updateGroups
         }
         else {
-            if ($hasExplicitSelectedUpdateKeys) {
-                $selectedKeysForPlan = Resolve-SelectedUpdateKeys -UpdateGroups $updateGroups -ExplicitSelectedUpdateKeys $SelectedUpdateKeys
-            }
-            elseif ($updateGroups.Count -gt 0) {
-                $selectedKeysForPlan = Read-UpdateGroupSelection -UpdateGroups $updateGroups
-            }
-            else {
-                $selectedKeysForPlan = @()
-            }
-
-            Write-Step -Message ('Selected update group key(s): {0}' -f @($selectedKeysForPlan).Count)
-            $agentResult = $searchRun.AgentResult
-            $status = $searchStatus
+            $selectedKeysForPlan = @()
         }
+
+        Write-Step -Message ('Selected update group key(s): {0}' -f @($selectedKeysForPlan).Count)
 
         $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
         $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
         $patchPlanPath = Join-Path $runOutputDirectory 'patch-plan.json'
         $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
         Show-PatchPlan -PatchPlanRecords $patchPlanRecords
-        $skipSingleVmValidationSummary = $true
 
         if ($PlanOnly) {
             $scriptExitCode = Get-PlanOnlyExitCode -PatchPlanRecords $patchPlanRecords
@@ -1266,117 +1128,14 @@ try {
             $scriptExitCode = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestAuth $guestAuth -VIServer $VIServer -VIServerCredential $VIServerCredential -GuestCredential $GuestCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit
         }
     }
-
-    if (-not $skipSingleVmValidationSummary) {
-    $outcome = Get-ObjectPropertyValue -InputObject $status -Path @('outcome')
-    $isElevated = Get-ObjectPropertyValue -InputObject $status -Path @('isElevated')
-    $availableUpdateCount = Get-ObjectPropertyValue -InputObject $status -Path @('availableUpdateCount')
-    $selectedUpdateCount = Get-ObjectPropertyValue -InputObject $status -Path @('selectedUpdateCount')
-    $pendingRebootIsPending = Get-ObjectPropertyValue -InputObject $status -Path @('pendingReboot', 'isPending')
-    $finishedAt = Get-ObjectPropertyValue -InputObject $status -Path @('finishedAt')
-
-    Write-Host ''
-    Write-Host 'Validation summary'
-    Write-Host '------------------'
-    Write-Host ('VM: {0}' -f $VMName)
-    Write-Host ('Output: {0}' -f $runOutputDirectory)
-    Write-Host ('Agent outcome: {0}' -f $outcome)
-    Write-Host ('Agent elevated: {0}' -f $isElevated)
-    Write-Host ('Available updates: {0}' -f $availableUpdateCount)
-    Write-Host ('Selected updates: {0}' -f $selectedUpdateCount)
-    Write-Host ('Role flags: {0}' -f (Get-RoleFlagText -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags'))))
-    Write-Host ('Pending reboot: {0}' -f $pendingRebootIsPending)
-
-    $pendingRebootChecks = Get-ObjectPropertyValue -InputObject $status -Path @('pendingReboot', 'checks')
-    if ($null -ne $pendingRebootChecks) {
-        Write-Host 'Pending reboot checks:'
-        foreach ($checkName in @('componentBasedServicing', 'windowsUpdate', 'pendingFileRename')) {
-            $checkValue = Get-ObjectPropertyValue -InputObject $pendingRebootChecks -Path @($checkName)
-            if ($null -ne $checkValue) {
-                Write-Host (' - {0}: {1}' -f $checkName, $checkValue)
-            }
-        }
-    }
-
-    $agentErrors = Get-ObjectPropertyValue -InputObject $status -Path @('errors')
-    if ($null -ne $agentErrors -and @($agentErrors).Count -gt 0) {
-        Write-Host 'Agent errors:'
-        foreach ($agentError in @($agentErrors)) {
-            $message = Get-ObjectPropertyValue -InputObject $agentError -Path @('message')
-            $type = Get-ObjectPropertyValue -InputObject $agentError -Path @('type')
-            $line = Get-ObjectPropertyValue -InputObject $agentError -Path @('line')
-            $stage = Get-ObjectPropertyValue -InputObject $agentError -Path @('stage')
-
-            $details = @()
-            if (-not [string]::IsNullOrWhiteSpace([string]$stage)) {
-                $details += ('stage={0}' -f $stage)
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace([string]$line)) {
-                $details += ('line={0}' -f $line)
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace([string]$type)) {
-                $details += ('type={0}' -f $type)
-            }
-
-            if ($details.Count -gt 0) {
-                Write-Host (' - {0} ({1})' -f $message, ($details -join '; '))
-            }
-            else {
-                Write-Host (' - {0}' -f $message)
-            }
-
-            $command = Get-ObjectPropertyValue -InputObject $agentError -Path @('command')
-            if (-not [string]::IsNullOrWhiteSpace([string]$command)) {
-                Write-Host ('   command: {0}' -f ([string]$command).Trim())
-            }
-        }
-    }
-
-    $updates = Get-ObjectPropertyValue -InputObject $status -Path @('updates')
-    if ($null -ne $updates) {
-        foreach ($update in @($updates)) {
-            if (Get-ObjectPropertyValue -InputObject $update -Path @('selected') -DefaultValue $false) {
-                Write-Host ('Selected update: {0}' -f (Get-ObjectPropertyValue -InputObject $update -Path @('title')))
-                $kbArticleIds = Get-ObjectPropertyValue -InputObject $update -Path @('kbArticleIds')
-                $kbArticleIdList = @(@($kbArticleIds) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
-                if ($kbArticleIdList.Count -gt 0) {
-                    Write-Host ('KB: {0}' -f ($kbArticleIdList -join ','))
-                }
-
-                $installResult = Get-ObjectPropertyValue -InputObject $update -Path @('installResult')
-                if ($installResult) {
-                    Write-Host ('Install result: {0} ({1})' -f (Get-ObjectPropertyValue -InputObject $installResult -Path @('result')), (Get-ObjectPropertyValue -InputObject $installResult -Path @('hResult')))
-                }
-            }
-        }
-    }
-
-    $hasSuccessfulOutcome = $outcome -in @('InstallSucceeded', 'NoApplicableUpdates', 'SearchOnly')
-    $hasFinishedAt = -not [string]::IsNullOrWhiteSpace([string]$finishedAt)
-
-    if ($hasSuccessfulOutcome) {
-        $scriptExitCode = 0
-    }
-    else {
-        $scriptExitCode = 1
-    }
-
-    if ($outcome -eq 'NoApplicableUpdates') {
-        Write-Warning 'No applicable updates were found. GuestOps and WUA search were validated, but WUA Install() still needs a VM with a pending update.'
-    }
-
-    if (-not $agentResult.Completed) {
-        if ($hasSuccessfulOutcome -and $hasFinishedAt) {
-            Write-Warning 'The GuestOps process result timed out. status.json has a successful outcome and finishedAt, so the JSON artifact remains the primary validation result.'
-        }
-        else {
-            Write-Warning 'The GuestOps process result timed out and status.json did not contain both a successful outcome and finishedAt.'
-            $scriptExitCode = 1
-        }
-    }
-    }
+    elseif ($PlanOnly) {
+        $selectedKeysForPlan = @()
+        $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
+        $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
+        $patchPlanPath = Join-Path $runOutputDirectory 'patch-plan.json'
+        $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
+        Show-PatchPlan -PatchPlanRecords $patchPlanRecords
+        $scriptExitCode = Get-PlanOnlyExitCode -PatchPlanRecords $patchPlanRecords
     }
 }
 catch {

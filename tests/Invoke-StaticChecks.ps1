@@ -261,10 +261,7 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-NoReservedVariableName -Ast $orchestratorAst -RelativePath $orchestratorPath -ReservedNames $reservedVariableNames
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'curl.exe'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Agent errors:'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Pending reboot checks:'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'InstallSelection'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Available updates'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'VMNames'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'VMListPath'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'ThrottleLimit'
@@ -330,7 +327,6 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'successful discovery outcome and finishedAt'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)if\s*\(\$targetVMNames\.Count\s+-gt\s+1\).*?\breturn\b' -Reason 'multi-VM discovery must fall through to the final exit'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Role flags:'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'failoverCluster'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Skipped: Failover Cluster detected. Please update manually one by one.'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?i)\$kbArticleIds\.Count\b' -Reason 'ConvertFrom-Json can collapse one KB article id to a scalar under StrictMode'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Confirm-GuestReboot'
@@ -343,6 +339,8 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextMatches -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)function\s+Invoke-GuestRebootPhase\b.*?Invoke-ThrottledJobs.*?-ThrottleLimit\s+\$ThrottleLimit' -Reason 'reboot phase uses the existing ThrottleLimit'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)function\s+Confirm-GuestReboot\b(?:(?!\bfunction\b).)*?SkipConfirmation' -Reason 'reboot confirmation must not honor -SkipConfirmation'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)IsNullOrWhiteSpace\(\$PatchPlanPath\)\).*?\breturn\b' -Reason 'resume branch must exit with the computed code, not return before the final exit'
+    Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern 'Validation summary' -Reason 'Single-VM validation summary path was unified into the phase-based flow'
+    Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern 'skipSingleVmValidationSummary' -Reason 'Single-VM validation flag removed by path unification'
 }
 
 if ($existingScripts.ContainsKey($runtimeHelperPath)) {
