@@ -901,6 +901,9 @@ function Invoke-DiscoveryPhase {
     $recordEntries = @()
     $jobInputs = @()
     $targetNumber = 0
+    $previousSuppressStepMessages = $script:SuppressStepMessages
+    $script:SuppressStepMessages = $true
+    try {
     foreach ($targetVMName in @($TargetVMNames)) {
         $targetNumber++
         $vmOutputDirectory = Join-Path $CycleOutputDirectory ('{0:D3}-{1}' -f $targetNumber, (Get-SafeFileName -Value $targetVMName))
@@ -967,6 +970,10 @@ function Invoke-DiscoveryPhase {
                 Record = New-DiscoveryRecordFromAgentRun -VMName $jobResult.VMName -AgentRun $agentRun -OutputDirectory $jobResult.VMOutputDirectory
             }
         }
+    }
+    }
+    finally {
+        $script:SuppressStepMessages = $previousSuppressStepMessages
     }
 
     $records = @($recordEntries | Sort-Object Sequence | ForEach-Object { $_.Record })

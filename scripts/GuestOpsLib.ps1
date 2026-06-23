@@ -1,5 +1,8 @@
+$script:SuppressStepMessages = $false
+
 function Write-Step {
     param([string]$Message)
+    if ($script:SuppressStepMessages) { return }
     Write-Host ('[{0}] {1}' -f (Get-Date).ToString('HH:mm:ss'), $Message)
 }
 
