@@ -330,6 +330,11 @@ Assert-Equal -Actual $summaryVm01.RoleFlags -Expected 'SQL' -Message 'summary in
 Assert-Equal -Actual $summaryVm01.SelectedUpdateCount -Expected 1 -Message 'summary counts selected updates'
 Assert-Equal -Actual $summaryVm03.Action -Expected 'Skip' -Message 'summary includes skipped cluster action'
 
+Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $true -AvailableUpdateCount 0 -HasErrors $false) -Expected 'UpToDate' -Message 'discovery status: successful with zero updates is up-to-date'
+Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $true -AvailableUpdateCount 3 -HasErrors $false) -Expected 'UpdatesFound' -Message 'discovery status: successful with updates is updates-found'
+Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $false -AvailableUpdateCount 0 -HasErrors $true) -Expected 'Failed' -Message 'discovery status: errors make discovery failed'
+Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $false -AvailableUpdateCount 5 -HasErrors $false) -Expected 'Failed' -Message 'discovery status: unsuccessful outcome is failed regardless of count'
+
 $rawPatchPlan = @(
     [pscustomobject]@{
         vmName = 'VM01'

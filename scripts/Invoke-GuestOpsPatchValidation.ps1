@@ -986,7 +986,16 @@ function Invoke-DiscoveryPhase {
     Write-Host 'Discovery summary'
     Write-Host '-----------------'
     foreach ($record in @($records)) {
-        Write-Host ('{0}: outcome={1}; updates={2}; roles={3}' -f $record.vmName, $record.outcome, $record.availableUpdateCount, (Get-RoleFlagText -RoleFlags $record.roleFlags))
+        $isSuccessful = Test-IsSuccessfulDiscoveryOutcome -Outcome ([string]$record.outcome)
+        $hasErrors = (@($record.errors).Count -gt 0)
+        $summaryStatus = Get-DiscoverySummaryStatus -IsSuccessful $isSuccessful -AvailableUpdateCount ([int]$record.availableUpdateCount) -HasErrors $hasErrors
+        $summaryColor = switch ($summaryStatus) {
+            'UpToDate' { 'Green' }
+            'UpdatesFound' { 'Yellow' }
+            default { 'Red' }
+        }
+        $rebootText = if ($null -eq $record.pendingRebootBefore) { '?' } elseif ([bool]$record.pendingRebootBefore) { 'yes' } else { 'no' }
+        Write-Host ('{0}: outcome={1}; updates={2}; reboot={3}; roles={4}' -f $record.vmName, $record.outcome, $record.availableUpdateCount, $rebootText, (Get-RoleFlagText -RoleFlags $record.roleFlags)) -ForegroundColor $summaryColor
     }
 
     return @($records)
@@ -1021,6 +1030,8 @@ if (-not $GuestCredential) {
 $curlPath = Assert-LocalPrerequisites -LocalAgentPath $AgentPath
 
 Import-Module VMware.VimAutomation.Core -ErrorAction Stop
+
+Set-PowerCLIConfiguration -Scope User -ParticipateInCEIP $false -Confirm:$false | Out-Null
 
 if ($IgnoreVCenterCertificate) {
     Set-PowerCLIConfiguration -Scope Session -InvalidCertificateAction Ignore -Confirm:$false | Out-Null

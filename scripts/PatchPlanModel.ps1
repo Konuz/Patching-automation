@@ -30,6 +30,24 @@ function Get-ModelPropertyValue {
     return $property.Value
 }
 
+function Get-DiscoverySummaryStatus {
+    param(
+        [bool]$IsSuccessful,
+        [int]$AvailableUpdateCount,
+        [bool]$HasErrors
+    )
+
+    if ($HasErrors -or -not $IsSuccessful) {
+        return 'Failed'
+    }
+
+    if ($AvailableUpdateCount -gt 0) {
+        return 'UpdatesFound'
+    }
+
+    return 'UpToDate'
+}
+
 function Test-ModelPropertyExists {
     param(
         $InputObject,
