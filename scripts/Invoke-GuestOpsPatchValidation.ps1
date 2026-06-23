@@ -104,6 +104,7 @@ function Get-GuestOpsCycleJobScript {
                 Set-PowerCLIConfiguration -Scope Session -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
             }
             . $JobInput.GuestOpsLibPath
+            $script:SuppressStepMessages = [bool](Get-ObjectPropertyValue -InputObject $JobInput -Path @('SuppressStepMessages'))
 
             $connection = Connect-VIServer -Server $JobInput.VIServer -Credential $JobInput.VIServerCredential -ErrorAction Stop
             $managers = Get-GuestOpsManagers
@@ -942,6 +943,7 @@ function Invoke-DiscoveryPhase {
                 MaxUpdates = $MaxUpdates
                 SelectedUpdateKeys = @()
                 SearchOnly = $true
+                SuppressStepMessages = $true
                 TimeoutSeconds = $TimeoutSeconds
                 PollSeconds = $PollSeconds
             }
