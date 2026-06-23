@@ -71,7 +71,7 @@ Potrzebne poświadczenia (skrypt o nie zapyta, jeśli ich nie podasz):
 
 Nazwy VM można podać na kilka sposobów: `-VMName <vm>`, `-VMNames vm1,vm2`, albo `-VMListPath
 .\vms.txt`. Jeśli nie podasz żadnej, skrypt zapyta interaktywnie i przyjmie **dowolną liczbę
-nazw oddzielonych przecinkiem `,` lub średnikiem `;`**.
+nazw oddzielonych średnikiem `;`**.
 
 Format pliku `vms.txt` — jedna nazwa w linii, puste linie i linie zaczynające się od `#` są
 pomijane:
@@ -97,7 +97,7 @@ flowchart TD
     C --> V["Pytanie: adres vCenter (jeśli nie podano parametrem)"]
     V --> Q{"Podano VM przez -VMName / -VMNames / -VMListPath?"}
     Q -->|"Tak"| CR["Pytanie: poświadczenia vCenter i gościa"]
-    Q -->|"Nie"| ASK["Pytanie: nazwy VM (jedna lub wiele, oddzielone , lub ;)"]
+    Q -->|"Nie"| ASK["Pytanie: nazwy VM (jedna lub wiele, oddzielone ;)"]
     ASK --> CR
     CR --> D["Discovery: agent WUA na każdej VM (skan)"]
     D --> E["Lista grup aktualizacji (klucz: UpdateID + RevisionNumber)"]
@@ -122,7 +122,7 @@ Krok po kroku:
    dodasz `-SkipStaticChecks`).
 2. **Odpowiedz na pytania o brakujące dane.** Skrypt pyta po kolei: najpierw o adres
    **vCenter**, potem — **tylko jeśli nie podałeś żadnej maszyny** przez `-VMName`, `-VMNames`
-   ani `-VMListPath` — **o nazwy VM** (możesz wpisać wiele naraz, oddzielone `,` lub `;`),
+   ani `-VMListPath` — **o nazwy VM** (możesz wpisać wiele naraz, oddzielone `;`),
    a na końcu o poświadczenia do vCenter i lokalnego admina gości. Cokolwiek przekażesz
    parametrem, o to skrypt nie pyta.
 3. **Discovery** — agent skanuje WUA na każdej maszynie i zwraca listę dostępnych aktualizacji
