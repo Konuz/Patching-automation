@@ -126,7 +126,7 @@ Krok po kroku:
    a na końcu o poświadczenia do vCenter i lokalnego admina gości. Cokolwiek przekażesz
    parametrem, o to skrypt nie pyta.
 3. **Discovery** — agent skanuje WUA na każdej maszynie i zwraca listę dostępnych aktualizacji
-   oraz flagi ról (np. Failover Cluster, SQL).
+   oraz flagi ról (np. Failover Cluster, Domain Controller, SQL, Exchange, IIS).
 4. **Wybór grup** — aktualizacje są pogrupowane i identyfikowane technicznie przez
    `UpdateID + RevisionNumber` (KB i tytuł są pokazywane dla człowieka). Wybierasz interaktywnie
    albo z góry przez `-SelectedUpdateKeys`. Domyślnie zaznaczone są aktualizacje krytyczne/ważne

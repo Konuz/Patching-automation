@@ -251,12 +251,17 @@ function Test-PendingReboot {
 
 function Get-RoleFlags {
     $failoverCluster = ($null -ne (Get-Service -Name 'ClusSvc' -ErrorAction SilentlyContinue))
+    $domainController = ($null -ne (Get-Service -Name 'NTDS' -ErrorAction SilentlyContinue))
     $sql = (@(Get-Service -Name @('MSSQLSERVER', 'MSSQL$*', 'SQLSERVERAGENT', 'SQLAgent$*') -ErrorAction SilentlyContinue).Count -gt 0)
     $exchange = (@(Get-Service -Name 'MSExchange*' -ErrorAction SilentlyContinue).Count -gt 0)
+    $iis = ($null -ne (Get-Service -Name 'W3SVC' -ErrorAction SilentlyContinue))
 
     $detected = @()
     if ($failoverCluster) {
         $detected += 'Failover Cluster'
+    }
+    if ($domainController) {
+        $detected += 'Domain Controller'
     }
     if ($sql) {
         $detected += 'SQL'
@@ -264,11 +269,16 @@ function Get-RoleFlags {
     if ($exchange) {
         $detected += 'Exchange'
     }
+    if ($iis) {
+        $detected += 'IIS'
+    }
 
     return [ordered]@{
         failoverCluster = $failoverCluster
+        domainController = $domainController
         sql = $sql
         exchange = $exchange
+        iis = $iis
         detected = $detected
     }
 }

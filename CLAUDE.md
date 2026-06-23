@@ -91,6 +91,6 @@ Runtime and model scripts run under `Set-StrictMode -Version 2.0` + `$ErrorActio
 The single-VM index-selection mode is validation scaffolding, not the final product. The target tool separates stages: **discovery → group update selection → per-VM plan → final confirm → apply**. Notable decisions:
 
 - Update selection becomes a **checkbox group view** keyed technically on **`UpdateID` + `RevisionNumber`** (KB/title shown to humans but not authoritative).
-- **Failover Cluster detected → hard skip** the VM ("update manually one by one"). SQL/Exchange become high-risk role flags, not auto-skips.
+- **Failover Cluster detected → hard skip** the VM ("update manually one by one"). SQL/Exchange become high-risk role flags; Domain Controller and IIS are also detected as role flags. None of these auto-skip.
 - Default policy first uses structured WUA fields (`MsrcSeverity`, `Type`) when available, then falls back to title/category matching. It preselects critical/important software updates and cumulative/security/critical/rollup + MSRT; it skips driver, preview, feature, and optional updates.
 ```
