@@ -99,7 +99,7 @@ function Get-GuestOpsCycleJobScript {
 
         $connection = $null
         try {
-            Import-Module VMware.PowerCLI -ErrorAction Stop
+            Import-Module VMware.VimAutomation.Core -ErrorAction Stop
             if ($JobInput.IgnoreVCenterCertificate) {
                 Set-PowerCLIConfiguration -Scope Session -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
             }
@@ -150,7 +150,7 @@ function Get-GuestRebootJobScript {
 
         $connection = $null
         try {
-            Import-Module VMware.PowerCLI -ErrorAction Stop
+            Import-Module VMware.VimAutomation.Core -ErrorAction Stop
             if ($JobInput.IgnoreVCenterCertificate) {
                 Set-PowerCLIConfiguration -Scope Session -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
             }
@@ -1011,7 +1011,7 @@ if (-not $GuestCredential) {
 
 $curlPath = Assert-LocalPrerequisites -LocalAgentPath $AgentPath
 
-Import-Module VMware.PowerCLI -ErrorAction Stop
+Import-Module VMware.VimAutomation.Core -ErrorAction Stop
 
 if ($IgnoreVCenterCertificate) {
     Set-PowerCLIConfiguration -Scope Session -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
