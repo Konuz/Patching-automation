@@ -996,6 +996,7 @@ function Invoke-DiscoveryPhase {
         }
         $rebootText = if ($null -eq $record.pendingRebootBefore) { '?' } elseif ([bool]$record.pendingRebootBefore) { 'yes' } else { 'no' }
         Write-Host ('{0}: outcome={1}; updates={2}; reboot={3}; roles={4}' -f $record.vmName, $record.outcome, $record.availableUpdateCount, $rebootText, (Get-RoleFlagText -RoleFlags $record.roleFlags)) -ForegroundColor $summaryColor
+        Write-Host ''
     }
 
     return @($records)

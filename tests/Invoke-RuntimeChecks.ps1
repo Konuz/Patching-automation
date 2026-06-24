@@ -230,7 +230,7 @@ function Read-Host {
 $fallbackTargets = @(Resolve-VMTargetNames -SingleVMName '' -ManyVMNames @() -ListPath '')
 Assert-Equal -Actual ($fallbackTargets -join ',') -Expected 'VM01,VM02' -Message 'empty sources prompt for any number of VM names, split and deduplicated'
 Assert-Equal -Actual $script:fallbackPrompts.Count -Expected 2 -Message 'blank fallback input re-prompts until a name is provided'
-Assert-Equal -Actual $script:fallbackPrompts[0] -Expected 'VM name(s), separated by ;' -Message 'fallback prompt asks for semicolon separated names'
+Assert-Equal -Actual $script:fallbackPrompts[0] -Expected 'VM name(s), separated by ";"' -Message 'fallback prompt asks for semicolon separated names'
 
 if ($failures.Count -gt 0) {
     Write-Host 'Runtime checks failed:'

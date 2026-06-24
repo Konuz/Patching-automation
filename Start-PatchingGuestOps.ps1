@@ -68,7 +68,7 @@ function Resolve-VMTargetNames {
 
     if ($uniqueTargets.Count -eq 0) {
         do {
-            $uniqueTargets = @(Split-VMNameInput -InputText (Read-Host 'VM name(s), separated by ;'))
+            $uniqueTargets = @(Split-VMNameInput -InputText (Read-Host 'VM name(s), separated by ";"'))
         } while ($uniqueTargets.Count -eq 0)
     }
 
