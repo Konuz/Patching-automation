@@ -237,6 +237,18 @@ Assert-Equal -Actual ((Get-VMLookupCandidates -Name 'vm1.contoso.com') -join '|'
 Assert-Equal -Actual ((Get-VMLookupCandidates -Name 'oldbox') -join '|') -Expected 'oldbox' -Message 'bare hostname yields a single candidate'
 Assert-Equal -Actual ((Get-VMLookupCandidates -Name 'host.sub.contoso.com') -join '|') -Expected 'host|host.sub.contoso.com' -Message 'multi-level FQDN splits at the first dot only'
 
+# --- Guest credential grouping (scripts/VMTargetLib.ps1) ---
+$credGroups = @(Get-GuestCredentialGroups -TargetNames @('vm2.contoso.com', 'vm1.contoso.com', 'app.fabrikam.local', 'oldbox'))
+Assert-Equal -Actual $credGroups.Count -Expected 3 -Message 'two domains plus one local form three groups'
+$contosoGroup = @($credGroups | Where-Object { $_.Key -eq 'contoso.com' })[0]
+Assert-Equal -Actual $contosoGroup.Kind -Expected 'Domain' -Message 'domain group has Domain kind'
+Assert-Equal -Actual (@($contosoGroup.Members) -join ',') -Expected 'vm2.contoso.com,vm1.contoso.com' -Message 'domain group keeps members in input order'
+$localGroup = @($credGroups | Where-Object { $_.Key -eq 'oldbox' })[0]
+Assert-Equal -Actual $localGroup.Kind -Expected 'Local' -Message 'no-dot entry is a Local group'
+Assert-Equal -Actual (@($localGroup.Members) -join ',') -Expected 'oldbox' -Message 'local group holds the one machine'
+$mixedCaseGroups = @(Get-GuestCredentialGroups -TargetNames @('A.Contoso.COM', 'b.contoso.com'))
+Assert-Equal -Actual $mixedCaseGroups.Count -Expected 1 -Message 'domain grouping is case-insensitive'
+
 if ($failures.Count -gt 0) {
     Write-Host 'Runtime checks failed:'
     foreach ($failure in $failures) {
