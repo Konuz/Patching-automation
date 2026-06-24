@@ -126,10 +126,6 @@ if (-not $VIServerCredential) {
     $VIServerCredential = Get-Credential -Message ('Credentials for vCenter {0}' -f $VIServer)
 }
 
-if (-not $GuestCredential) {
-    $GuestCredential = Get-Credential -Message 'Local administrator credentials for guest VM targets'
-}
-
 $orchestratorParams = @{
     VIServer = $VIServer
     VMNames = $resolvedVMNames
