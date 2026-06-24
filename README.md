@@ -87,6 +87,8 @@ Plik możesz trzymać **gdziekolwiek** — liczy się ścieżka podana w `-VMLis
 do katalogu, z którego uruchamiasz skrypt, albo bezwzględna). Zapis `.\vms.txt` w przykładach
 oznacza plik w **bieżącym katalogu** — zwykle katalog repo, obok `Start-PatchingGuestOps.ps1`.
 
+Wpisy listy to **FQDN-y** (np. `vm1.contoso.com`). Sufiks po pierwszej kropce wyznacza domenę — skrypt pyta o poświadczenia gościa **raz na domenę** (grupując maszyny po sufiksie). Wpis bez kropki (np. `oldbox`) to maszyna **lokalna** — pytana osobno, jedna na maszynę. Nazwę w vCenter skrypt rozwiązuje najpierw po krótkiej nazwie (część przed pierwszą kropką), a gdy nie znajdzie — po pełnym FQDN. Parametr `-GuestCredential` wymusza jedno poświadczenie dla **wszystkich** VM (tryb nieinteraktywny / pojedyncza domena).
+
 ---
 
 ## Workflow administratora
@@ -123,8 +125,8 @@ Krok po kroku:
 2. **Odpowiedz na pytania o brakujące dane.** Skrypt pyta po kolei: najpierw o adres
    **vCenter**, potem — **tylko jeśli nie podałeś żadnej maszyny** przez `-VMName`, `-VMNames`
    ani `-VMListPath` — **o nazwy VM** (możesz wpisać wiele naraz, oddzielone `;`),
-   a na końcu o poświadczenia do vCenter i lokalnego admina gości. Cokolwiek przekażesz
-   parametrem, o to skrypt nie pyta.
+   a na końcu o poświadczenia do vCenter oraz gości — **jedno okno na domenę** (wg sufiksu FQDN)
+   i **jedno na każdą maszynę lokalną**. Cokolwiek przekażesz parametrem, o to skrypt nie pyta.
 3. **Discovery** — agent skanuje WUA na każdej maszynie i zwraca listę dostępnych aktualizacji
    oraz flagi ról (np. Failover Cluster, Domain Controller, SQL, Exchange, IIS).
 4. **Wybór grup** — aktualizacje są pogrupowane i identyfikowane technicznie przez
