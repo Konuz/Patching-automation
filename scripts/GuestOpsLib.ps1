@@ -30,16 +30,18 @@ function Get-VMLookupCandidates {
 function Get-ExactVM {
     param([string]$Name)
 
-    $exactMatches = @(Get-VM -Name $Name -ErrorAction Stop | Where-Object { $_.Name -eq $Name })
-    if ($exactMatches.Count -eq 0) {
-        throw ('VM not found: {0}' -f $Name)
+    foreach ($candidate in @(Get-VMLookupCandidates -Name $Name)) {
+        $exactMatches = @(Get-VM -Name $candidate -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $candidate })
+        if ($exactMatches.Count -gt 1) {
+            throw ('More than one VM matched exact name: {0}' -f $candidate)
+        }
+
+        if ($exactMatches.Count -eq 1) {
+            return $exactMatches[0]
+        }
     }
 
-    if ($exactMatches.Count -gt 1) {
-        throw ('More than one VM matched exact name: {0}' -f $Name)
-    }
-
-    return $exactMatches[0]
+    throw ('VM not found: {0}' -f $Name)
 }
 
 function Assert-VMReadyForGuestOps {
