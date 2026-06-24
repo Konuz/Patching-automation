@@ -232,6 +232,11 @@ Assert-Equal -Actual ($fallbackTargets -join ',') -Expected 'VM01,VM02' -Message
 Assert-Equal -Actual $script:fallbackPrompts.Count -Expected 2 -Message 'blank fallback input re-prompts until a name is provided'
 Assert-Equal -Actual $script:fallbackPrompts[0] -Expected 'VM name(s), separated by ";"' -Message 'fallback prompt asks for semicolon separated names'
 
+# --- VM lookup candidates (scripts/GuestOpsLib.ps1) ---
+Assert-Equal -Actual ((Get-VMLookupCandidates -Name 'vm1.contoso.com') -join '|') -Expected 'vm1|vm1.contoso.com' -Message 'FQDN yields short name then full fallback'
+Assert-Equal -Actual ((Get-VMLookupCandidates -Name 'oldbox') -join '|') -Expected 'oldbox' -Message 'bare hostname yields a single candidate'
+Assert-Equal -Actual ((Get-VMLookupCandidates -Name 'host.sub.contoso.com') -join '|') -Expected 'host|host.sub.contoso.com' -Message 'multi-level FQDN splits at the first dot only'
+
 if ($failures.Count -gt 0) {
     Write-Host 'Runtime checks failed:'
     foreach ($failure in $failures) {

@@ -16,6 +16,17 @@ function New-GuestAuthentication {
     return $auth
 }
 
+function Get-VMLookupCandidates {
+    param([string]$Name)
+
+    $shortName = ($Name -split '\.', 2)[0]
+    if ($Name -eq $shortName) {
+        return @($Name)
+    }
+
+    return @($shortName, $Name)
+}
+
 function Get-ExactVM {
     param([string]$Name)
 
