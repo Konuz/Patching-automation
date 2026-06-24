@@ -40,13 +40,13 @@ Na maszynie sterującej (stepping stone):
 Po stronie maszyn docelowych (gości):
 
 - Działające **VMware Tools**.
-- Poświadczenia **lokalnego administratora** gościa.
+- Konto z prawami **lokalnego administratora** gościa — **lokalne lub domenowe**.
 - WinRM **nie jest** wymagany.
 
 Potrzebne poświadczenia (skrypt o nie zapyta, jeśli ich nie podasz):
 
 - do **vCenter**,
-- **lokalnego administratora** maszyn docelowych.
+- konta z prawami **lokalnego administratora** maszyn docelowych (lokalnego lub domenowego) — przy maszynach domenowych skrypt pyta raz na domenę, a dla lokalnych osobno.
 
 ---
 
