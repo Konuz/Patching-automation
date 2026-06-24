@@ -878,6 +878,39 @@ function Invoke-ApplyAndOptionalReboot {
     return 1
 }
 
+function Resolve-GuestCredentialMap {
+    param(
+        [string[]]$TargetNames,
+        [pscredential]$OverrideCredential
+    )
+
+    $map = @{}
+
+    if ($OverrideCredential) {
+        foreach ($name in @($TargetNames)) {
+            $map[$name] = $OverrideCredential
+        }
+
+        return $map
+    }
+
+    foreach ($group in @(Get-GuestCredentialGroups -TargetNames $TargetNames)) {
+        if ($group.Kind -eq 'Domain') {
+            $message = ('Domain administrator credentials for {0} ({1})' -f $group.Domain, (@($group.Members) -join ', '))
+        }
+        else {
+            $message = ('Local administrator credentials for {0}' -f $group.Key)
+        }
+
+        $credential = Get-Credential -Message $message
+        foreach ($member in @($group.Members)) {
+            $map[$member] = $credential
+        }
+    }
+
+    return $map
+}
+
 function Invoke-DiscoveryPhase {
     param(
         [string[]]$TargetVMNames,
