@@ -249,6 +249,21 @@ Assert-Equal -Actual (@($localGroup.Members) -join ',') -Expected 'oldbox' -Mess
 $mixedCaseGroups = @(Get-GuestCredentialGroups -TargetNames @('A.Contoso.COM', 'b.contoso.com'))
 Assert-Equal -Actual $mixedCaseGroups.Count -Expected 1 -Message 'domain grouping is case-insensitive'
 
+# --- Live progress line formatting (scripts/GuestOpsLib.ps1) ---
+$fullProgress = [pscustomobject]@{ phase = 'Installing'; totalUpdates = 4; currentUpdateNumber = 1; currentUpdatePercent = 30; overallPercent = 58; updatedAt = '2026-06-27T10:00:00' }
+Assert-Equal -Actual (Format-ProgressLine -Progress $fullProgress) -Expected 'Installing update 1/4 - 58%' -Message 'full progress renders phase, counter, and overall percent'
+
+$noPercentProgress = [pscustomobject]@{ phase = 'Downloading'; totalUpdates = 3; currentUpdateNumber = 2; currentUpdatePercent = $null; overallPercent = $null; updatedAt = '2026-06-27T10:00:00' }
+Assert-Equal -Actual (Format-ProgressLine -Progress $noPercentProgress) -Expected 'Downloading update 2/3' -Message 'missing overall percent drops the percent suffix but keeps the counter'
+
+$noCounterProgress = [pscustomobject]@{ phase = 'Installing'; totalUpdates = 0; currentUpdateNumber = 0; currentUpdatePercent = $null; overallPercent = 10; updatedAt = '2026-06-27T10:00:00' }
+Assert-Equal -Actual (Format-ProgressLine -Progress $noCounterProgress) -Expected 'Installing - 10%' -Message 'missing counter drops the update fraction but keeps the percent'
+
+Assert-Equal -Actual (Format-ProgressLine -Progress $null) -Expected $null -Message 'null progress yields no line'
+
+$emptyPhaseProgress = [pscustomobject]@{ phase = ''; totalUpdates = 2; currentUpdateNumber = 1; currentUpdatePercent = $null; overallPercent = 5; updatedAt = '2026-06-27T10:00:00' }
+Assert-Equal -Actual (Format-ProgressLine -Progress $emptyPhaseProgress) -Expected $null -Message 'blank phase yields no line so the operator is not shown a bare percent'
+
 if ($failures.Count -gt 0) {
     Write-Host 'Runtime checks failed:'
     foreach ($failure in $failures) {

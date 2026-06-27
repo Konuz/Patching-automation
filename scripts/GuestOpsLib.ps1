@@ -6,6 +6,34 @@ function Write-Step {
     Write-Host ('[{0}] {1}' -f (Get-Date).ToString('HH:mm:ss'), $Message)
 }
 
+function Format-ProgressLine {
+    param($Progress)
+
+    # UX decision point: turns the agent's status.json `progress` object into the one
+    # line the operator sees, e.g. "Installing update 1/4 - 58%". Returns $null when
+    # there is nothing meaningful to show (so the caller skips printing).
+    $phase = [string](Get-ObjectPropertyValue -InputObject $Progress -Path @('phase'))
+    if ([string]::IsNullOrWhiteSpace($phase)) {
+        return $null
+    }
+
+    $total = [int](Get-ObjectPropertyValue -InputObject $Progress -Path @('totalUpdates') -DefaultValue 0)
+    $number = [int](Get-ObjectPropertyValue -InputObject $Progress -Path @('currentUpdateNumber') -DefaultValue 0)
+    $overall = Get-ObjectPropertyValue -InputObject $Progress -Path @('overallPercent')
+
+    $counter = ''
+    if ($total -gt 0 -and $number -gt 0) {
+        $counter = ' update {0}/{1}' -f $number, $total
+    }
+
+    $percent = ''
+    if ($null -ne $overall) {
+        $percent = ' - {0}%' -f [int]$overall
+    }
+
+    return ('{0}{1}{2}' -f $phase, $counter, $percent)
+}
+
 function New-GuestAuthentication {
     param([pscredential]$Credential)
 
@@ -141,10 +169,17 @@ function Wait-GuestProcess {
         $GuestAuth,
         [long]$ProcessId,
         [int]$TimeoutSeconds,
-        [int]$PollSeconds
+        [int]$PollSeconds,
+        $FileManager,
+        [string]$HostName,
+        [string]$CurlPath,
+        [string]$GuestStatusPath,
+        [string]$LocalStatusPath,
+        [switch]$ReportProgress
     )
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $lastProgressLine = $null
 
     while ((Get-Date) -lt $deadline) {
         $processes = @($ProcessManager.ListProcessesInGuest($VMView.MoRef, $GuestAuth, @($ProcessId)))
@@ -156,6 +191,22 @@ function Wait-GuestProcess {
                     ExitCode = $process.ExitCode
                     EndTime = $process.EndTime
                 }
+            }
+        }
+
+        if ($ReportProgress) {
+            # Best-effort: the agent writes status.json non-atomically, so a partial
+            # read or a not-yet-created file is expected early on — swallow and retry.
+            try {
+                Receive-GuestFile -FileManager $FileManager -VMView $VMView -GuestAuth $GuestAuth -HostName $HostName -CurlPath $CurlPath -GuestPath $GuestStatusPath -LocalPath $LocalStatusPath
+                $statusSnapshot = Get-Content -LiteralPath $LocalStatusPath -Raw | ConvertFrom-Json
+                $progressLine = Format-ProgressLine -Progress (Get-ObjectPropertyValue -InputObject $statusSnapshot -Path @('progress'))
+                if (-not [string]::IsNullOrWhiteSpace($progressLine) -and $progressLine -ne $lastProgressLine) {
+                    Write-Step -Message $progressLine
+                    $lastProgressLine = $progressLine
+                }
+            }
+            catch {
             }
         }
 
@@ -387,7 +438,7 @@ function Invoke-GuestAgentRun {
     $agentProcessId = Start-GuestAgent -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -SearchOnly:$SearchOnly
     Write-Step -Message ('Guest agent PID: {0}' -f $agentProcessId)
 
-    $agentResult = Wait-GuestProcess -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -ProcessId $agentProcessId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
+    $agentResult = Wait-GuestProcess -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -ProcessId $agentProcessId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -FileManager $FileManager -HostName $HostName -CurlPath $CurlPath -GuestStatusPath $GuestStatusPath -LocalStatusPath $LocalStatusPath -ReportProgress:(-not $SearchOnly)
     Write-Step -Message ('Guest agent process completed={0}, exitCode={1}.' -f $agentResult.Completed, $agentResult.ExitCode)
 
     $artifactErrors = @()

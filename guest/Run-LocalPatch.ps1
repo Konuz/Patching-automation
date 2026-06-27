@@ -5,7 +5,8 @@ param(
     [string[]]$SelectedUpdateKeys = @(),
     [string]$SelectionPath,
     [switch]$SearchOnly,
-    [string]$SearchCriteria = "IsInstalled=0 and IsHidden=0 and Type='Software'"
+    [string]$SearchCriteria = "IsInstalled=0 and IsHidden=0 and Type='Software'",
+    [int]$ProgressPollSeconds = 2
 )
 
 Set-StrictMode -Version 2.0
@@ -387,6 +388,117 @@ function Save-Status {
     Set-Content -LiteralPath $StatusPath -Value $json -Encoding UTF8
 }
 
+function Set-AgentProgress {
+    param(
+        $Status,
+        [string]$Phase,
+        [int]$TotalUpdates,
+        $WuaProgress
+    )
+
+    # WUA progress counters can be absent or throw under StrictMode, so every read goes
+    # through the optional-property helper and falls back to 0/null on a miss.
+    $currentIndex = Get-OptionalPropertyValue -InputObject $WuaProgress -Name 'CurrentUpdateIndex'
+    $currentUpdatePercent = Get-OptionalPropertyValue -InputObject $WuaProgress -Name 'CurrentUpdatePercentComplete'
+    $overallPercent = Get-OptionalPropertyValue -InputObject $WuaProgress -Name 'PercentComplete'
+
+    $currentNumber = 0
+    if ($null -ne $currentIndex) {
+        $currentNumber = [int]$currentIndex + 1
+    }
+
+    $Status.progress = [ordered]@{
+        phase = $Phase
+        totalUpdates = $TotalUpdates
+        currentUpdateNumber = $currentNumber
+        currentUpdatePercent = if ($null -ne $currentUpdatePercent) { [int]$currentUpdatePercent } else { $null }
+        overallPercent = if ($null -ne $overallPercent) { [int]$overallPercent } else { $null }
+        updatedAt = (Get-Date).ToString('o')
+    }
+
+    Save-Status -Status $Status
+}
+
+function Invoke-WuaDownloadWithProgress {
+    param(
+        $Status,
+        $Downloader,
+        [int]$TotalUpdates,
+        [int]$PollSeconds
+    )
+
+    # BeginDownload exposes a pollable IDownloadJob, so progress works without a COM
+    # callback (which Windows PowerShell 5.1 cannot implement). If the async start
+    # itself fails, fall back to the synchronous path so the patch run still proceeds.
+    $downloadJob = $null
+    try {
+        $downloadJob = $Downloader.BeginDownload($null, $null, $null)
+    }
+    catch {
+        Write-AgentLog -Message ('Async download unavailable; using synchronous Download(): {0}' -f $_.Exception.Message)
+        return $Downloader.Download()
+    }
+
+    try {
+        while (-not $downloadJob.IsCompleted) {
+            try {
+                $downloadProgress = $downloadJob.GetProgress()
+                Set-AgentProgress -Status $Status -Phase 'Downloading' -TotalUpdates $TotalUpdates -WuaProgress $downloadProgress
+            }
+            catch {
+                # A single missed progress read must not abort the download.
+            }
+
+            Start-Sleep -Seconds $PollSeconds
+        }
+
+        return $Downloader.EndDownload($downloadJob)
+    }
+    finally {
+        try { $downloadJob.CleanUp() } catch { }
+    }
+}
+
+function Invoke-WuaInstallWithProgress {
+    param(
+        $Status,
+        $Installer,
+        [int]$TotalUpdates,
+        [int]$PollSeconds
+    )
+
+    # Same pattern as download. Critically, the synchronous fallback only runs when
+    # BeginInstall itself throws (nothing has started yet), never after EndInstall —
+    # so we can never double-install a patch.
+    $installJob = $null
+    try {
+        $installJob = $Installer.BeginInstall($null, $null, $null)
+    }
+    catch {
+        Write-AgentLog -Message ('Async install unavailable; using synchronous Install(): {0}' -f $_.Exception.Message)
+        return $Installer.Install()
+    }
+
+    try {
+        while (-not $installJob.IsCompleted) {
+            try {
+                $installProgress = $installJob.GetProgress()
+                Set-AgentProgress -Status $Status -Phase 'Installing' -TotalUpdates $TotalUpdates -WuaProgress $installProgress
+            }
+            catch {
+                # A single missed progress read must not abort the install.
+            }
+
+            Start-Sleep -Seconds $PollSeconds
+        }
+
+        return $Installer.EndInstall($installJob)
+    }
+    finally {
+        try { $installJob.CleanUp() } catch { }
+    }
+}
+
 $status = [ordered]@{
     schemaVersion = 'phase0b-1'
     computerName = $env:COMPUTERNAME
@@ -410,6 +522,7 @@ $status = [ordered]@{
     searchResult = $null
     downloadResult = $null
     installResult = $null
+    progress = $null
     pendingReboot = $null
     pendingRebootBefore = $null
     pendingRebootAfter = $null
@@ -560,7 +673,7 @@ try {
             $downloader = $updateSession.CreateUpdateDownloader()
             $downloader.ClientApplicationID = 'PatchingGuestOpsPhase0b'
             $downloader.Updates = $selectedUpdates
-            $downloadResult = $downloader.Download()
+            $downloadResult = Invoke-WuaDownloadWithProgress -Status $status -Downloader $downloader -TotalUpdates $selectedUpdates.Count -PollSeconds $ProgressPollSeconds
             $status.downloadResult = New-OperationResult -Result $downloadResult
 
             for ($selectedIndex = 0; $selectedIndex -lt $selectedUpdates.Count; $selectedIndex++) {
@@ -590,7 +703,7 @@ try {
                 $installer.ClientApplicationID = 'PatchingGuestOpsPhase0b'
                 $installer.AllowSourcePrompts = $false
                 $installer.Updates = $selectedUpdates
-                $installResult = $installer.Install()
+                $installResult = Invoke-WuaInstallWithProgress -Status $status -Installer $installer -TotalUpdates $selectedUpdates.Count -PollSeconds $ProgressPollSeconds
                 $status.installResult = New-OperationResult -Result $installResult
 
                 for ($selectedIndex = 0; $selectedIndex -lt $selectedUpdates.Count; $selectedIndex++) {
