@@ -57,20 +57,113 @@ function Assert-VMReadyForGuestOps {
     }
 }
 
+function Get-ViewFromVMClient {
+    param(
+        $VMView,
+        $ManagedObjectReference
+    )
+
+    $viewClient = Get-ObjectPropertyValue -InputObject $VMView -Path @('Client')
+    if ($null -ne $viewClient -and $null -ne $ManagedObjectReference) {
+        return $viewClient.GetView($ManagedObjectReference, $null)
+    }
+
+    return Get-View $ManagedObjectReference
+}
+
 function Get-GuestOpsManagers {
-    $serviceInstance = Get-View ServiceInstance
-    $guestOpsManager = Get-View $serviceInstance.Content.GuestOperationsManager
+    param($VMView)
+
+    $viewClient = Get-ObjectPropertyValue -InputObject $VMView -Path @('Client')
+    $serviceContent = Get-ObjectPropertyValue -InputObject $viewClient -Path @('ServiceContent')
+    $guestOperationsManager = Get-ObjectPropertyValue -InputObject $serviceContent -Path @('GuestOperationsManager')
+    if ($null -ne $guestOperationsManager) {
+        $guestOpsManager = Get-ViewFromVMClient -VMView $VMView -ManagedObjectReference $guestOperationsManager
+    }
+    else {
+        $serviceInstance = Get-View ServiceInstance
+        $guestOpsManager = Get-View $serviceInstance.Content.GuestOperationsManager
+    }
 
     return [pscustomobject]@{
-        ProcessManager = Get-View $guestOpsManager.ProcessManager
-        FileManager = Get-View $guestOpsManager.FileManager
+        ProcessManager = Get-ViewFromVMClient -VMView $VMView -ManagedObjectReference $guestOpsManager.ProcessManager
+        FileManager = Get-ViewFromVMClient -VMView $VMView -ManagedObjectReference $guestOpsManager.FileManager
     }
+}
+
+function Connect-VIServersWithCredentialMap {
+    param(
+        [string[]]$VIServers,
+        [hashtable]$CredentialMap,
+        [scriptblock]$ConnectScript,
+        [scriptblock]$CredentialPromptScript,
+        [switch]$RetryOnFailure
+    )
+
+    if ($null -eq $CredentialMap) {
+        $CredentialMap = @{}
+    }
+
+    if ($null -eq $ConnectScript) {
+        $ConnectScript = {
+            param([string]$Server, [pscredential]$Credential)
+            Connect-VIServer -Server $Server -Credential $Credential -ErrorAction Stop
+        }
+    }
+
+    if ($null -eq $CredentialPromptScript) {
+        $CredentialPromptScript = {
+            param([string]$Message)
+            Get-Credential -Message $Message
+        }
+    }
+
+    $connections = @()
+    foreach ($server in @($VIServers)) {
+        $serverName = ([string]$server).Trim()
+        if ([string]::IsNullOrWhiteSpace($serverName)) {
+            continue
+        }
+
+        while ($true) {
+            $credential = $null
+            if ($CredentialMap.ContainsKey($serverName)) {
+                $credential = $CredentialMap[$serverName]
+            }
+
+            if ($null -eq $credential) {
+                throw ('No vCenter credential is available for {0}.' -f $serverName)
+            }
+
+            try {
+                $connections += @(& $ConnectScript $serverName $credential)
+                break
+            }
+            catch {
+                if (-not $RetryOnFailure) {
+                    foreach ($connection in @($connections)) {
+                        try {
+                            Disconnect-VIServer -Server $connection -Confirm:$false | Out-Null
+                        }
+                        catch { }
+                    }
+
+                    throw
+                }
+
+                Write-Warning ('vCenter login failed for {0}: {1}' -f $serverName, $_.Exception.Message)
+                $CredentialMap[$serverName] = & $CredentialPromptScript ('Credentials for vCenter {0} (previous login failed)' -f $serverName)
+            }
+        }
+    }
+
+    return @($connections)
 }
 
 function Get-VMHostNameForTransfer {
     param($VMView)
 
-    $hostView = Get-View $VMView.Runtime.Host
+    $hostView = Get-ViewFromVMClient -VMView $VMView -ManagedObjectReference $VMView.Runtime.Host
     if (-not $hostView.Name) {
         throw 'Unable to resolve ESXi host name for guest file transfer URL.'
     }
@@ -440,7 +533,10 @@ function Invoke-VMAgentCycle {
     $vm = Get-ExactVM -Name $VMName
     Assert-VMReadyForGuestOps -VM $vm
 
-    $vmView = Get-View $vm.Id
+    $vmView = $vm.ExtensionData
+    if ($null -eq $Managers) {
+        $Managers = Get-GuestOpsManagers -VMView $vmView
+    }
     $hostName = Get-VMHostNameForTransfer -VMView $vmView
 
     New-Item -ItemType Directory -Force -Path $VMOutputDirectory | Out-Null
@@ -501,7 +597,10 @@ function Invoke-VMGuestReboot {
     $vm = Get-ExactVM -Name $VMName
     Assert-VMReadyForGuestOps -VM $vm
 
-    $vmView = Get-View $vm.Id
+    $vmView = $vm.ExtensionData
+    if ($null -eq $Managers) {
+        $Managers = Get-GuestOpsManagers -VMView $vmView
+    }
     Write-Step -Message ('Initiating guest reboot for VM {0}.' -f $VMName)
     $rebootProcessId = Start-GuestReboot -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth
 

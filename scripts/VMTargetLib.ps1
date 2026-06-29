@@ -28,6 +28,14 @@ function Split-VMNameInput {
     return @(Get-UniqueTrimmedNames -Names ($InputText -split '[,;]'))
 }
 
+function Split-VIServerInput {
+    param(
+        [string]$InputText
+    )
+
+    return @(Get-UniqueTrimmedNames -Names ($InputText -split ';'))
+}
+
 function Resolve-VMTargetNamesFromSources {
     param(
         [string]$SingleVMName,
@@ -110,4 +118,47 @@ function Get-GuestCredentialGroups {
     }
 
     return @($groups)
+}
+
+function Resolve-VIServerCredentialMap {
+    param(
+        [string[]]$VIServers,
+        [pscredential]$OverrideCredential,
+        [scriptblock]$CredentialPromptScript
+    )
+
+    if ($null -eq $CredentialPromptScript) {
+        $CredentialPromptScript = {
+            param([string]$Message)
+            Get-Credential -Message $Message
+        }
+    }
+
+    $map = @{}
+    if ($OverrideCredential) {
+        foreach ($server in @($VIServers)) {
+            $serverName = ([string]$server).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($serverName)) {
+                $map[$serverName] = $OverrideCredential
+            }
+        }
+
+        return $map
+    }
+
+    foreach ($group in @(Get-GuestCredentialGroups -TargetNames $VIServers)) {
+        if ($group.Kind -eq 'Domain') {
+            $message = ('Credentials for vCenter domain {0} ({1})' -f $group.Domain, (@($group.Members) -join ', '))
+        }
+        else {
+            $message = ('Credentials for vCenter {0}' -f $group.Key)
+        }
+
+        $credential = & $CredentialPromptScript $message
+        foreach ($member in @($group.Members)) {
+            $map[$member] = $credential
+        }
+    }
+
+    return $map
 }

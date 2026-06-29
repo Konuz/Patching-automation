@@ -251,6 +251,7 @@ if ($existingScripts.ContainsKey($guestOpsLibPath)) {
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Invoke-VMGuestReboot'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'C:\Windows\System32\shutdown.exe'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'PatchingGuestOps reboot after updates'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Connect-VIServersWithCredentialMap'
 }
 
 if ($existingScripts.ContainsKey($vmTargetLibPath)) {
@@ -263,7 +264,9 @@ if ($existingScripts.ContainsKey($vmTargetLibPath)) {
     Assert-TextDoesNotMatch -RelativePath $vmTargetLibPath -Text $vmTargetLibText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $vmTargetLibPath -Text $vmTargetLibText -Needle 'Get-UniqueTrimmedNames'
     Assert-TextContains -RelativePath $vmTargetLibPath -Text $vmTargetLibText -Needle 'Split-VMNameInput'
+    Assert-TextContains -RelativePath $vmTargetLibPath -Text $vmTargetLibText -Needle 'Split-VIServerInput'
     Assert-TextContains -RelativePath $vmTargetLibPath -Text $vmTargetLibText -Needle 'Resolve-VMTargetNamesFromSources'
+    Assert-TextContains -RelativePath $vmTargetLibPath -Text $vmTargetLibText -Needle 'Resolve-VIServerCredentialMap'
 }
 
 if ($existingScripts.ContainsKey($orchestratorPath)) {
@@ -350,6 +353,9 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Invoke-ApplyAndOptionalReboot'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Get-GuestRebootJobScript'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Write-RebootActionArtifacts'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Resolve-VIServerCredentialMap'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'VIServerCredentialMap'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Connect-VIServersWithCredentialMap'
     Assert-TextMatches -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)function\s+Confirm-GuestReboot\b.*?Read-Host.*?REBOOT' -Reason 'reboot confirmation is an explicit REBOOT prompt'
     Assert-TextMatches -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)function\s+Invoke-GuestRebootPhase\b.*?Invoke-ThrottledJobs.*?-ThrottleLimit\s+\$ThrottleLimit' -Reason 'reboot phase uses the existing ThrottleLimit'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)function\s+Confirm-GuestReboot\b(?:(?!\bfunction\b).)*?SkipConfirmation' -Reason 'reboot confirmation must not honor -SkipConfirmation'
@@ -398,7 +404,6 @@ if ($existingScripts.ContainsKey($launcherPath)) {
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Invoke-ModelChecks.ps1'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Invoke-GuestOpsPatchValidation.ps1'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'VMTargetLib.ps1'
-    Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Get-Credential'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'InstallSelection'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'VMNames'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'VMListPath'

@@ -47,6 +47,15 @@ function Assert-NotContains {
     }
 }
 
+function New-TestCredential {
+    param([string]$UserName)
+
+    return New-Object System.Management.Automation.PSCredential(
+        $UserName,
+        (ConvertTo-SecureString 'password' -AsPlainText -Force)
+    )
+}
+
 $argumentText = New-GuestAgentArguments -GuestAgentPath 'C:\ProgramData\PatchingGuestOps\Run-LocalPatch.ps1' -GuestWorkingDirectory 'C:\ProgramData\PatchingGuestOps' -MaxUpdates 2 -SelectedUpdateKeys @(
     '11111111-1111-1111-1111-111111111111|205',
     '22222222-2222-2222-2222-222222222222|17'
@@ -193,6 +202,14 @@ else {
     . ([scriptblock]::Create($resolveDefinition[0].Extent.Text))
 }
 
+$resolveVIServerDefinition = @($launcherFunctions | Where-Object { $_.Name -eq 'Resolve-VIServerNames' })
+if ($resolveVIServerDefinition.Count -eq 0) {
+    Add-Failure -Message 'Launcher function not found: Resolve-VIServerNames'
+}
+else {
+    . ([scriptblock]::Create($resolveVIServerDefinition[0].Extent.Text))
+}
+
 $fromSourcesEmpty = @(Resolve-VMTargetNamesFromSources -SingleVMName '' -ManyVMNames @() -ListPath '')
 Assert-Equal -Actual $fromSourcesEmpty.Count -Expected 0 -Message 'no sources yields an empty target list (no prompt, no throw)'
 
@@ -227,6 +244,106 @@ Assert-Equal -Actual $splitBlank.Count -Expected 0 -Message 'whitespace-only fal
 
 $uniqueNames = @(Get-UniqueTrimmedNames -Names @('VM01', ' VM02 ', '', '  ', 'VM01', 'VM03'))
 Assert-Equal -Actual ($uniqueNames -join ',') -Expected 'VM01,VM02,VM03' -Message 'name normalization trims, drops blanks, and removes duplicates in order'
+
+$splitVIServers = @(Split-VIServerInput -InputText 'vc01; vc02 ; vc01')
+Assert-Equal -Actual ($splitVIServers -join ',') -Expected 'vc01,vc02' -Message 'vCenter fallback splits only on semicolon, trims whitespace, and removes duplicates'
+
+$splitVIServerComma = @(Split-VIServerInput -InputText 'vc01, vc02')
+Assert-Equal -Actual $splitVIServerComma.Count -Expected 1 -Message 'vCenter fallback does not split on comma'
+Assert-Equal -Actual $splitVIServerComma[0] -Expected 'vc01, vc02' -Message 'comma is preserved inside a vCenter token'
+
+$splitVIServerBlank = @(Split-VIServerInput -InputText '   ')
+Assert-Equal -Actual $splitVIServerBlank.Count -Expected 0 -Message 'whitespace-only vCenter fallback input yields no names'
+
+$explicitVIServers = @(Resolve-VIServerNames -InputText 'vc03;vc04;vc03')
+Assert-Equal -Actual ($explicitVIServers -join ',') -Expected 'vc03,vc04' -Message 'explicit vCenter input is split and deduplicated'
+
+$script:viserverPromptMessages = @()
+$script:viserverCredentialQueue = New-Object System.Collections.Queue
+$script:viserverCredentialQueue.Enqueue((New-TestCredential -UserName 'CONTOSO\vc-admin'))
+$script:viserverCredentialQueue.Enqueue((New-TestCredential -UserName 'FABRIKAM\vc-admin'))
+$script:viserverCredentialQueue.Enqueue((New-TestCredential -UserName '.\local-admin'))
+$viserverCredentialMap = Resolve-VIServerCredentialMap -VIServers @(
+    'vc02.contoso.com',
+    'vc01.contoso.com',
+    'vc01.fabrikam.local',
+    'legacy-vc'
+) -CredentialPromptScript {
+    param([string]$Message)
+    $script:viserverPromptMessages += $Message
+    return $script:viserverCredentialQueue.Dequeue()
+}
+
+Assert-Equal -Actual $script:viserverPromptMessages.Count -Expected 3 -Message 'vCenter credentials are prompted once per domain plus once per local vCenter'
+Assert-Contains -Text $script:viserverPromptMessages[0] -Needle 'contoso.com' -Message 'first vCenter prompt names the contoso domain'
+Assert-Contains -Text $script:viserverPromptMessages[1] -Needle 'fabrikam.local' -Message 'second vCenter prompt names the fabrikam domain'
+Assert-Contains -Text $script:viserverPromptMessages[2] -Needle 'legacy-vc' -Message 'local vCenter prompt names the vCenter'
+Assert-Equal -Actual $viserverCredentialMap['vc02.contoso.com'].UserName -Expected 'CONTOSO\vc-admin' -Message 'same-domain vCenter gets the domain credential'
+Assert-Equal -Actual $viserverCredentialMap['vc01.contoso.com'].UserName -Expected 'CONTOSO\vc-admin' -Message 'same-domain vCenter reuses one credential prompt'
+Assert-Equal -Actual $viserverCredentialMap['vc01.fabrikam.local'].UserName -Expected 'FABRIKAM\vc-admin' -Message 'different vCenter domain gets a separate credential'
+Assert-Equal -Actual $viserverCredentialMap['legacy-vc'].UserName -Expected '.\local-admin' -Message 'no-dot vCenter gets its own local credential'
+
+$overrideVIServerCredential = New-TestCredential -UserName 'SHARED\override'
+$script:overrideVIServerPromptCount = 0
+$overrideVIServerCredentialMap = Resolve-VIServerCredentialMap -VIServers @('vc01.contoso.com', 'vc01.fabrikam.local') -OverrideCredential $overrideVIServerCredential -CredentialPromptScript {
+    param([string]$Message)
+    $script:overrideVIServerPromptCount++
+    throw 'override should not prompt'
+}
+
+Assert-Equal -Actual $script:overrideVIServerPromptCount -Expected 0 -Message 'explicit vCenter credential bypasses grouped prompts'
+Assert-Equal -Actual $overrideVIServerCredentialMap['vc01.contoso.com'].UserName -Expected 'SHARED\override' -Message 'override credential applies to first vCenter'
+Assert-Equal -Actual $overrideVIServerCredentialMap['vc01.fabrikam.local'].UserName -Expected 'SHARED\override' -Message 'override credential applies to second vCenter'
+
+$retryVIServerCredentialMap = @{
+    'vc01.contoso.com' = New-TestCredential -UserName 'CONTOSO\vc-admin'
+    'vc02.contoso.com' = New-TestCredential -UserName 'CONTOSO\vc-admin'
+}
+$script:connectAttempts = @{}
+$script:retryPromptMessages = @()
+$retryConnections = @(Connect-VIServersWithCredentialMap -VIServers @('vc01.contoso.com', 'vc02.contoso.com') -CredentialMap $retryVIServerCredentialMap -RetryOnFailure -ConnectScript {
+    param($Server, $Credential)
+    if (-not $script:connectAttempts.ContainsKey($Server)) {
+        $script:connectAttempts[$Server] = 0
+    }
+    $script:connectAttempts[$Server]++
+
+    if ($Server -eq 'vc02.contoso.com' -and $Credential.UserName -eq 'CONTOSO\vc-admin') {
+        throw 'domain credential rejected'
+    }
+
+    return [pscustomobject]@{
+        Server = $Server
+        UserName = $Credential.UserName
+    }
+} -CredentialPromptScript {
+    param([string]$Message)
+    $script:retryPromptMessages += $Message
+    return New-TestCredential -UserName 'administrator@vsphere.local'
+} 3>$null)
+
+Assert-Equal -Actual $retryConnections.Count -Expected 2 -Message 'retrying vCenter connection returns both successful connections'
+Assert-Equal -Actual $script:connectAttempts['vc01.contoso.com'] -Expected 1 -Message 'successful same-domain vCenter is not retried'
+Assert-Equal -Actual $script:connectAttempts['vc02.contoso.com'] -Expected 2 -Message 'failed same-domain vCenter is retried after prompting'
+Assert-Equal -Actual $script:retryPromptMessages.Count -Expected 1 -Message 'vCenter retry prompts only for the failed vCenter'
+Assert-Contains -Text $script:retryPromptMessages[0] -Needle 'vc02.contoso.com' -Message 'vCenter retry prompt names the failed vCenter'
+Assert-Equal -Actual $retryVIServerCredentialMap['vc01.contoso.com'].UserName -Expected 'CONTOSO\vc-admin' -Message 'retry does not replace credential for successful vCenter'
+Assert-Equal -Actual $retryVIServerCredentialMap['vc02.contoso.com'].UserName -Expected 'administrator@vsphere.local' -Message 'retry stores replacement credential for failed vCenter'
+
+$script:vcenterPrompts = @()
+$vcenterResponses = New-Object System.Collections.Queue
+$vcenterResponses.Enqueue('   ')
+$vcenterResponses.Enqueue('vc01; vc02; vc01')
+function Read-Host {
+    param([Parameter(Position = 0)][string]$Prompt)
+    $script:vcenterPrompts += $Prompt
+    return $vcenterResponses.Dequeue()
+}
+
+$fallbackVIServers = @(Resolve-VIServerNames -InputText '')
+Assert-Equal -Actual ($fallbackVIServers -join ',') -Expected 'vc01,vc02' -Message 'empty vCenter input prompts for semicolon-separated vCenter names'
+Assert-Equal -Actual $script:vcenterPrompts.Count -Expected 2 -Message 'blank vCenter fallback input re-prompts until a name is provided'
+Assert-Equal -Actual $script:vcenterPrompts[0] -Expected 'vCenter(s), separated by ";"' -Message 'vCenter fallback prompt asks for semicolon separated names'
 
 # The empty-source fallback must loop until at least one name is supplied. Override
 # Read-Host (interactive, so unavoidable to mock) with scripted responses.

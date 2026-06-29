@@ -59,6 +59,9 @@ Potrzebne poświadczenia (skrypt o nie zapyta, jeśli ich nie podasz):
 # Tylko rozpoznanie (skan WUA), bez pobierania i instalacji:
 .\Start-PatchingGuestOps.ps1 -SearchOnly
 
+# VM rozproszone po kilku vCenter:
+.\Start-PatchingGuestOps.ps1 -VIServer 'vc01;vc02;vc03' -VMNames vm1,vm2,vm3
+
 # Wiele maszyn z pliku, 2 równolegle:
 .\Start-PatchingGuestOps.ps1 -VMListPath .\vms.txt -ThrottleLimit 2
 
@@ -72,6 +75,12 @@ Potrzebne poświadczenia (skrypt o nie zapyta, jeśli ich nie podasz):
 Nazwy VM można podać na kilka sposobów: `-VMName <vm>`, `-VMNames vm1,vm2`, albo `-VMListPath
 .\vms.txt`. Jeśli nie podasz żadnej, skrypt zapyta interaktywnie i przyjmie **dowolną liczbę
 nazw oddzielonych średnikiem `;`**.
+
+`-VIServer` też może zawierać kilka vCenter oddzielonych średnikiem `;` (np.
+`-VIServer 'vc01;vc02'`). Bez `-VIServerCredential` skrypt pyta o poświadczenia vCenter raz
+na domenę FQDN i raz dla każdego vCenter bez kropki. Jeśli logowanie do konkretnego vCenter
+zostanie odrzucone, skrypt ponowi prompt tylko dla tego vCenter, więc można wtedy podać konto
+lokalne. Nie ma osobnego pliku dla vCenter.
 
 Format pliku `vms.txt` — jedna nazwa w linii, puste linie i linie zaczynające się od `#` są
 pomijane:
@@ -123,10 +132,12 @@ Krok po kroku:
 1. **Uruchom** `.\Start-PatchingGuestOps.ps1`. Skrypt najpierw odpala lokalne testy (chyba że
    dodasz `-SkipStaticChecks`).
 2. **Odpowiedz na pytania o brakujące dane.** Skrypt pyta po kolei: najpierw o adres
-   **vCenter**, potem — **tylko jeśli nie podałeś żadnej maszyny** przez `-VMName`, `-VMNames`
+   **vCenter** (jedno lub wiele, oddzielone `;`), potem — **tylko jeśli nie podałeś żadnej maszyny** przez `-VMName`, `-VMNames`
    ani `-VMListPath` — **o nazwy VM** (możesz wpisać wiele naraz, oddzielone `;`),
-   a na końcu o poświadczenia do vCenter oraz gości — **jedno okno na domenę** (wg sufiksu FQDN)
-   i **jedno na każdą maszynę lokalną**. Cokolwiek przekażesz parametrem, o to skrypt nie pyta.
+   a na końcu o poświadczenia do vCenter oraz gości — dla obu warstw **jedno okno na domenę**
+   (wg sufiksu FQDN) i **jedno na każdą nazwę lokalną**. Jeśli credentiale vCenter zostaną
+   odrzucone, skrypt ponowi prompt dla tego konkretnego vCenter. Cokolwiek przekażesz
+   parametrem, o to skrypt nie pyta.
 3. **Discovery** — agent skanuje WUA na każdej maszynie i zwraca listę dostępnych aktualizacji
    oraz flagi ról (np. Failover Cluster, Domain Controller, SQL, Exchange, IIS).
 4. **Wybór grup** — aktualizacje są pogrupowane i identyfikowane technicznie przez
@@ -153,6 +164,7 @@ Krok po kroku:
 
 | Parametr | Opis |
 |----------|------|
+| `-VIServer 'vc01;vc02'` | Jedno lub wiele vCenter, oddzielone średnikiem; poświadczenia grupowane po domenie. |
 | `-VMName <vm>` | Pojedyncza maszyna. |
 | `-VMNames vm1,vm2` | Lista maszyn. |
 | `-VMListPath .\vms.txt` | Lista maszyn z pliku (jedna na linię, `#` = komentarz). |

@@ -40,23 +40,6 @@ function Resolve-RequiredFile {
     return $path
 }
 
-function Read-RequiredValue {
-    param(
-        [string]$CurrentValue,
-        [string]$Prompt
-    )
-
-    if (-not [string]::IsNullOrWhiteSpace($CurrentValue)) {
-        return $CurrentValue
-    }
-
-    do {
-        $value = Read-Host $Prompt
-    } while ([string]::IsNullOrWhiteSpace($value))
-
-    return $value
-}
-
 function Resolve-VMTargetNames {
     param(
         [string]$SingleVMName,
@@ -73,6 +56,21 @@ function Resolve-VMTargetNames {
     }
 
     return $uniqueTargets
+}
+
+function Resolve-VIServerNames {
+    param([string]$InputText)
+
+    $uniqueServers = @(Split-VIServerInput -InputText $InputText)
+    if ($uniqueServers.Count -gt 0) {
+        return $uniqueServers
+    }
+
+    do {
+        $uniqueServers = @(Split-VIServerInput -InputText (Read-Host 'vCenter(s), separated by ";"'))
+    } while ($uniqueServers.Count -eq 0)
+
+    return $uniqueServers
 }
 
 $root = $PSScriptRoot
@@ -112,7 +110,7 @@ if (-not $SkipStaticChecks) {
     }
 }
 
-$VIServer = Read-RequiredValue -CurrentValue $VIServer -Prompt 'vCenter'
+$resolvedVIServers = @(Resolve-VIServerNames -InputText $VIServer)
 $resolvedVMNames = @(Resolve-VMTargetNames -SingleVMName $VMName -ManyVMNames $VMNames -ListPath $VMListPath)
 
 # Index selection was replaced by grouped selection (-SelectedUpdateKeys); the
@@ -122,14 +120,9 @@ if (-not [string]::IsNullOrWhiteSpace($InstallSelection)) {
     throw 'InstallSelection is not supported with grouped update selection. Use SelectedUpdateKeys instead.'
 }
 
-if (-not $VIServerCredential) {
-    $VIServerCredential = Get-Credential -Message ('Credentials for vCenter {0}' -f $VIServer)
-}
-
 $orchestratorParams = @{
-    VIServer = $VIServer
+    VIServer = ($resolvedVIServers -join ';')
     VMNames = $resolvedVMNames
-    VIServerCredential = $VIServerCredential
     GuestCredential = $GuestCredential
     AgentPath = $agentPath
     GuestWorkingDirectory = $GuestWorkingDirectory
@@ -138,6 +131,10 @@ $orchestratorParams = @{
     ThrottleLimit = $ThrottleLimit
     TimeoutMinutes = $TimeoutMinutes
     PollSeconds = $PollSeconds
+}
+
+if ($VIServerCredential) {
+    $orchestratorParams.VIServerCredential = $VIServerCredential
 }
 
 if ($PSBoundParameters.ContainsKey('SelectedUpdateKeys')) {
