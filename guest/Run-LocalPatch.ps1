@@ -6,7 +6,10 @@ param(
     [string]$SelectionPath,
     [switch]$SearchOnly,
     [string]$SearchCriteria = "IsInstalled=0 and IsHidden=0 and Type='Software'",
-    [int]$ProgressPollSeconds = 2
+    [int]$ProgressPollSeconds = 2,
+    # Dot-source guard: load the function definitions without running the patch flow,
+    # so the test harness can exercise helpers like Save-Status in isolation.
+    [switch]$DefineFunctionsOnly
 )
 
 Set-StrictMode -Version 2.0
@@ -521,6 +524,8 @@ function Invoke-WuaInstallWithProgress {
         try { $installJob.CleanUp() } catch { }
     }
 }
+
+if ($DefineFunctionsOnly) { return }
 
 $status = [ordered]@{
     schemaVersion = 'phase0b-1'

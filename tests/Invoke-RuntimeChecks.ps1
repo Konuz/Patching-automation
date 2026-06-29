@@ -277,6 +277,54 @@ Assert-Equal -Actual (Format-ProgressLine -Progress $null) -Expected $null -Mess
 $emptyPhaseProgress = [pscustomobject]@{ phase = ''; totalUpdates = 2; currentUpdateNumber = 1; currentUpdatePercent = $null; overallPercent = 5; updatedAt = '2026-06-27T10:00:00' }
 Assert-Equal -Actual (Format-ProgressLine -Progress $emptyPhaseProgress) -Expected $null -Message 'blank phase yields no line so the operator is not shown a bare percent'
 
+# --- Agent status.json write resilience (guest/Run-LocalPatch.ps1 Save-Status) ---
+# The orchestrator reads status.json mid-run over GuestOps, so a transient sharing
+# violation must not abort the agent. Save-Status writes atomically and retries through
+# the lock. Dot-source the agent with -DefineFunctionsOnly inside a child scope so its
+# helpers can be exercised without running the patch flow or leaking into the harness.
+& {
+    $agentPath = Join-Path $repoRoot 'guest\Run-LocalPatch.ps1'
+    $agentTemp = Join-Path $env:TEMP ('agent-savestatus-{0}' -f ([guid]::NewGuid().ToString('N')))
+    . $agentPath -DefineFunctionsOnly -WorkingDirectory $agentTemp
+
+    $sampleStatus = [ordered]@{ outcome = 'InstallSucceeded'; updates = @(1, 2, 3) }
+    Set-Content -LiteralPath $StatusPath -Value 'OLD' -Encoding UTF8
+
+    # Background holder: take an exclusive handle (FileShare::None), signal readiness via a
+    # marker, hold 800ms, then release - emulating VMware Tools serving a status.json
+    # transfer mid-run. Save-Status (retry budget ~1.8s) must ride through it.
+    $readyMarker = '{0}.locked' -f $StatusPath
+    $lockJob = Start-Job -ScriptBlock {
+        param($target, $marker)
+        $handle = [System.IO.File]::Open($target, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+        New-Item -ItemType File -Path $marker -Force | Out-Null
+        Start-Sleep -Milliseconds 800
+        $handle.Dispose()
+    } -ArgumentList $StatusPath, $readyMarker
+
+    # Deterministic handshake: only write once the lock is actually held, so the retry path
+    # is genuinely exercised regardless of job spin-up time.
+    $waited = 0
+    while (-not (Test-Path -LiteralPath $readyMarker) -and $waited -lt 5000) {
+        Start-Sleep -Milliseconds 50
+        $waited += 50
+    }
+
+    $saveThrew = $false
+    try { Save-Status -Status $sampleStatus } catch { $saveThrew = $true }
+    Receive-Job $lockJob -Wait | Out-Null
+    Remove-Job $lockJob
+
+    Assert-Equal -Actual $saveThrew -Expected $false -Message 'Save-Status survives a transient status.json sharing violation'
+    if (-not $saveThrew) {
+        $written = Get-Content -LiteralPath $StatusPath -Raw | ConvertFrom-Json
+        Assert-Equal -Actual (@($written.updates).Count) -Expected 3 -Message 'Save-Status writes complete content after a transient lock'
+    }
+    Assert-Equal -Actual (Test-Path -LiteralPath ('{0}.tmp' -f $StatusPath)) -Expected $false -Message 'Save-Status leaves no stray .tmp after success'
+
+    Remove-Item -Recurse -Force -LiteralPath $agentTemp -ErrorAction SilentlyContinue
+}
+
 if ($failures.Count -gt 0) {
     Write-Host 'Runtime checks failed:'
     foreach ($failure in $failures) {
