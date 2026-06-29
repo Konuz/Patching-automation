@@ -98,7 +98,6 @@ function Invoke-Curl {
         [string]$Description
     )
 
-    Write-Step -Message $Description
     # curl reports failures on stderr; under $ErrorActionPreference='Stop' a native
     # stderr write captured via 2>&1 is promoted to a terminating error before we can
     # inspect $LASTEXITCODE, which would bypass the descriptive throw below. Relax it
@@ -385,10 +384,8 @@ function Invoke-GuestAgentRun {
 
     Write-Step -Message $Description
     $agentProcessId = Start-GuestAgent -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -SearchOnly:$SearchOnly
-    Write-Step -Message ('Guest agent PID: {0}' -f $agentProcessId)
 
     $agentResult = Wait-GuestProcess -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -ProcessId $agentProcessId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
-    Write-Step -Message ('Guest agent process completed={0}, exitCode={1}.' -f $agentResult.Completed, $agentResult.ExitCode)
 
     $artifactErrors = @()
     try {
@@ -440,7 +437,6 @@ function Invoke-VMAgentCycle {
         [int]$PollSeconds
     )
 
-    Write-Step -Message ('Resolving VM {0}.' -f $VMName)
     $vm = Get-ExactVM -Name $VMName
     Assert-VMReadyForGuestOps -VM $vm
 
@@ -455,7 +451,6 @@ function Invoke-VMAgentCycle {
     $localStatusPath = Join-Path $VMOutputDirectory 'status.json'
     $localLogPath = Join-Path $VMOutputDirectory 'agent.log'
 
-    Write-Step -Message ('Creating guest working directory {0}.' -f $GuestWorkingDirectory)
     $mkdirProcessId = New-GuestDirectory -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -DirectoryPath $GuestWorkingDirectory
     $mkdirResult = Wait-GuestProcess -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -ProcessId $mkdirProcessId -TimeoutSeconds 120 -PollSeconds 5
     if (-not $mkdirResult.Completed -or ($null -ne $mkdirResult.ExitCode -and $mkdirResult.ExitCode -ne 0)) {

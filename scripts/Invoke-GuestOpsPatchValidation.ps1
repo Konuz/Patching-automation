@@ -286,13 +286,15 @@ function Read-UpdateGroupSelection {
 
     while ($true) {
         Write-Host ''
-        Write-Host 'Toggle update groups by number, press Enter to accept current selection.'
+        Write-Host 'Select update groups to install. Actions:'
+        Write-Host '  - Type a group number and press Enter to toggle it on ([x]) or off ([ ]).'
+        Write-Host '  - Press Enter on an empty line to accept the current selection and continue.'
         for ($i = 0; $i -lt $groups.Count; $i++) {
             $mark = if ($selected[$i]) { 'x' } else { ' ' }
             Write-Host ('[{0}] {1}. {2}' -f $mark, ($i + 1), $groups[$i].title)
         }
 
-        $inputText = Read-Host 'Group number to toggle'
+        $inputText = Read-Host 'Group number to toggle (Enter to accept)'
         if ([string]::IsNullOrWhiteSpace($inputText)) {
             break
         }
@@ -331,6 +333,7 @@ function Show-PatchPlan {
 
     foreach ($record in @($PatchPlanRecords)) {
         Write-Host ''
+        Write-Host '--------------------------------------------------'
         Write-Host $record.vmName
         $roleFlagText = if ($record.roleFlags -is [string]) { [string]$record.roleFlags } else { Get-RoleFlagText -RoleFlags $record.roleFlags }
         Write-Host ('Role flags: {0}' -f $roleFlagText)
@@ -378,8 +381,11 @@ function Confirm-GuestReboot {
         Write-Host ('- {0}' -f $target.vmName)
     }
     Write-Host ''
+    Write-Host 'Actions:'
+    Write-Host '  - Type REBOOT (uppercase) and press Enter to reboot the VM(s) above now.'
+    Write-Host '  - Type anything else (or just press Enter) to skip the reboot and leave them as-is.'
 
-    $answer = Read-Host 'Initiate guest reboot now? Type REBOOT to continue'
+    $answer = Read-Host 'Type REBOOT to continue'
     return (([string]$answer).Trim() -ceq 'REBOOT')
 }
 
@@ -510,7 +516,10 @@ function New-ApplyResultFromCycle {
         }
     }
 
-    if ($null -ne $cycle.AgentResult.ExitCode -and [int]$cycle.AgentResult.ExitCode -ne 0) {
+    # A partial install (WUA ResultCode 3) exits non-zero but is authoritative in
+    # status.json as 'InstallSucceededWithErrors'. Preserve that outcome so the summary
+    # can distinguish it from a total failure; only an unrecognized non-zero exit fails.
+    if ($null -ne $cycle.AgentResult.ExitCode -and [int]$cycle.AgentResult.ExitCode -ne 0 -and $outcome -ne 'InstallSucceededWithErrors') {
         $reason = 'Apply guest process exited with code {0}.' -f $cycle.AgentResult.ExitCode
         $errors += $reason
         return [pscustomobject]@{
@@ -776,6 +785,29 @@ function Invoke-GuestRebootPhase {
     return @($resultEntries | Sort-Object Sequence | ForEach-Object { $_.Result })
 }
 
+function Write-PatchingSummary {
+    param($ApplyResults)
+
+    Write-Host ''
+    Write-Host 'Patching summary'
+    Write-Host '----------------'
+    foreach ($result in @($ApplyResults)) {
+        $status = Get-ApplySummaryStatus -ApplyResult $result
+        switch ($status) {
+            'Installed' { $label = 'Installed'; $color = 'Green' }
+            'InstalledRebootRequired' { $label = 'Installed (reboot required)'; $color = 'Yellow' }
+            'Partial' { $label = 'Partially installed (some updates failed - see artifacts)'; $color = 'DarkYellow' }
+            'Skipped' { $label = ([string]$result.reason); $color = 'DarkGray' }
+            default {
+                $reasonText = ([string]$result.reason).Trim()
+                $label = if ([string]::IsNullOrWhiteSpace($reasonText)) { 'Failed' } else { ('Failed - {0}' -f $reasonText) }
+                $color = 'Red'
+            }
+        }
+        Write-Host ('{0}: {1}' -f $result.vmName, $label) -ForegroundColor $color
+    }
+}
+
 function Write-FinalReport {
     param(
         $PatchPlanRecords,
@@ -854,6 +886,7 @@ function Invoke-ApplyAndOptionalReboot {
     )
 
     $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $PatchPlanRecords -Managers $Managers -GuestCredentialMap $GuestCredentialMap -VIServer $VIServer -VIServerCredential $VIServerCredential -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $GuestOpsLibPath -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -CycleOutputDirectory $CycleOutputDirectory -ThrottleLimit $ThrottleLimit)
+    Write-PatchingSummary -ApplyResults $applyResults
     Write-FinalReport -PatchPlanRecords $PatchPlanRecords -ApplyResults $applyResults -CycleOutputDirectory $CycleOutputDirectory
 
     $rebootActions = @()

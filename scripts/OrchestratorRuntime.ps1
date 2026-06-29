@@ -151,6 +151,33 @@ function Test-IsApplyResultError {
     return $false
 }
 
+function Get-ApplySummaryStatus {
+    param($ApplyResult)
+
+    # Maps an apply result to the single status token the console summary colours on.
+    # Partial wins over the error check (a partial install trips Test-IsApplyResultError
+    # because its outcome is not 'InstallSucceeded', but it is not a total failure).
+    # Otherwise: error wins, a non-install action is a skip, and a clean install splits
+    # on whether the guest still needs a reboot.
+    if ($ApplyResult.action -eq 'Install' -and $ApplyResult.outcome -eq 'InstallSucceededWithErrors') {
+        return 'Partial'
+    }
+
+    if (Test-IsApplyResultError -ApplyResult $ApplyResult) {
+        return 'Error'
+    }
+
+    if ($ApplyResult.action -ne 'Install') {
+        return 'Skipped'
+    }
+
+    if ([bool]$ApplyResult.rebootRequired) {
+        return 'InstalledRebootRequired'
+    }
+
+    return 'Installed'
+}
+
 function Test-ApplyResultsSuccessful {
     param($ApplyResults)
 
