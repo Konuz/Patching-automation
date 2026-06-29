@@ -112,6 +112,19 @@ Assert-Equal -Actual (Test-IsApplyResultError -ApplyResult $discoverySkip) -Expe
 $clusterSkip = [pscustomobject]@{ action = 'Skip'; outcome = 'Skipped'; reason = 'Skipped: Failover Cluster detected. Please update manually one by one.' }
 Assert-Equal -Actual (Test-IsApplyResultError -ApplyResult $clusterSkip) -Expected $false -Message 'failover cluster skip is not an apply error'
 
+$installedOk = [pscustomobject]@{ action = 'Install'; outcome = 'InstallSucceeded'; reason = ''; rebootRequired = $false }
+Assert-Equal -Actual (Get-ApplySummaryStatus -ApplyResult $installedOk) -Expected 'Installed' -Message 'apply status: successful install without reboot is installed'
+
+$installedReboot = [pscustomobject]@{ action = 'Install'; outcome = 'InstallSucceeded'; reason = ''; rebootRequired = $true }
+Assert-Equal -Actual (Get-ApplySummaryStatus -ApplyResult $installedReboot) -Expected 'InstalledRebootRequired' -Message 'apply status: successful install needing reboot is flagged'
+
+Assert-Equal -Actual (Get-ApplySummaryStatus -ApplyResult $clusterSkip) -Expected 'Skipped' -Message 'apply status: non-error skip is skipped'
+Assert-Equal -Actual (Get-ApplySummaryStatus -ApplyResult $failedApply) -Expected 'Error' -Message 'apply status: failed install is error'
+
+$partialInstall = [pscustomobject]@{ action = 'Install'; outcome = 'InstallSucceededWithErrors'; reason = ''; rebootRequired = $false }
+Assert-Equal -Actual (Get-ApplySummaryStatus -ApplyResult $partialInstall) -Expected 'Partial' -Message 'apply status: partial install is distinguished from failure'
+Assert-Equal -Actual (Get-ApplySummaryStatus -ApplyResult ([pscustomobject]@{ action = 'Install'; outcome = 'InstallSucceededWithErrors'; reason = ''; rebootRequired = $true })) -Expected 'Partial' -Message 'apply status: partial install wins over reboot-required'
+
 $throttleGuardThrew = $false
 try { Invoke-ThrottledJobs -Items @() -ThrottleLimit 0 -JobTimeoutSeconds 30 -ScriptBlock { param($i) $i } | Out-Null }
 catch { $throttleGuardThrew = $true }
