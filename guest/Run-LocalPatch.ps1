@@ -385,7 +385,30 @@ function Save-Status {
     param($Status)
 
     $json = $Status | ConvertTo-Json -Depth 12
-    Set-Content -LiteralPath $StatusPath -Value $json -Encoding UTF8
+
+    # The orchestrator polls status.json mid-run over GuestOps (VMware Tools opens this
+    # guest file for every progress download), so a plain Set-Content can lose a race and
+    # throw a sharing violation. Write to a temp file, then atomically replace status.json
+    # (readers therefore never see a half-written file), retrying the replace through a
+    # transient lock so a momentary collision never aborts the whole patch run.
+    $tempPath = '{0}.tmp' -f $StatusPath
+    Set-Content -LiteralPath $tempPath -Value $json -Encoding UTF8
+
+    $attempt = 0
+    $maxAttempts = 10
+    while ($true) {
+        try {
+            Move-Item -LiteralPath $tempPath -Destination $StatusPath -Force
+            break
+        }
+        catch [System.IO.IOException] {
+            $attempt++
+            if ($attempt -ge $maxAttempts) {
+                throw
+            }
+            Start-Sleep -Milliseconds 200
+        }
+    }
 }
 
 function Set-AgentProgress {
