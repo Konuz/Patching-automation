@@ -154,14 +154,30 @@ $rebootTargets = @(Select-RebootRequiredApplyResults -ApplyResults $mixedApplyRe
 Assert-Equal -Actual $rebootTargets.Count -Expected 1 -Message 'only rebootRequired apply results become reboot targets'
 Assert-Equal -Actual $rebootTargets[0].vmName -Expected 'VM01' -Message 'reboot target preserves VM name'
 
+$pendingBeforeDiscovery = @(
+    [pscustomobject]@{ vmName = 'VM01'; pendingRebootBefore = [pscustomobject]@{ isPending = $true } },
+    [pscustomobject]@{ vmName = 'VM02'; pendingRebootBefore = [pscustomobject]@{ isPending = $true } },
+    [pscustomobject]@{ vmName = 'VM03'; pendingRebootBefore = [pscustomobject]@{ isPending = $false } },
+    [pscustomobject]@{ vmName = 'VM04'; pendingRebootBefore = [pscustomobject]@{ isPending = $true } }
+)
+$combinedRebootTargets = @(Select-RebootRequiredApplyResults -ApplyResults $mixedApplyResults -DiscoveryRecords $pendingBeforeDiscovery)
+$secondCombinedRebootTargetName = if ($combinedRebootTargets.Count -gt 1) { $combinedRebootTargets[1].vmName } else { '<missing>' }
+$secondCombinedRebootTargetReason = if ($combinedRebootTargets.Count -gt 1) { $combinedRebootTargets[1].rebootReason } else { '<missing>' }
+Assert-Equal -Actual $combinedRebootTargets.Count -Expected 2 -Message 'pre-existing pending reboot records are added to reboot targets'
+Assert-Equal -Actual $combinedRebootTargets[0].vmName -Expected 'VM01' -Message 'apply reboot target keeps original order'
+Assert-Equal -Actual $secondCombinedRebootTargetName -Expected 'VM02' -Message 'pending-before reboot target is included after apply reboot targets'
+Assert-Equal -Actual $secondCombinedRebootTargetReason -Expected 'Pending before patching' -Message 'pending-before reboot target explains why reboot is requested'
+Assert-Equal -Actual (@($combinedRebootTargets | Where-Object { $_.vmName -eq 'VM04' }).Count) -Expected 0 -Message 'pending-before discovery outside apply results is not rebooted'
+
 $skippedRebootActions = @(New-SkippedRebootActionRecords -RebootTargets $rebootTargets)
 Assert-Equal -Actual $skippedRebootActions.Count -Expected 1 -Message 'skipped reboot action is created for every reboot target'
 Assert-Equal -Actual $skippedRebootActions[0].action -Expected 'SkippedByOperator' -Message 'operator skip action is explicit'
+Assert-Equal -Actual $skippedRebootActions[0].rebootReason -Expected 'Reported after apply' -Message 'skipped reboot action preserves reboot reason'
 Assert-Equal -Actual (Test-RebootActionsSuccessful -RebootActions $skippedRebootActions) -Expected $true -Message 'operator skip is not a reboot failure'
 
 $failedRebootActions = @(
-    (New-RebootActionRecord -VMName 'VM01' -Action 'Initiated' -ProcessId 42),
-    (New-RebootActionRecord -VMName 'VM02' -Action 'Failed' -ErrorMessage 'VMware Tools are not running')
+    (New-RebootActionRecord -VMName 'VM01' -Action 'Initiated' -ProcessId 42 -RebootReason 'Pending before patching'),
+    (New-RebootActionRecord -VMName 'VM02' -Action 'Failed' -ErrorMessage 'VMware Tools are not running' -RebootReason 'Reported after apply')
 )
 Assert-Equal -Actual (Test-RebootActionsSuccessful -RebootActions $failedRebootActions) -Expected $false -Message 'failed reboot action makes reboot phase unsuccessful'
 
@@ -177,7 +193,8 @@ try {
     $summaryText = Get-Content -LiteralPath (Join-Path $tempRoot 'summary.md') -Raw
     Assert-Contains -Text $summaryText -Needle 'Guest reboot actions' -Message 'summary includes reboot action section'
     Assert-Contains -Text $summaryText -Needle 'VMs with reboot initiation errors' -Message 'summary includes reboot error section'
-    Assert-Contains -Text $summaryText -Needle 'VM02' -Message 'summary includes failed reboot VM name'
+    Assert-Contains -Text $summaryText -Needle 'VM01 (Pending before patching)' -Message 'summary includes initiated reboot reason'
+    Assert-Contains -Text $summaryText -Needle 'VM02 (Reported after apply): VMware Tools are not running' -Message 'summary includes failed reboot VM name, reason, and error'
 }
 finally {
     Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue

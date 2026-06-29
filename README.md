@@ -150,9 +150,10 @@ Krok po kroku:
 6. **Potwierdzenie** — wpisujesz `Y`, żeby ruszyć z instalacją (chyba że użyjesz
    `-SkipConfirmation`).
 7. **Apply** — instalacja przez WUA na gościach; powstaje raport `summary.md` i `summary.csv`.
-8. **Restart** — jeśli któraś maszyna zgłosi `rebootRequired`, skrypt pokazuje listę i prosi o
-   wpisanie **`REBOOT`** (samo `-SkipConfirmation` tego promptu **nie** pomija). Restart idzie
-   przez GuestOps; skrypt go inicjuje, ale **nie czeka** na powrót systemu.
+8. **Restart** — jeśli któraś maszyna zgłosi `rebootRequired` po apply albo już w discovery miała
+   `pendingRebootBefore.isPending=true`, skrypt pokazuje listę i prosi o wpisanie **`REBOOT`**
+   (samo `-SkipConfirmation` tego promptu **nie** pomija). Restart idzie przez GuestOps; skrypt
+   go inicjuje, ale **nie czeka** na powrót systemu.
 
 > Maszyn jest wiele i chcesz je robić równolegle? Ustaw `-ThrottleLimit > 1`. To wpływa tylko
 > na to, ile VM przetwarza się jednocześnie — sam przebieg, prompty i pliki wynikowe są takie
@@ -210,7 +211,7 @@ Zawartość katalogu przebiegu:
 | `patch-plan.json` | Plan per-VM (co, gdzie, co pominięte). |
 | `apply-results.json` | Wynik instalacji per-VM. |
 | `summary.md`, `summary.csv` | Raport końcowy dla człowieka. |
-| `reboot-actions.json` | Co zrobiono z restartami (jeśli były wymagane). |
+| `reboot-actions.json` | Co zrobiono z restartami i dlaczego były wymagane. |
 | `NNN-<vm>\status.json`, `agent.log` | Surowe artefakty agenta z każdej maszyny. |
 
 `status.json` i `agent.log` to podstawowe źródło do diagnostyki, jeśli coś pójdzie nie tak na

@@ -185,10 +185,83 @@ function Test-ApplyResultsSuccessful {
     return ($errors.Count -eq 0)
 }
 
-function Select-RebootRequiredApplyResults {
-    param($ApplyResults)
+function Get-RuntimePropertyValue {
+    param(
+        $InputObject,
+        [string]$Name,
+        $DefaultValue = $null
+    )
 
-    return @($ApplyResults | Where-Object { [bool]$_.rebootRequired })
+    if ($null -eq $InputObject) {
+        return $DefaultValue
+    }
+
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        return $DefaultValue
+    }
+
+    return $property.Value
+}
+
+function Get-RebootTargetReason {
+    param(
+        [bool]$RebootRequiredAfterApply,
+        [bool]$PendingBeforeApply
+    )
+
+    if ($RebootRequiredAfterApply -and $PendingBeforeApply) {
+        return 'Pending before patching and after apply'
+    }
+
+    if ($PendingBeforeApply) {
+        return 'Pending before patching'
+    }
+
+    return 'Reported after apply'
+}
+
+function Select-RebootRequiredApplyResults {
+    param(
+        $ApplyResults,
+        $DiscoveryRecords = @()
+    )
+
+    $pendingBeforeByVmName = @{}
+    foreach ($record in @($DiscoveryRecords)) {
+        $vmName = [string](Get-RuntimePropertyValue -InputObject $record -Name 'vmName')
+        if ([string]::IsNullOrWhiteSpace($vmName)) {
+            continue
+        }
+
+        $pendingRebootBefore = Get-RuntimePropertyValue -InputObject $record -Name 'pendingRebootBefore'
+        $isPending = Get-RuntimePropertyValue -InputObject $pendingRebootBefore -Name 'isPending' -DefaultValue $false
+        if ([bool]$isPending) {
+            $pendingBeforeByVmName[$vmName] = $true
+        }
+    }
+
+    $targets = @()
+    foreach ($result in @($ApplyResults)) {
+        $vmName = [string](Get-RuntimePropertyValue -InputObject $result -Name 'vmName')
+        if ([string]::IsNullOrWhiteSpace($vmName)) {
+            continue
+        }
+
+        $rebootRequiredAfterApply = [bool](Get-RuntimePropertyValue -InputObject $result -Name 'rebootRequired' -DefaultValue $false)
+        $pendingBeforeApply = $pendingBeforeByVmName.ContainsKey($vmName)
+        if (-not $rebootRequiredAfterApply -and -not $pendingBeforeApply) {
+            continue
+        }
+
+        $targets += [pscustomobject]@{
+            vmName = $vmName
+            rebootRequired = $true
+            rebootReason = Get-RebootTargetReason -RebootRequiredAfterApply $rebootRequiredAfterApply -PendingBeforeApply $pendingBeforeApply
+        }
+    }
+
+    return @($targets)
 }
 
 function New-RebootActionRecord {
@@ -196,12 +269,14 @@ function New-RebootActionRecord {
         [string]$VMName,
         [string]$Action,
         $ProcessId = $null,
-        [string]$ErrorMessage = $null
+        [string]$ErrorMessage = $null,
+        [string]$RebootReason = $null
     )
 
     return [pscustomobject]@{
         vmName = $VMName
         rebootRequired = $true
+        rebootReason = $RebootReason
         action = $Action
         processId = $ProcessId
         errorMessage = $ErrorMessage
@@ -213,7 +288,7 @@ function New-SkippedRebootActionRecords {
 
     $records = @()
     foreach ($target in @($RebootTargets)) {
-        $records += New-RebootActionRecord -VMName ([string]$target.vmName) -Action 'SkippedByOperator'
+        $records += New-RebootActionRecord -VMName ([string]$target.vmName) -Action 'SkippedByOperator' -RebootReason ([string]$target.rebootReason)
     }
 
     return @($records)
@@ -261,11 +336,12 @@ function Write-RebootActionArtifacts {
         }
         else {
             foreach ($row in @($section.Rows)) {
+                $reasonText = if ([string]::IsNullOrWhiteSpace([string]$row.rebootReason)) { '' } else { (' ({0})' -f $row.rebootReason) }
                 if ([string]::IsNullOrWhiteSpace([string]$row.errorMessage)) {
-                    $lines += ('- {0}' -f $row.vmName)
+                    $lines += ('- {0}{1}' -f $row.vmName, $reasonText)
                 }
                 else {
-                    $lines += ('- {0}: {1}' -f $row.vmName, $row.errorMessage)
+                    $lines += ('- {0}{1}: {2}' -f $row.vmName, $reasonText, $row.errorMessage)
                 }
             }
         }
