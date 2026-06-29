@@ -297,6 +297,8 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Invoke-DiscoveryPhase'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'discovery.json'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Discovery summary'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "@('pendingRebootBefore', 'isPending')"
+    Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '\[bool\]\$record\.pendingRebootBefore\b' -Reason 'discovery summary must read pendingRebootBefore.isPending, not cast the wrapper object'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Available update groups'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Show-UpdateGroups'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Read-UpdateGroupSelection'

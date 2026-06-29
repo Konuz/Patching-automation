@@ -1059,7 +1059,8 @@ function Invoke-DiscoveryPhase {
             'UpdatesFound' { 'Yellow' }
             default { 'Red' }
         }
-        $rebootText = if ($null -eq $record.pendingRebootBefore) { '?' } elseif ([bool]$record.pendingRebootBefore) { 'yes' } else { 'no' }
+        $pendingRebootBefore = Get-ObjectPropertyValue -InputObject $record -Path @('pendingRebootBefore', 'isPending')
+        $rebootText = if ($null -eq $pendingRebootBefore) { '?' } elseif ([bool]$pendingRebootBefore) { 'yes' } else { 'no' }
         Write-Host ('{0}: outcome={1}; updates={2}; reboot={3}; roles={4}' -f $record.vmName, $record.outcome, $record.availableUpdateCount, $rebootText, (Get-RoleFlagText -RoleFlags $record.roleFlags)) -ForegroundColor $summaryColor
         Write-Host ''
     }
