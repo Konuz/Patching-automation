@@ -322,26 +322,32 @@ function Receive-GuestFile {
     )
 }
 
-function New-UpdateSelectionDocument {
-    param([string[]]$SelectedUpdateKeys = @())
+function Get-UniqueTrimmedKeys {
+    param([string[]]$Keys = @())
 
-    $keys = New-Object System.Collections.Generic.List[string]
+    $result = New-Object System.Collections.Generic.List[string]
     $seen = @{}
-    foreach ($selectedUpdateKey in @($SelectedUpdateKeys)) {
-        $key = ([string]$selectedUpdateKey).Trim()
+    foreach ($rawKey in @($Keys)) {
+        $key = ([string]$rawKey).Trim()
         if ([string]::IsNullOrWhiteSpace($key)) {
             continue
         }
 
         if (-not $seen.ContainsKey($key)) {
             $seen[$key] = $true
-            [void]$keys.Add($key)
+            [void]$result.Add($key)
         }
     }
 
+    return @($result.ToArray())
+}
+
+function New-UpdateSelectionDocument {
+    param([string[]]$SelectedUpdateKeys = @())
+
     return [pscustomobject]@{
         schemaVersion = 'selection-v1'
-        selectedUpdateKeys = @($keys.ToArray())
+        selectedUpdateKeys = @(Get-UniqueTrimmedKeys -Keys $SelectedUpdateKeys)
     }
 }
 

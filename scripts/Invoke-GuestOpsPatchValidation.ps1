@@ -247,31 +247,19 @@ function Resolve-SelectedUpdateKeys {
             }
         }
 
-        $selectedKeys = New-Object System.Collections.Generic.List[string]
-        $seenSelectedKeys = @{}
-        foreach ($explicitKey in $explicitKeyValues) {
-            $selectedKey = ([string]$explicitKey).Trim()
-            if ([string]::IsNullOrWhiteSpace($selectedKey)) {
-                continue
-            }
-
-            if (-not $seenSelectedKeys.ContainsKey($selectedKey)) {
-                $seenSelectedKeys[$selectedKey] = $true
-                [void]$selectedKeys.Add($selectedKey)
-            }
-        }
+        $selectedKeys = @(Get-UniqueTrimmedKeys -Keys $explicitKeyValues)
 
         if ($selectedKeys.Count -eq 0) {
             throw 'SelectedUpdateKeys did not contain any non-empty update keys.'
         }
 
-        foreach ($selectedKey in @($selectedKeys.ToArray())) {
+        foreach ($selectedKey in $selectedKeys) {
             if (-not $knownKeys.ContainsKey($selectedKey)) {
                 throw ('Selected update key is not present in discovered update groups: {0}' -f $selectedKey)
             }
         }
 
-        return @($selectedKeys.ToArray())
+        return $selectedKeys
     }
 
     return @(@($UpdateGroups) | Where-Object { $_.selectedByDefault } | ForEach-Object { [string]$_.identityKey })
@@ -340,12 +328,7 @@ function Show-PatchPlan {
         $roleFlagText = if ($record.roleFlags -is [string]) { [string]$record.roleFlags } else { Get-RoleFlagText -RoleFlags $record.roleFlags }
         Write-Host ('Role flags: {0}' -f $roleFlagText)
 
-        if ($record.action -eq 'Skip') {
-            Write-Host $record.reason
-            continue
-        }
-
-        if ($record.action -eq 'NoSelectedUpdates') {
+        if ($record.action -in @('Skip', 'NoSelectedUpdates')) {
             Write-Host $record.reason
             continue
         }
@@ -590,30 +573,13 @@ function Invoke-ApplyPhase {
             continue
         }
 
-        $selectedKeys = @()
-        $seenSelectedKeys = @{}
-        foreach ($selectedUpdate in @($record.selectedUpdates)) {
-            $selectedKey = ([string](Get-ObjectPropertyValue -InputObject $selectedUpdate -Path @('identityKey'))).Trim()
-            if ([string]::IsNullOrWhiteSpace($selectedKey)) {
-                continue
-            }
-
-            if (-not $seenSelectedKeys.ContainsKey($selectedKey)) {
-                $seenSelectedKeys[$selectedKey] = $true
-                $selectedKeys += $selectedKey
-            }
+        $identityKeys = foreach ($selectedUpdate in @($record.selectedUpdates)) {
+            [string](Get-ObjectPropertyValue -InputObject $selectedUpdate -Path @('identityKey'))
         }
+        $selectedKeys = @(Get-UniqueTrimmedKeys -Keys @($identityKeys))
 
         $vmOutputDirectory = Join-Path $CycleOutputDirectory ('{0:D3}-apply-{1}' -f $recordNumber, (Get-SafeFileName -Value $record.vmName))
         Write-Step -Message ('Apply starting for VM {0} with {1} selected update(s).' -f $record.vmName, $selectedKeys.Count)
-
-        if ($selectedKeys.Count -gt 0) {
-            New-Item -ItemType Directory -Force -Path $vmOutputDirectory | Out-Null
-            $selectionDocument = New-UpdateSelectionDocument -SelectedUpdateKeys $selectedKeys
-            $localSelectionPath = Join-Path $vmOutputDirectory 'selection.json'
-            $selectionDocument | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $localSelectionPath -Encoding UTF8
-            $guestSelectionPath = Join-Path $GuestWorkingDirectory 'selection.json'
-        }
 
         if ($selectedKeys.Count -eq 0) {
             $reason = 'No selected update keys were available for apply.'
@@ -631,6 +597,12 @@ function Invoke-ApplyPhase {
             }
             continue
         }
+
+        New-Item -ItemType Directory -Force -Path $vmOutputDirectory | Out-Null
+        $selectionDocument = New-UpdateSelectionDocument -SelectedUpdateKeys $selectedKeys
+        $localSelectionPath = Join-Path $vmOutputDirectory 'selection.json'
+        $selectionDocument | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $localSelectionPath -Encoding UTF8
+        $guestSelectionPath = Join-Path $GuestWorkingDirectory 'selection.json'
 
         if ($ThrottleLimit -le 1) {
             try {
