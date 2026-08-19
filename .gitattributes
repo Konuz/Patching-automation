@@ -1,0 +1,5 @@
+# Windows-only project (Windows PowerShell 5.1 on the customer stepping stone).
+# The repository stores LF; every working tree gets CRLF. Spelling eol=crlf here makes that
+# independent of each machine's core.autocrlf, which is a Git-for-Windows installer default
+# rather than a project decision. text=auto still lets Git leave detected binaries alone.
+* text=auto eol=crlf
