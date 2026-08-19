@@ -27,6 +27,7 @@ param(
 
     [string[]]$SelectedUpdateKeys,
 
+    [ValidateRange(1, 2147483647)]
     [int]$ThrottleLimit = 3,
 
     [switch]$SearchOnly,
@@ -37,6 +38,10 @@ param(
 
     [int]$TimeoutMinutes = 180,
 
+    [ValidateRange(1, 2147483647)]
+    [int]$RebootTimeoutMinutes = 30,
+
+    [ValidateRange(1, 2147483647)]
     [int]$PollSeconds = 15,
 
     [switch]$IgnoreVCenterCertificate,
@@ -176,6 +181,51 @@ function Get-GuestRebootJobScript {
                 VMName = $JobInput.VMName
                 RebootReason = $JobInput.RebootReason
                 ProcessId = $null
+                Error = $_.Exception.Message
+            }
+        }
+        finally {
+            if ($connections.Count -gt 0) {
+                try {
+                    Disconnect-VIServer -Server $connections -Confirm:$false | Out-Null
+                }
+                catch { }
+            }
+        }
+    }
+}
+
+function Get-GuestBootTimeJobScript {
+    return {
+        param($JobInput)
+
+        Set-StrictMode -Version 2.0
+        $ErrorActionPreference = 'Stop'
+
+        $connections = @()
+        try {
+            Import-Module VMware.VimAutomation.Core -ErrorAction Stop
+            if ($JobInput.IgnoreVCenterCertificate) {
+                Set-PowerCLIConfiguration -Scope Session -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
+            }
+            . $JobInput.GuestOpsLibPath
+
+            $connections = @(Connect-VIServersWithCredentialMap -VIServers @($JobInput.VIServers) -CredentialMap $JobInput.VIServerCredentialMap)
+            $guestAuth = New-GuestAuthentication -Credential $JobInput.GuestCredential
+            $bootTime = Invoke-VMGuestBootTimeRead -VMName $JobInput.VMName -Managers $null -GuestAuth $guestAuth -CurlPath $JobInput.CurlPath -GuestWorkingDirectory $JobInput.GuestWorkingDirectory -BootTimeHelperPath $JobInput.BootTimeHelperPath -TimeoutSeconds $JobInput.TimeoutSeconds -PollSeconds $JobInput.PollSeconds
+
+            return [pscustomobject]@{
+                Sequence = $JobInput.Sequence
+                VMName = $JobInput.VMName
+                BootTimeUtc = $bootTime.BootTimeUtc
+                Error = $null
+            }
+        }
+        catch {
+            return [pscustomobject]@{
+                Sequence = $JobInput.Sequence
+                VMName = $JobInput.VMName
+                BootTimeUtc = $null
                 Error = $_.Exception.Message
             }
         }
@@ -689,78 +739,139 @@ function Invoke-ApplyPhase {
     return @($results)
 }
 
+function Read-RebootDecision {
+    param($Context)
+
+    $stage = [string]$Context.Stage
+    $batchNumber = [int]$Context.BatchNumber
+    $vmNames = @($Context.VMNames | ForEach-Object { [string]$_ })
+    $vmList = $vmNames -join ', '
+
+    Write-Host ''
+    switch ($stage) {
+        'BaselineShortfall' {
+            Write-Host ('Could not read baseline boot time before reboot for batch {0} VM(s): {1}' -f $batchNumber, $vmList)
+            Write-Host 'Without a baseline the reboot cannot be confirmed to have changed the boot time.'
+            $options = @('RETRY', 'CONTINUE', 'ABORT')
+        }
+        'InitiationError' {
+            Write-Host ('Failed to initiate reboot for batch {0} VM(s): {1}' -f $batchNumber, $vmList)
+            Write-Host 'The shutdown command was not retried automatically to avoid the risk of a double reboot.'
+            $options = @('CONTINUE', 'ABORT')
+        }
+        'WaitTimeout' {
+            Write-Host ('Boot time did not confirm within {0}s for batch {1} VM(s): {2}' -f $Context.WaitSeconds, $batchNumber, $vmList)
+            $options = @('RETRY', 'CONTINUE', 'ABORT')
+        }
+        default {
+            $options = @('CONTINUE', 'ABORT')
+        }
+    }
+
+    Write-Host 'Actions:'
+    if (@($options) -contains 'RETRY') {
+        Write-Host ('  - RETRY     check again without re-sending reboot, for a new full timeout period.')
+    }
+    Write-Host ('  - CONTINUE  continue with the next reboot batch even though not every server is confirmed.')
+    Write-Host ('  - ABORT     do not start further reboot batches; the run ends with an error.')
+    Write-Host ''
+
+    while ($true) {
+        $answer = ([string](Read-Host ('Choose {0}' -f ($options -join ', ')))).Trim().ToUpperInvariant()
+        if (@($options) -contains $answer) {
+            return $answer
+        }
+        Write-Host ('Invalid choice. Options: {0}' -f ($options -join ' / '))
+    }
+}
+
 function Invoke-GuestRebootPhase {
     param(
         $RebootTargets,
-        $Managers,
         $GuestCredentialMap,
         [string[]]$VIServers,
         [hashtable]$VIServerCredentialMap,
         [switch]$IgnoreVCenterCertificate,
         [string]$GuestOpsLibPath,
+        [string]$CurlPath,
+        [string]$GuestWorkingDirectory,
+        [int]$RebootTimeoutSeconds,
+        [int]$PollSeconds,
         [int]$ThrottleLimit = 1
     )
 
-    $resultEntries = @()
-    $jobInputs = @()
-    $sequence = 0
+    $bootTimeHelperPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'guest\Read-BootTime.ps1'
 
+    $targetInputs = @()
+    $sequence = 0
     foreach ($target in @($RebootTargets)) {
         $sequence++
-        $vmName = [string]$target.vmName
-        $rebootReason = [string](Get-ObjectPropertyValue -InputObject $target -Path @('rebootReason'))
-
-        if ($ThrottleLimit -le 1) {
-            try {
-                $vmAuth = New-GuestAuthentication -Credential $GuestCredentialMap[$vmName]
-                $rebootResult = Invoke-VMGuestReboot -VMName $vmName -Managers $Managers -GuestAuth $vmAuth
-                $resultEntries += [pscustomobject]@{
-                    Sequence = $sequence
-                    Result = New-RebootActionRecord -VMName $vmName -Action 'Initiated' -ProcessId $rebootResult.ProcessId -RebootReason $rebootReason
-                }
-            }
-            catch {
-                $resultEntries += [pscustomobject]@{
-                    Sequence = $sequence
-                    Result = New-RebootActionRecord -VMName $vmName -Action 'Failed' -ErrorMessage $_.Exception.Message -RebootReason $rebootReason
-                }
-            }
+        $targetInputs += [pscustomobject]@{
+            Sequence = $sequence
+            VMName = [string]$target.vmName
+            RebootReason = [string](Get-ObjectPropertyValue -InputObject $target -Path @('rebootReason'))
         }
-        else {
+    }
+
+    $readJobScript = Get-GuestBootTimeJobScript
+    $restartJobScript = Get-GuestRebootJobScript
+
+    $readBootTimeScript = {
+        param($Items)
+        $jobInputs = @()
+        # TimeoutSeconds bounds the work *inside* the guest, but the job must import PowerCLI
+        # and connect to vCenter before that budget starts ticking. Giving the job the same
+        # number would kill it before the read even begins, so the outer timeout is the largest
+        # inner budget plus startup headroom - and it takes the max, so no item is cut short.
+        $jobStartupHeadroomSeconds = 120
+        $maxItemTimeoutSeconds = 1
+        foreach ($item in @($Items)) {
+            $timeoutSeconds = if ($null -eq $item.ReadTimeoutSeconds) { 120 } else { [int][math]::Max(1, [math]::Min(120, $item.ReadTimeoutSeconds)) }
+            $maxItemTimeoutSeconds = [int][math]::Max($maxItemTimeoutSeconds, $timeoutSeconds)
             $jobInputs += [pscustomobject]@{
-                Sequence = $sequence
-                VMName = $vmName
-                RebootReason = $rebootReason
+                Sequence = $item.Sequence
+                VMName = $item.VMName
                 VIServers = @($VIServers)
                 VIServerCredentialMap = $VIServerCredentialMap
-                GuestCredential = $GuestCredentialMap[$vmName]
+                GuestCredential = $GuestCredentialMap[$item.VMName]
+                IgnoreVCenterCertificate = [bool]$IgnoreVCenterCertificate
+                GuestOpsLibPath = $GuestOpsLibPath
+                CurlPath = $CurlPath
+                GuestWorkingDirectory = $GuestWorkingDirectory
+                BootTimeHelperPath = $bootTimeHelperPath
+                TimeoutSeconds = $timeoutSeconds
+                PollSeconds = $PollSeconds
+            }
+        }
+        $jobTimeoutSeconds = $maxItemTimeoutSeconds + $jobStartupHeadroomSeconds
+        return @(Invoke-ThrottledJobs -Items $jobInputs -ThrottleLimit $ThrottleLimit -JobTimeoutSeconds $jobTimeoutSeconds -ScriptBlock $readJobScript)
+    }
+
+    $initiateRebootScript = {
+        param($Items)
+        $jobInputs = @()
+        foreach ($item in @($Items)) {
+            $jobInputs += [pscustomobject]@{
+                Sequence = $item.Sequence
+                VMName = $item.VMName
+                RebootReason = $item.RebootReason
+                VIServers = @($VIServers)
+                VIServerCredentialMap = $VIServerCredentialMap
+                GuestCredential = $GuestCredentialMap[$item.VMName]
                 IgnoreVCenterCertificate = [bool]$IgnoreVCenterCertificate
                 GuestOpsLibPath = $GuestOpsLibPath
                 VMOutputDirectory = ''
             }
         }
+        return @(Invoke-ThrottledJobs -Items $jobInputs -ThrottleLimit $ThrottleLimit -JobTimeoutSeconds 300 -ScriptBlock $restartJobScript)
     }
 
-    if ($ThrottleLimit -gt 1 -and $jobInputs.Count -gt 0) {
-        $jobScript = Get-GuestRebootJobScript
-        $jobResults = @(Invoke-ThrottledJobs -Items $jobInputs -ThrottleLimit $ThrottleLimit -JobTimeoutSeconds 300 -ScriptBlock $jobScript)
-        foreach ($jobResult in @($jobResults | Sort-Object Sequence)) {
-            if (-not [string]::IsNullOrWhiteSpace([string]$jobResult.Error)) {
-                $resultEntries += [pscustomobject]@{
-                    Sequence = $jobResult.Sequence
-                    Result = New-RebootActionRecord -VMName $jobResult.VMName -Action 'Failed' -ErrorMessage $jobResult.Error -RebootReason ([string]$jobResult.RebootReason)
-                }
-                continue
-            }
-
-            $resultEntries += [pscustomobject]@{
-                Sequence = $jobResult.Sequence
-                Result = New-RebootActionRecord -VMName $jobResult.VMName -Action 'Initiated' -ProcessId $jobResult.ProcessId -RebootReason ([string]$jobResult.RebootReason)
-            }
-        }
+    $decisionPromptScript = {
+        param($Context)
+        return Read-RebootDecision -Context $Context
     }
 
-    return @($resultEntries | Sort-Object Sequence | ForEach-Object { $_.Result })
+    return @(Invoke-RebootBatchCoordinator -RebootTargets $targetInputs -BatchSize $ThrottleLimit -WaitTimeoutSeconds $RebootTimeoutSeconds -PollSeconds $PollSeconds -ReadBootTimeScript $readBootTimeScript -InitiateRebootScript $initiateRebootScript -DecisionPromptScript $decisionPromptScript)
 }
 
 function Write-PatchingSummary {
@@ -861,6 +972,7 @@ function Invoke-ApplyAndOptionalReboot {
         [string]$IdentityHelperPath,
         [string]$GuestWorkingDirectory,
         [int]$TimeoutSeconds,
+        [int]$RebootTimeoutSeconds,
         [int]$PollSeconds,
         [string]$CycleOutputDirectory,
         [int]$ThrottleLimit,
@@ -875,7 +987,7 @@ function Invoke-ApplyAndOptionalReboot {
     Write-FinalReport -PatchPlanRecords $PatchPlanRecords -ApplyResults $applyResults -CycleOutputDirectory $CycleOutputDirectory -RebootTargets $rebootTargets
     if ($rebootTargets.Count -gt 0) {
         if (Confirm-GuestReboot -RebootTargets $rebootTargets) {
-            $rebootActions = @(Invoke-GuestRebootPhase -RebootTargets $rebootTargets -Managers $Managers -GuestCredentialMap $GuestCredentialMap -VIServers $VIServers -VIServerCredentialMap $VIServerCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $GuestOpsLibPath -ThrottleLimit $ThrottleLimit)
+            $rebootActions = @(Invoke-GuestRebootPhase -RebootTargets $rebootTargets -GuestCredentialMap $GuestCredentialMap -VIServers $VIServers -VIServerCredentialMap $VIServerCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $GuestOpsLibPath -CurlPath $CurlPath -GuestWorkingDirectory $GuestWorkingDirectory -RebootTimeoutSeconds $RebootTimeoutSeconds -PollSeconds $PollSeconds -ThrottleLimit $ThrottleLimit)
         }
         else {
             Write-Warning 'Guest reboot was not approved. Reboot phase skipped.'
@@ -1113,7 +1225,7 @@ try {
         }
         else {
             $guestCredentialMap = Resolve-GuestCredentialMap -TargetNames @(@($patchPlanRecords) | ForEach-Object { [string]$_.vmName }) -OverrideCredential $GuestCredential
-            $scriptExitCode = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit
+            $scriptExitCode = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit
         }
 
         exit $scriptExitCode
@@ -1162,7 +1274,7 @@ try {
             $scriptExitCode = 1
         }
         else {
-            $scriptExitCode = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit -DiscoveryRecords $discoveryRecords
+            $scriptExitCode = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit -DiscoveryRecords $discoveryRecords
         }
     }
     elseif ($PlanOnly) {

@@ -152,12 +152,21 @@ Krok po kroku:
 7. **Apply** — instalacja przez WUA na gościach; powstaje raport `summary.md` i `summary.csv`.
 8. **Restart** — jeśli któraś maszyna zgłosi `rebootRequired` po apply albo już w discovery miała
    `pendingRebootBefore.isPending=true`, skrypt pokazuje listę i prosi o wpisanie **`REBOOT`**
-   (samo `-SkipConfirmation` tego promptu **nie** pomija). Restart idzie przez GuestOps; skrypt
-   go inicjuje, ale **nie czeka** na powrót systemu.
+   (samo `-SkipConfirmation` tego promptu **nie** pomija). Restart idzie przez GuestOps.
+   Cele są dzielone na stałe paczki po `-ThrottleLimit`; kolejna paczka startuje dopiero po
+   potwierdzeniu, że każda VM z poprzedniej paczki **z odczytaną wartością bazową** zgłosiła
+   `LastBootUpTime` bezwzględnie nowszy od tej wartości — chyba że operator świadomie wymusił
+   przejście przez `CONTINUE`.
 
-> Maszyn jest wiele i chcesz je robić równolegle? Ustaw `-ThrottleLimit > 1`. To wpływa tylko
-> na to, ile VM przetwarza się jednocześnie — sam przebieg, prompty i pliki wynikowe są takie
-> same niezależnie od liczby maszyn.
+   Czas oczekiwania jednej paczki określa `-RebootTimeoutMinutes` (domyślnie 30), a częstotliwość
+   odpytywania — `-PollSeconds`. Po timeoucie operator wybiera `RETRY` (bez ponownego restartu),
+   `CONTINUE` (wymuszone, niezweryfikowane przejście) albo `ABORT`. Te decyzje są wymagane także
+   przy braku wartości bazowej lub błędzie inicjacji; błąd wysłania restartu nie jest automatycznie
+   ponawiany. `CONTINUE` i `ABORT` pozostawiają ślad w raporcie i kończą przebieg kodem 1.
+
+> `-ThrottleLimit > 1` określa równoległość wewnątrz jednej paczki rebootu, ale nie pozwala
+> rozpocząć następnej paczki przed przejściem bramki boot time. Discovery i apply zachowują swoje
+> dotychczasowe użycie tego limitu.
 
 ---
 
@@ -174,6 +183,8 @@ Krok po kroku:
 | `-PlanOnly` | Zbuduj plan i zakończ (bez instalacji). |
 | `-PatchPlanPath .\out\<run>\patch-plan.json` | Wznów z zapisanego planu. |
 | `-ThrottleLimit <n>` | Ile VM przetwarzać równolegle (domyślnie 3). |
+| `-RebootTimeoutMinutes <n>` | Maksymalny czas potwierdzania każdej paczki rebootu (domyślnie 30 minut). |
+| `-PollSeconds <n>` | Odstęp między odczytami boot time podczas oczekiwania na reboot. |
 | `-SkipConfirmation` | Pomiń pytanie o plan (**nie** pomija promptu o restart). |
 | `-SkipStaticChecks` | Pomiń lokalne testy przed uruchomieniem. |
 | `-IgnoreVCenterCertificate` | Zignoruj błąd certyfikatu vCenter. |
@@ -211,7 +222,7 @@ Zawartość katalogu przebiegu:
 | `patch-plan.json` | Plan per-VM (co, gdzie, co pominięte). |
 | `apply-results.json` | Wynik instalacji per-VM. |
 | `summary.md`, `summary.csv` | Raport końcowy dla człowieka. |
-| `reboot-actions.json` | Co zrobiono z restartami i dlaczego były wymagane. |
+| `reboot-actions.json` | Wynik restartów: paczka, baseline/observed boot time, status walidacji, decyzja operatora i błędy. |
 | `NNN-<vm>\status.json`, `agent.log` | Surowe artefakty agenta z każdej maszyny. |
 
 `status.json` i `agent.log` to podstawowe źródło do diagnostyki, jeśli coś pójdzie nie tak na
@@ -264,6 +275,7 @@ scripts\
   VMTargetLib.ps1                     # Wspólne rozwiązywanie nazw VM (launcher + orchestrator)
 guest\
   Run-LocalPatch.ps1                  # Agent działający w gościu (WUA COM)
+  Read-BootTime.ps1                   # Odczyt Win32_OperatingSystem.LastBootUpTime w gościu
   UpdateIdentity.ps1                  # Wspólne formatowanie tożsamości aktualizacji
 tests\
   Invoke-StaticChecks.ps1             # Bramka statyczna (AST + tekst)
@@ -309,5 +321,8 @@ Launcher odpala te bramki automatycznie przed każdym przebiegiem (chyba że dod
   przez operatora.
 - **Failover Cluster = twardy skip** — maszyny klastra trzeba aktualizować ręcznie, węzeł
   po węźle.
-- Skrypt **inicjuje** restart, ale **nie czeka** na powrót systemu, VMware Tools ani
-  gotowość aplikacji.
+- Reboot jest potwierdzany przez zmianę `Win32_OperatingSystem.LastBootUpTime` oraz ponowną
+  dostępność GuestOps/VMware Tools; nie oznacza to gotowości aplikacji.
+- `CONTINUE` po timeoutem lub przy braku baseline jest świadomym obejściem i zawsze powoduje
+  końcowy kod wyjścia 1. Szczegóły i statusy (`Confirmed`, `Unverified`, `Timeout`,
+  `InitiationError`, `NotStartedAfterAbort`) są zapisywane w `reboot-actions.json` i `summary.md`.

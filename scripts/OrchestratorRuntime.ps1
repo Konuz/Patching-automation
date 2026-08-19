@@ -7,10 +7,13 @@ function New-ThrottledJobErrorResult {
         [string]$ErrorMessage
     )
 
+    # Job inputs differ per phase (apply carries VMOutputDirectory, boot-time reads do not),
+    # so every field is read defensively — under StrictMode a missing property would throw
+    # here and tear down the whole phase instead of reporting the job error.
     return [pscustomobject]@{
-        Sequence = $InputObject.Sequence
-        VMName = $InputObject.VMName
-        VMOutputDirectory = $InputObject.VMOutputDirectory
+        Sequence = Get-RuntimePropertyValue -InputObject $InputObject -Name 'Sequence'
+        VMName = Get-RuntimePropertyValue -InputObject $InputObject -Name 'VMName'
+        VMOutputDirectory = Get-RuntimePropertyValue -InputObject $InputObject -Name 'VMOutputDirectory'
         Status = $null
         AgentResult = $null
         Error = $ErrorMessage
@@ -84,7 +87,7 @@ function Invoke-ThrottledJobs {
 
             foreach ($entry in $timedOut) {
                 $timedOutJobIds[[string]$entry.Job.Id] = $true
-                Stop-Job -Job $entry.Job -Force -ErrorAction SilentlyContinue
+                Stop-Job -Job $entry.Job -ErrorAction SilentlyContinue
                 $results += New-ThrottledJobErrorResult -InputObject $entry.Input -ErrorMessage ('Job timed out after {0} seconds.' -f $JobTimeoutSeconds)
             }
 
@@ -120,7 +123,7 @@ function Invoke-ThrottledJobs {
     }
     finally {
         foreach ($entry in @($running)) {
-            Stop-Job -Job $entry.Job -Force -ErrorAction SilentlyContinue
+            Stop-Job -Job $entry.Job -ErrorAction SilentlyContinue
         }
         foreach ($createdJobId in @($createdJobIds)) {
             $job = Get-Job -Id $createdJobId -ErrorAction SilentlyContinue
@@ -184,7 +187,6 @@ function Test-ApplyResultsSuccessful {
     $errors = @($ApplyResults | Where-Object { Test-IsApplyResultError -ApplyResult $_ })
     return ($errors.Count -eq 0)
 }
-
 function Get-RuntimePropertyValue {
     param(
         $InputObject,
@@ -264,14 +266,64 @@ function Select-RebootRequiredApplyResults {
     return @($targets)
 }
 
+function Split-RebootBatches {
+    param(
+        [object[]]$Items,
+        [int]$BatchSize = 1
+    )
+
+    if ($BatchSize -lt 1) {
+        throw 'BatchSize must be greater than or equal to 1.'
+    }
+
+    $batches = New-Object System.Collections.Generic.List[object]
+    $current = New-Object System.Collections.Generic.List[object]
+    foreach ($item in @($Items)) {
+        $current.Add($item)
+        if ($current.Count -ge $BatchSize) {
+            $batches.Add([object[]]$current.ToArray())
+            $current = New-Object System.Collections.Generic.List[object]
+        }
+    }
+    if ($current.Count -gt 0) {
+        $batches.Add([object[]]$current.ToArray())
+    }
+
+    return @($batches.ToArray())
+}
+
+function Test-BootTimeNewer {
+    param($Baseline, $Observed)
+
+    if ($null -eq $Baseline -or $null -eq $Observed) {
+        return $false
+    }
+
+    return ([datetime]$Observed -gt [datetime]$Baseline)
+}
+
 function New-RebootActionRecord {
     param(
         [string]$VMName,
         [string]$Action,
         $ProcessId = $null,
         [string]$ErrorMessage = $null,
-        [string]$RebootReason = $null
+        [string]$RebootReason = $null,
+        [int]$BatchNumber = 0,
+        [int]$Sequence = 0,
+        $BootTimeBaseline = $null,
+        $BootTimeObserved = $null,
+        [string]$ValidationStatus = 'NotRequested',
+        [int]$WaitSeconds = 0,
+        [string]$OperatorDecision = $null,
+        [int]$AttemptCount = 0,
+        [int]$TimeoutCount = 0,
+        [string]$LastErrorMessage = $null
     )
+
+    $bootTimeBaselineText = if ($null -eq $BootTimeBaseline) { $null } else { ([datetime]$BootTimeBaseline).ToUniversalTime().ToString('o') }
+    $bootTimeObservedText = if ($null -eq $BootTimeObserved) { $null } else { ([datetime]$BootTimeObserved).ToUniversalTime().ToString('o') }
+    $lastErrorText = if ([string]::IsNullOrWhiteSpace($LastErrorMessage)) { $ErrorMessage } else { $LastErrorMessage }
 
     return [pscustomobject]@{
         vmName = $VMName
@@ -280,6 +332,16 @@ function New-RebootActionRecord {
         action = $Action
         processId = $ProcessId
         errorMessage = $ErrorMessage
+        batchNumber = $BatchNumber
+        sequence = $Sequence
+        bootTimeBaseline = $bootTimeBaselineText
+        bootTimeObserved = $bootTimeObservedText
+        validationStatus = $ValidationStatus
+        waitSeconds = $WaitSeconds
+        operatorDecision = $OperatorDecision
+        attemptCount = $AttemptCount
+        timeoutCount = $TimeoutCount
+        lastError = $lastErrorText
     }
 }
 
@@ -297,8 +359,24 @@ function New-SkippedRebootActionRecords {
 function Test-RebootActionsSuccessful {
     param($RebootActions)
 
-    $failed = @($RebootActions | Where-Object { $_.action -eq 'Failed' })
-    return ($failed.Count -eq 0)
+    $records = @($RebootActions)
+    if ($records.Count -eq 0) {
+        return $true
+    }
+
+    foreach ($record in $records) {
+        $action = [string]$record.action
+        $validation = [string]$record.validationStatus
+        if ($action -eq 'SkippedByOperator') {
+            continue
+        }
+        if ($action -eq 'Initiated' -and $validation -eq 'Confirmed') {
+            continue
+        }
+        return $false
+    }
+
+    return $true
 }
 
 function Write-RebootActionArtifacts {
@@ -312,23 +390,32 @@ function Write-RebootActionArtifacts {
     $actions | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $artifactPath -Encoding UTF8
 
     $summaryPath = Join-Path $CycleOutputDirectory 'summary.md'
-    $initiated = @($actions | Where-Object { $_.action -eq 'Initiated' })
+    $confirmed = @($actions | Where-Object { $_.action -eq 'Initiated' -and $_.validationStatus -eq 'Confirmed' })
+    $unverified = @($actions | Where-Object { $_.action -eq 'Initiated' -and $_.validationStatus -eq 'Unverified' })
+    $timeout = @($actions | Where-Object { $_.action -eq 'Initiated' -and $_.validationStatus -eq 'Timeout' })
     $skipped = @($actions | Where-Object { $_.action -eq 'SkippedByOperator' })
     $failed = @($actions | Where-Object { $_.action -eq 'Failed' })
+    $aborted = @($actions | Where-Object { $_.action -eq 'NotStartedAfterAbort' })
 
     $lines = @()
     $lines += ''
     $lines += '## Guest reboot actions'
     $lines += ''
-    $lines += ('- VMs with reboot initiated: {0}' -f $initiated.Count)
+    $lines += ('- VMs with reboot confirmed: {0}' -f $confirmed.Count)
+    $lines += ('- VMs with reboot unverified (operator override): {0}' -f $unverified.Count)
     $lines += ('- VMs with reboot skipped by operator: {0}' -f $skipped.Count)
     $lines += ('- VMs with reboot initiation errors: {0}' -f $failed.Count)
+    $lines += ('- VMs with reboot timeout: {0}' -f $timeout.Count)
+    $lines += ('- VMs not rebooted (aborted): {0}' -f $aborted.Count)
     $lines += ''
 
     foreach ($section in @(
-        [pscustomobject]@{ Title = 'VMs with reboot initiated'; Rows = $initiated },
+        [pscustomobject]@{ Title = 'VMs with reboot confirmed'; Rows = $confirmed },
+        [pscustomobject]@{ Title = 'VMs with reboot unverified (operator override)'; Rows = $unverified },
         [pscustomobject]@{ Title = 'VMs with reboot skipped by operator'; Rows = $skipped },
-        [pscustomobject]@{ Title = 'VMs with reboot initiation errors'; Rows = $failed }
+        [pscustomobject]@{ Title = 'VMs with reboot timeout'; Rows = $timeout },
+        [pscustomobject]@{ Title = 'VMs with reboot initiation errors'; Rows = $failed },
+        [pscustomobject]@{ Title = 'VMs not rebooted (aborted)'; Rows = $aborted }
     )) {
         $lines += ('### {0}' -f $section.Title)
         if (@($section.Rows).Count -eq 0) {
@@ -349,4 +436,329 @@ function Write-RebootActionArtifacts {
     }
 
     Add-Content -LiteralPath $summaryPath -Value $lines -Encoding UTF8
+}
+
+function Wait-RebootBatchBootTimes {
+    param(
+        [object[]]$Items,
+        [int]$WaitTimeoutSeconds,
+        [int]$PollSeconds,
+        [scriptblock]$ReadBootTimeScript,
+        [scriptblock]$SleepScript = { param([int]$Seconds) Start-Sleep -Seconds $Seconds }
+    )
+
+    if ($PollSeconds -lt 1) {
+        throw 'PollSeconds must be greater than or equal to 1.'
+    }
+    if ($WaitTimeoutSeconds -lt 0) {
+        throw 'WaitTimeoutSeconds must be greater than or equal to 0.'
+    }
+
+    $pending = @($Items | Where-Object { -not $_.Confirmed })
+    if ($pending.Count -eq 0) {
+        return [pscustomobject]@{ Records = @(); Pending = @(); TimedOut = $false }
+    }
+
+    $records = @()
+    $deadline = (Get-Date).AddSeconds($WaitTimeoutSeconds)
+    $windowStart = Get-Date
+    $timedOut = $false
+    $firstRead = $true
+
+    while ($pending.Count -gt 0) {
+        if (-not $firstRead -and (Get-Date) -ge $deadline) {
+            $timedOut = $true
+            break
+        }
+
+        $remainingSeconds = [math]::Max(1, [int][math]::Ceiling(($deadline - (Get-Date)).TotalSeconds))
+        foreach ($pendingItem in $pending) {
+            $pendingItem.AttemptCount++
+            $pendingItem.ReadTimeoutSeconds = $remainingSeconds
+        }
+        $readResults = @(& $ReadBootTimeScript $pending)
+        $newBootByVm = @{}
+        $readByVm = @{}
+        foreach ($readResult in @($readResults)) {
+            $readByVm[[string]$readResult.VMName] = $readResult
+            if ([string]::IsNullOrWhiteSpace([string]$readResult.Error) -and $null -ne $readResult.BootTimeUtc) {
+                $newBootByVm[[string]$readResult.VMName] = $readResult.BootTimeUtc
+            }
+        }
+
+        $kept = @()
+        foreach ($pendingItem in $pending) {
+            $readResult = $readByVm[[string]$pendingItem.VMName]
+            if ($null -eq $readResult) {
+                $pendingItem.LastErrorMessage = 'No boot time result was returned.'
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace([string]$readResult.Error)) {
+                $pendingItem.LastErrorMessage = [string]$readResult.Error
+            }
+            $confirmed = $false
+            if ($newBootByVm.ContainsKey([string]$pendingItem.VMName)) {
+                $observed = $newBootByVm[[string]$pendingItem.VMName]
+                $pendingItem.BootTimeObserved = $observed
+                if (Test-BootTimeNewer -Baseline $pendingItem.BootTimeBaseline -Observed $observed) {
+                    $confirmed = $true
+                    $records += New-RebootActionRecord -VMName $pendingItem.VMName -Action 'Initiated' -ProcessId $pendingItem.ProcessId -RebootReason $pendingItem.RebootReason -BatchNumber $pendingItem.BatchNumber -Sequence $pendingItem.Sequence -BootTimeBaseline $pendingItem.BootTimeBaseline -BootTimeObserved $observed -ValidationStatus 'Confirmed' -WaitSeconds ([int](Get-Date).Subtract($windowStart).TotalSeconds) -AttemptCount $pendingItem.AttemptCount -TimeoutCount $pendingItem.TimeoutCount -LastErrorMessage $pendingItem.LastErrorMessage
+                }
+            }
+
+            if (-not $confirmed) {
+                $kept += $pendingItem
+            }
+        }
+        $pending = $kept
+        $firstRead = $false
+
+        if ($pending.Count -gt 0) {
+            $remainingSeconds = ($deadline - (Get-Date)).TotalSeconds
+            if ($remainingSeconds -le 0) {
+                $timedOut = $true
+                break
+            }
+
+            $sleepSeconds = [int][math]::Floor([math]::Min($PollSeconds, $remainingSeconds))
+            if ($sleepSeconds -gt 0) {
+                & $SleepScript $sleepSeconds
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Records = @($records)
+        Pending = @($pending)
+        TimedOut = $timedOut
+    }
+}
+
+function Invoke-RebootBatchCoordinator {
+    param(
+        [object[]]$RebootTargets,
+        [int]$BatchSize,
+        [int]$WaitTimeoutSeconds,
+        [int]$PollSeconds,
+        [scriptblock]$ReadBootTimeScript,
+        [scriptblock]$InitiateRebootScript,
+        [scriptblock]$DecisionPromptScript,
+        [scriptblock]$SleepScript = { param([int]$Seconds) Start-Sleep -Seconds $Seconds }
+    )
+
+    $records = @()
+    # @() is load-bearing: a single batch is emitted as one object that is itself an array, so
+    # without the wrapper the outer level collapses and every VM becomes its own batch.
+    $batches = @(Split-RebootBatches -Items $RebootTargets -BatchSize $BatchSize)
+    $batchNumber = 0
+    $aborted = $false
+
+    foreach ($batch in @($batches)) {
+        if ($aborted) {
+            $batchNumber++
+            foreach ($target in @($batch)) {
+                $records += New-RebootActionRecord -VMName ([string]$target.vmName) -Action 'NotStartedAfterAbort' -RebootReason ([string]$target.rebootReason) -BatchNumber $batchNumber -Sequence ([int]$target.Sequence) -ValidationStatus 'NotStartedAfterAbort' -OperatorDecision 'ABORT'
+            }
+            continue
+        }
+
+        $batchNumber++
+        $batchItems = @()
+        foreach ($target in @($batch)) {
+            $batchItems += [pscustomobject]@{
+                Sequence = [int]$target.Sequence
+                VMName = [string]$target.vmName
+                RebootReason = [string]$target.rebootReason
+                BatchNumber = $batchNumber
+                BootTimeBaseline = $null
+                BootTimeObserved = $null
+                ValidationRequired = $false
+                Initiated = $false
+                ProcessId = $null
+                Confirmed = $false
+                AttemptCount = 0
+                TimeoutCount = 0
+                LastErrorMessage = $null
+                ReadTimeoutSeconds = $null
+            }
+        }
+
+        # --- baseline boot-time reads ---
+        foreach ($item in $batchItems) {
+            $item.ValidationRequired = $true
+        }
+
+        while ($true) {
+            $missing = @($batchItems | Where-Object { $_.ValidationRequired -and $null -eq $_.BootTimeBaseline })
+            if ($missing.Count -eq 0) {
+                break
+            }
+
+            foreach ($item in $missing) {
+                $item.AttemptCount++
+            }
+            $readResults = @(& $ReadBootTimeScript $missing)
+            $readByVm = @{}
+            foreach ($readResult in @($readResults)) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$readResult.Error)) {
+                    $matchingItem = @($missing | Where-Object { $_.VMName -eq $readResult.VMName })[0]
+                    if ($null -ne $matchingItem) {
+                        $matchingItem.LastErrorMessage = [string]$readResult.Error
+                    }
+                }
+                if ([string]::IsNullOrWhiteSpace([string]$readResult.Error) -and $null -ne $readResult.BootTimeUtc) {
+                    $readByVm[[string]$readResult.VMName] = $readResult.BootTimeUtc
+                }
+            }
+            foreach ($item in $missing) {
+                $readResult = @($readResults | Where-Object { $_.VMName -eq $item.VMName })[0]
+                if ($null -eq $readResult) {
+                    $item.LastErrorMessage = 'No boot time result was returned.'
+                }
+                elseif ([string]::IsNullOrWhiteSpace([string]$readResult.Error) -and $null -eq $readResult.BootTimeUtc) {
+                    $item.LastErrorMessage = 'Boot time result was empty.'
+                }
+                if ($readByVm.ContainsKey([string]$item.VMName)) {
+                    $item.BootTimeBaseline = $readByVm[[string]$item.VMName]
+                    $item.BootTimeObserved = $readByVm[[string]$item.VMName]
+                }
+            }
+
+            $stillMissing = @($batchItems | Where-Object { $_.ValidationRequired -and $null -eq $_.BootTimeBaseline })
+            if ($stillMissing.Count -eq 0) {
+                break
+            }
+
+            $context = [pscustomobject]@{
+                Stage = 'BaselineShortfall'
+                BatchNumber = $batchNumber
+                VMNames = @($stillMissing | ForEach-Object { $_.VMName })
+            }
+            $decision = & $DecisionPromptScript $context
+            if ($decision -eq 'RETRY') {
+                continue
+            }
+            elseif ($decision -eq 'CONTINUE') {
+                foreach ($item in $stillMissing) {
+                    $item.ValidationRequired = $false
+                }
+                break
+            }
+            else {
+                $aborted = $true
+                break
+            }
+        }
+
+        if ($aborted) {
+            foreach ($item in $batchItems) {
+                $alreadyRecorded = @($records | Where-Object { $_.vmName -eq $item.VMName }).Count -gt 0
+                if (-not $alreadyRecorded) {
+                    $records += New-RebootActionRecord -VMName $item.VMName -Action 'NotStartedAfterAbort' -ErrorMessage $item.LastErrorMessage -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -ValidationStatus 'NotStartedAfterAbort' -OperatorDecision 'ABORT' -AttemptCount $item.AttemptCount -LastErrorMessage $item.LastErrorMessage
+                }
+            }
+            continue
+        }
+
+        # --- initiate reboots for the whole batch ---
+        $restartResults = @(& $InitiateRebootScript $batchItems)
+        $restartByVm = @{}
+        foreach ($restartResult in @($restartResults)) {
+            if (-not $restartByVm.ContainsKey([string]$restartResult.VMName)) {
+                $restartByVm[[string]$restartResult.VMName] = $restartResult
+            }
+        }
+
+        # A missing result counts as a failed initiation: silently dropping the VM here would
+        # leave it out of reboot-actions.json and let the run exit 0 without ever rebooting it.
+        $initFailed = @($batchItems | Where-Object {
+            $result = $restartByVm[[string]$_.VMName]
+            $null -eq $result -or -not [string]::IsNullOrWhiteSpace([string]$result.Error)
+        })
+
+        if ($initFailed.Count -gt 0) {
+            $context = [pscustomobject]@{
+                Stage = 'InitiationError'
+                BatchNumber = $batchNumber
+                VMNames = @($initFailed | ForEach-Object { $_.VMName })
+            }
+            $initDecision = & $DecisionPromptScript $context
+            if ($initDecision -eq 'ABORT') {
+                $aborted = $true
+            }
+            foreach ($item in $initFailed) {
+                $result = $restartByVm[[string]$item.VMName]
+                $initErrorMessage = if ($null -eq $result) { 'No reboot initiation result was returned.' } else { [string]$result.Error }
+                $operatorDecision = if ($aborted) { 'ABORT' } else { 'CONTINUE' }
+                $records += New-RebootActionRecord -VMName $item.VMName -Action 'Failed' -ErrorMessage $initErrorMessage -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -ValidationStatus 'InitiationError' -OperatorDecision $operatorDecision -AttemptCount $item.AttemptCount -LastErrorMessage $initErrorMessage
+                $item.Initiated = $false
+            }
+        }
+
+        foreach ($item in $batchItems) {
+            $restartResult = $restartByVm[[string]$item.VMName]
+            $restartSucceeded = ($null -ne $restartResult -and [string]::IsNullOrWhiteSpace([string]$restartResult.Error))
+            if ($restartSucceeded) {
+                $item.Initiated = $true
+                $item.ProcessId = $restartResult.ProcessId
+            }
+        }
+
+        # --- validation / boot-time gate ---
+        foreach ($item in @($batchItems | Where-Object { $_.Initiated -and -not $_.ValidationRequired })) {
+            $records += New-RebootActionRecord -VMName $item.VMName -Action 'Initiated' -ProcessId $item.ProcessId -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -BootTimeBaseline $null -BootTimeObserved $null -ValidationStatus 'Unverified' -OperatorDecision 'CONTINUE' -AttemptCount $item.AttemptCount -TimeoutCount $item.TimeoutCount -LastErrorMessage $item.LastErrorMessage
+        }
+
+        $pendingItems = @($batchItems | Where-Object { $_.Initiated -and $_.ValidationRequired })
+
+        if ($pendingItems.Count -gt 0) {
+            $validationAborted = $false
+            while ($true) {
+                $wait = Wait-RebootBatchBootTimes -Items $pendingItems -WaitTimeoutSeconds $WaitTimeoutSeconds -PollSeconds $PollSeconds -ReadBootTimeScript $ReadBootTimeScript -SleepScript $SleepScript
+                $records += $wait.Records
+                $pendingItems = $wait.Pending
+
+                if ($pendingItems.Count -eq 0) {
+                    break
+                }
+
+                foreach ($item in $pendingItems) {
+                    $item.TimeoutCount++
+                }
+
+                $context = [pscustomobject]@{
+                    Stage = 'WaitTimeout'
+                    BatchNumber = $batchNumber
+                    VMNames = @($pendingItems | ForEach-Object { $_.VMName })
+                    WaitSeconds = $WaitTimeoutSeconds
+                }
+                $decision = & $DecisionPromptScript $context
+
+                if ($decision -eq 'RETRY') {
+                    continue
+                }
+                elseif ($decision -eq 'CONTINUE') {
+                    foreach ($item in $pendingItems) {
+                        $records += New-RebootActionRecord -VMName $item.VMName -Action 'Initiated' -ProcessId $item.ProcessId -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -BootTimeBaseline $item.BootTimeBaseline -BootTimeObserved $item.BootTimeObserved -ValidationStatus 'Unverified' -OperatorDecision 'CONTINUE' -AttemptCount $item.AttemptCount -TimeoutCount $item.TimeoutCount -LastErrorMessage $item.LastErrorMessage
+                    }
+                    break
+                }
+                else {
+                    foreach ($item in $pendingItems) {
+                        $records += New-RebootActionRecord -VMName $item.VMName -Action 'Initiated' -ProcessId $item.ProcessId -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -BootTimeBaseline $item.BootTimeBaseline -BootTimeObserved $item.BootTimeObserved -ValidationStatus 'Timeout' -OperatorDecision 'ABORT' -AttemptCount $item.AttemptCount -TimeoutCount $item.TimeoutCount -LastErrorMessage $item.LastErrorMessage
+                    }
+                    $validationAborted = $true
+                    break
+                }
+            }
+
+            if ($validationAborted) {
+                $aborted = $true
+                continue
+            }
+        }
+    }
+
+    # Sort-Object is not stable in Windows PowerShell 5.1, so batchNumber alone would scramble
+    # the VM order inside a batch; sequence is the original target order and breaks every tie.
+    return @($records | Sort-Object batchNumber, sequence)
 }

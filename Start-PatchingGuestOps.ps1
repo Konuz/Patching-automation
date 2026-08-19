@@ -9,8 +9,12 @@ param(
     [int]$MaxUpdates = 1,
     [string]$InstallSelection,
     [string[]]$SelectedUpdateKeys,
+    [ValidateRange(1, 2147483647)]
     [int]$ThrottleLimit = 3,
     [int]$TimeoutMinutes = 180,
+    [ValidateRange(1, 2147483647)]
+    [int]$RebootTimeoutMinutes = 30,
+    [ValidateRange(1, 2147483647)]
     [int]$PollSeconds = 15,
     [string]$GuestWorkingDirectory = 'C:\ProgramData\PatchingGuestOps',
     [string]$LocalOutputDirectory,
@@ -130,6 +134,7 @@ $orchestratorParams = @{
     MaxUpdates = $MaxUpdates
     ThrottleLimit = $ThrottleLimit
     TimeoutMinutes = $TimeoutMinutes
+    RebootTimeoutMinutes = $RebootTimeoutMinutes
     PollSeconds = $PollSeconds
 }
 

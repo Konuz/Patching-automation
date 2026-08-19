@@ -251,7 +251,13 @@ function Wait-GuestProcess {
             }
         }
 
-        Start-Sleep -Seconds $PollSeconds
+        $remainingSeconds = ($deadline - (Get-Date)).TotalSeconds
+        # Ceiling, not Floor: a sub-second remainder would floor to 0 and spin the loop against
+        # ListProcessesInGuest without sleeping. The -gt 0 guard below still handles a past deadline.
+        $sleepSeconds = [int][math]::Ceiling([math]::Min($PollSeconds, $remainingSeconds))
+        if ($sleepSeconds -gt 0) {
+            Start-Sleep -Seconds $sleepSeconds
+        }
     }
 
     return [pscustomobject]@{
@@ -269,7 +275,8 @@ function Send-GuestFile {
         [string]$HostName,
         [string]$CurlPath,
         [string]$LocalPath,
-        [string]$GuestPath
+        [string]$GuestPath,
+        [int]$TimeoutSeconds = 0
     )
 
     $file = Get-Item -LiteralPath $LocalPath
@@ -277,7 +284,7 @@ function Send-GuestFile {
     $url = $FileManager.InitiateFileTransferToGuest($VMView.MoRef, $GuestAuth, $GuestPath, $attributes, [int64]$file.Length, $true)
     $resolvedUrl = Resolve-GuestFileTransferUrl -Url $url -HostName $HostName
 
-    Invoke-Curl -CurlPath $CurlPath -Description ('Uploading {0} to guest path {1}' -f $LocalPath, $GuestPath) -Arguments @(
+    $curlArguments = @(
         # Phase 0b validates GuestOps ESXi transfer URLs; -k is not the target production TLS pattern.
         '-k',
         '--silent',
@@ -289,6 +296,10 @@ function Send-GuestFile {
         $LocalPath,
         $resolvedUrl
     )
+    if ($TimeoutSeconds -gt 0) {
+        $curlArguments += @('--max-time', [string]$TimeoutSeconds)
+    }
+    Invoke-Curl -CurlPath $CurlPath -Description ('Uploading {0} to guest path {1}' -f $LocalPath, $GuestPath) -Arguments $curlArguments
 }
 
 function Receive-GuestFile {
@@ -299,7 +310,8 @@ function Receive-GuestFile {
         [string]$HostName,
         [string]$CurlPath,
         [string]$GuestPath,
-        [string]$LocalPath
+        [string]$LocalPath,
+        [int]$TimeoutSeconds = 0
     )
 
     $localParent = Split-Path -Parent $LocalPath
@@ -310,7 +322,7 @@ function Receive-GuestFile {
     $transferInfo = $FileManager.InitiateFileTransferFromGuest($VMView.MoRef, $GuestAuth, $GuestPath)
     $resolvedUrl = Resolve-GuestFileTransferUrl -Url $transferInfo.Url -HostName $HostName
 
-    Invoke-Curl -CurlPath $CurlPath -Description ('Downloading guest path {0} to {1}' -f $GuestPath, $LocalPath) -Arguments @(
+    $curlArguments = @(
         # Phase 0b validates GuestOps ESXi transfer URLs; -k is not the target production TLS pattern.
         '-k',
         '--silent',
@@ -320,6 +332,10 @@ function Receive-GuestFile {
         $LocalPath,
         $resolvedUrl
     )
+    if ($TimeoutSeconds -gt 0) {
+        $curlArguments += @('--max-time', [string]$TimeoutSeconds)
+    }
+    Invoke-Curl -CurlPath $CurlPath -Description ('Downloading guest path {0} to {1}' -f $GuestPath, $LocalPath) -Arguments $curlArguments
 }
 
 function Get-UniqueTrimmedKeys {
@@ -613,5 +629,127 @@ function Invoke-VMGuestReboot {
     return [pscustomobject]@{
         VMName = $VMName
         ProcessId = $rebootProcessId
+    }
+}
+
+function New-GuestBootTimeQueryArguments {
+    param(
+        [string]$BootTimeHelperPath,
+        [string]$OutputPath
+    )
+
+    $safeHelperPath = ([string]$BootTimeHelperPath) -replace '"', '`"'
+    $safeOutputPath = ([string]$OutputPath) -replace '"', '`"'
+    return ('-NoProfile -ExecutionPolicy Bypass -File "{0}" -OutputPath "{1}"' -f $safeHelperPath, $safeOutputPath)
+}
+
+function Start-GuestBootTimeQuery {
+    param(
+        $ProcessManager,
+        $VMView,
+        $GuestAuth,
+        [string]$BootTimeHelperPath,
+        [string]$OutputPath
+    )
+
+    $programSpec = New-Object VMware.Vim.GuestProgramSpec
+    $programSpec.ProgramPath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+    $programSpec.Arguments = New-GuestBootTimeQueryArguments -BootTimeHelperPath $BootTimeHelperPath -OutputPath $OutputPath
+    $programSpec.WorkingDirectory = Split-Path -Parent $OutputPath
+
+    return $ProcessManager.StartProgramInGuest($VMView.MoRef, $GuestAuth, $programSpec)
+}
+
+function Invoke-VMGuestBootTimeRead {
+    param(
+        [string]$VMName,
+        $Managers,
+        $GuestAuth,
+        [string]$CurlPath,
+        [string]$GuestWorkingDirectory,
+        [string]$BootTimeHelperPath,
+        [int]$TimeoutSeconds = 120,
+        [int]$PollSeconds = 5
+    )
+
+    $vm = Get-ExactVM -Name $VMName
+    Assert-VMReadyForGuestOps -VM $vm
+
+    $vmView = $vm.ExtensionData
+    if ($null -eq $Managers) {
+        $Managers = Get-GuestOpsManagers -VMView $vmView
+    }
+    $hostName = Get-VMHostNameForTransfer -VMView $vmView
+
+    $localTempDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-boottime-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $localTempDirectory | Out-Null
+
+    try {
+        # One helper and one output file per guest, overwritten on every attempt. Naming them per
+        # attempt instead would pile up hundreds of files per VM per run inside the guest and never
+        # clean them up. A VM is never polled concurrently with itself, so overwriting is safe --
+        # but it does mean a dead query would leave the previous attempt's JSON in place, which is
+        # why the exit code of the query below is checked and not just its completion.
+        $safeVmName = ([string]$VMName) -replace '[^a-zA-Z0-9_.-]', '_'
+        $guestHelperPath = Join-Path $GuestWorkingDirectory ('Read-BootTime-{0}.ps1' -f $safeVmName)
+        $guestOutputPath = Join-Path $GuestWorkingDirectory ('boot-time-{0}.json' -f $safeVmName)
+        $operationDeadline = (Get-Date).AddSeconds([math]::Max(1, $TimeoutSeconds))
+        $getRemainingSeconds = {
+            $remaining = ($operationDeadline - (Get-Date)).TotalSeconds
+            if ($remaining -le 0) {
+                throw 'Boot time read timeout budget expired.'
+            }
+            return [int][math]::Ceiling($remaining)
+        }
+
+        # mkdir and the boot-time query both finish in about a second, while $PollSeconds is sized
+        # for the WUA agent, which runs for minutes. Polling those two at the caller's cadence would
+        # burn most of a poll interval per attempt just noticing that a one-second job is done.
+        $shortOperationPollSeconds = [int][math]::Max(1, [math]::Min(5, $PollSeconds))
+
+        $mkdirProcessId = New-GuestDirectory -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -DirectoryPath $GuestWorkingDirectory
+        $mkdirTimeoutSeconds = [int][math]::Min(120, (& $getRemainingSeconds))
+        $mkdirResult = Wait-GuestProcess -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -ProcessId $mkdirProcessId -TimeoutSeconds $mkdirTimeoutSeconds -PollSeconds $shortOperationPollSeconds
+        if (-not $mkdirResult.Completed -or ($null -ne $mkdirResult.ExitCode -and $mkdirResult.ExitCode -ne 0)) {
+            throw ('Failed to create guest working directory. Completed={0}; ExitCode={1}' -f $mkdirResult.Completed, $mkdirResult.ExitCode)
+        }
+
+        Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $BootTimeHelperPath -GuestPath $guestHelperPath -TimeoutSeconds (& $getRemainingSeconds)
+
+        $queryProcessId = Start-GuestBootTimeQuery -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -BootTimeHelperPath $guestHelperPath -OutputPath $guestOutputPath
+        $queryTimeoutSeconds = & $getRemainingSeconds
+        $queryResult = Wait-GuestProcess -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -ProcessId $queryProcessId -TimeoutSeconds $queryTimeoutSeconds -PollSeconds $shortOperationPollSeconds
+        if (-not $queryResult.Completed) {
+            throw ('Boot time query did not complete within {0} seconds.' -f $TimeoutSeconds)
+        }
+        # A non-zero exit means the helper did not write this attempt's file. With a stable output
+        # path the previous attempt's JSON would still be sitting there, so downloading it would
+        # silently pass off a stale boot time as a fresh reading.
+        if ($null -ne $queryResult.ExitCode -and $queryResult.ExitCode -ne 0) {
+            throw ('Boot time query failed inside guest. ExitCode={0}' -f $queryResult.ExitCode)
+        }
+
+        $localOutputPath = Join-Path $localTempDirectory 'boot-time.json'
+        Receive-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -GuestPath $guestOutputPath -LocalPath $localOutputPath -TimeoutSeconds (& $getRemainingSeconds)
+
+        $parsed = Get-Content -LiteralPath $localOutputPath -Raw | ConvertFrom-Json
+        $parsedError = [string](Get-ObjectPropertyValue -InputObject $parsed -Path @('error'))
+        if (-not [string]::IsNullOrWhiteSpace($parsedError)) {
+            throw ('Boot time query failed inside guest: {0}' -f $parsedError)
+        }
+
+        $bootTimeUtcText = [string](Get-ObjectPropertyValue -InputObject $parsed -Path @('bootTimeUtc'))
+        $bootTimeUtc = $null
+        if (-not [string]::IsNullOrWhiteSpace($bootTimeUtcText)) {
+            $bootTimeUtc = [datetime]::Parse($bootTimeUtcText, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+        }
+
+        return [pscustomobject]@{
+            VMName = $VMName
+            BootTimeUtc = $bootTimeUtc
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $localTempDirectory -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

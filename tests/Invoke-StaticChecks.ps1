@@ -174,6 +174,7 @@ function Assert-NoReservedVariableName {
 
 $agentPath = 'guest\Run-LocalPatch.ps1'
 $identityHelperPath = 'guest\UpdateIdentity.ps1'
+$bootTimeHelperPath = 'guest\Read-BootTime.ps1'
 $orchestratorPath = 'scripts\Invoke-GuestOpsPatchValidation.ps1'
 $runtimeHelperPath = 'scripts\OrchestratorRuntime.ps1'
 $guestOpsLibPath = 'scripts\GuestOpsLib.ps1'
@@ -184,7 +185,7 @@ $modelTestPath = 'tests\Invoke-ModelChecks.ps1'
 $runtimeTestPath = 'tests\Invoke-RuntimeChecks.ps1'
 
 $existingScripts = @{}
-foreach ($relativePath in @($agentPath, $identityHelperPath, $orchestratorPath, $runtimeHelperPath, $guestOpsLibPath, $vmTargetLibPath, $launcherPath, $modelPath, $modelTestPath, $runtimeTestPath)) {
+foreach ($relativePath in @($agentPath, $identityHelperPath, $bootTimeHelperPath, $orchestratorPath, $runtimeHelperPath, $guestOpsLibPath, $vmTargetLibPath, $launcherPath, $modelPath, $modelTestPath, $runtimeTestPath)) {
     $path = Assert-FileExists -RelativePath $relativePath
     if ($path) {
         $existingScripts[$relativePath] = $path
@@ -228,6 +229,16 @@ if ($existingScripts.ContainsKey($agentPath)) {
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'roleFlags'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'failoverCluster'
     Assert-TextDoesNotMatch -RelativePath $agentPath -Text $agentText -Pattern '(?i)\$[a-z_][a-z0-9_]*\.HResult\b' -Reason 'WUA COM HResult can be absent under StrictMode'
+}
+
+if ($existingScripts.ContainsKey($bootTimeHelperPath)) {
+    $bootTimeHelperAst = Get-ScriptAst -RelativePath $bootTimeHelperPath -Path $existingScripts[$bootTimeHelperPath]
+    $bootTimeHelperText = Get-ScriptText -Path $existingScripts[$bootTimeHelperPath]
+
+    Assert-NoForbiddenCommand -Ast $bootTimeHelperAst -RelativePath $bootTimeHelperPath -ForbiddenNames $forbiddenCommands
+    Assert-NoForbiddenCommandLiteral -RelativePath $bootTimeHelperPath -Text $bootTimeHelperText -ForbiddenNames $forbiddenCommands
+    Assert-NoReservedVariableName -Ast $bootTimeHelperAst -RelativePath $bootTimeHelperPath -ReservedNames $reservedVariableNames
+    Assert-TextDoesNotMatch -RelativePath $bootTimeHelperPath -Text $bootTimeHelperText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
 }
 
 if ($existingScripts.ContainsKey($guestOpsLibPath)) {
@@ -386,6 +397,7 @@ if ($existingScripts.ContainsKey($runtimeHelperPath)) {
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'New-ThrottledJobErrorResult'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'StartedAt'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Stop-Job'
+    Assert-TextDoesNotMatch -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Pattern '(?i)Stop-Job\b[^\r\n]*-Force' -Reason 'Stop-Job -Force is not available in Windows PowerShell 5.1'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Receive-Job returned no output.'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Test-ApplyResultsSuccessful'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle "`$ApplyResult.action -eq 'Install' -and `$ApplyResult.outcome -ne 'InstallSucceeded'"

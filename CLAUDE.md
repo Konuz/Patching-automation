@@ -34,6 +34,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-RuntimeCh
 # Reboot prompt is automatic when any VM reports rebootRequired=true after apply,
 # or had pendingRebootBefore.isPending=true in discovery for this run.
 # The operator must type REBOOT; -SkipConfirmation does not skip this prompt.
+# Reboots run in fixed batches of ThrottleLimit and wait for a newer guest boot time.
 .\Start-PatchingGuestOps.ps1 -VMListPath .\vms.txt -ThrottleLimit 2
 
 # Run the orchestrator directly, bypassing the launcher:
@@ -56,6 +57,39 @@ Execution flows through layered runtime scripts plus the offline planning model 
 3. **`scripts/PatchPlanModel.ps1`** (offline model) — pure planning/reporting logic for update identity validation, default group selection, Failover Cluster skips, per-VM patch plans, summaries, and PlanOnly exit semantics. Keep it free of PowerCLI, GuestOps calls, `Read-Host`, and top-level runtime flow.
 4. **`scripts/GuestOpsLib.ps1`** (GuestOps helpers) — shared PowerCLI/GuestOps file transfer and process-run helpers used by direct and throttled apply/discovery cycles.
 5. **`guest/Run-LocalPatch.ps1`** (agent, runs *inside* the guest) — WUA COM only: `Microsoft.Update.Session` → searcher → downloader → installer. Writes `status.json` + `agent.log` to the working directory (`C:\ProgramData\PatchingGuestOps`). **Never reboots** — it only reports `pendingReboot`.
+6. **`guest/Read-BootTime.ps1`** (helper, runs *inside* the guest) — reads `Win32_OperatingSystem.LastBootUpTime` and writes a UTC/ISO 8601 result for the reboot validation gate.
+
+### Reboot batches and boot-time gate
+
+The reboot phase is deliberately separate from discovery and apply throttling semantics. It keeps
+the target order and splits reboot targets into fixed batches of `ThrottleLimit`. Within one batch,
+baseline `Win32_OperatingSystem.LastBootUpTime` values are read through GuestOps, `shutdown.exe`
+is initiated in parallel, and the next batch is blocked until every VM with a baseline reports a
+strictly newer boot time. The boot-time helper runs inside the VM; no WinRM, PSRemoting,
+`Invoke-VMScript`, or `Copy-VMGuestFile` is used.
+
+The helper and its JSON output use **one stable path per guest** (`Read-BootTime-<vm>.ps1`,
+`boot-time-<vm>.json`), overwritten on every attempt — per-attempt names would leave hundreds of
+files per VM per run behind on production servers. Because the output path is reused,
+`Invoke-VMGuestBootTimeRead` checks the query's **exit code** and not just its completion: a helper
+that died would otherwise leave the previous attempt's JSON in place and have it read back as a
+fresh boot time.
+
+`-RebootTimeoutMinutes` defaults to 30 minutes. `-PollSeconds` controls polling cadence, not the
+timeout. GuestOps/VMware Tools errors during observation are transient until timeout. At a baseline
+shortfall or timeout the operator must choose `RETRY`, `CONTINUE`, or `ABORT`; `-SkipConfirmation`
+does not bypass these prompts. `RETRY` observes against the original baseline without sending
+`shutdown.exe` again. A failed initiation is never automatically retried and offers only
+`CONTINUE`/`ABORT`. `CONTINUE` records an unverified/forced result and `ABORT` records remaining
+targets as `NotStartedAfterAbort`; either outcome makes the final exit code `1`.
+
+Each `reboot-actions.json` record retains the existing reboot fields and adds the batch number,
+the target sequence (records are ordered by `batchNumber, sequence` because `Sort-Object` is not
+stable on 5.1),
+baseline/observed boot times, validation status, wait/timeout data, operator decision, and the
+latest error. `summary.md` separates confirmed, unverified/forced, timeout, initiation-error,
+skipped, and not-started-after-abort restarts. A confirmed boot-time gate proves OS reboot and
+GuestOps/VMware Tools availability only; application readiness remains out of scope.
 
 ### The contract between orchestrator and agent
 
