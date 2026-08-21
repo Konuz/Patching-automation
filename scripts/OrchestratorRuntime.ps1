@@ -313,6 +313,8 @@ function New-RebootActionRecord {
         [int]$Sequence = 0,
         $BootTimeBaseline = $null,
         $BootTimeObserved = $null,
+        $UptimeBaselineSeconds = $null,
+        $UptimeObservedSeconds = $null,
         [string]$ValidationStatus = 'NotRequested',
         [int]$WaitSeconds = 0,
         [string]$OperatorDecision = $null,
@@ -336,6 +338,11 @@ function New-RebootActionRecord {
         sequence = $Sequence
         bootTimeBaseline = $bootTimeBaselineText
         bootTimeObserved = $bootTimeObservedText
+        # Diagnostics only - the gate decides on boot time alone. Uptime comes from the same CIM
+        # snapshot as the boot time, so it survives a guest clock step: if a confirmed restart ever
+        # shows up as a boot time that moved backwards, these two fields are what explains it.
+        uptimeBaselineSeconds = $UptimeBaselineSeconds
+        uptimeObservedSeconds = $UptimeObservedSeconds
         validationStatus = $ValidationStatus
         waitSeconds = $WaitSeconds
         operatorDecision = $OperatorDecision
@@ -443,6 +450,7 @@ function Wait-RebootBatchBootTimes {
         [object[]]$Items,
         [int]$WaitTimeoutSeconds,
         [int]$PollSeconds,
+        [int]$GraceSeconds = 0,
         [scriptblock]$ReadBootTimeScript,
         [scriptblock]$SleepScript = { param([int]$Seconds) Start-Sleep -Seconds $Seconds }
     )
@@ -454,14 +462,21 @@ function Wait-RebootBatchBootTimes {
         throw 'WaitTimeoutSeconds must be greater than or equal to 0.'
     }
 
-    $pending = @($Items | Where-Object { -not $_.Confirmed })
+    $pending = @($Items)
     if ($pending.Count -eq 0) {
         return [pscustomobject]@{ Records = @(); Pending = @(); TimedOut = $false }
     }
 
     $records = @()
-    $deadline = (Get-Date).AddSeconds($WaitTimeoutSeconds)
     $windowStart = Get-Date
+    # A guest that was just told to shut down cannot possibly report a newer boot time for a
+    # minute or more, so reads inside that window are guaranteed-wasted GuestOps traffic. The
+    # grace sits outside the timeout budget - it delays the first read without shortening the
+    # observation window - and the caller drops it on RETRY, where the wait is long past over.
+    if ($GraceSeconds -gt 0) {
+        & $SleepScript $GraceSeconds
+    }
+    $deadline = (Get-Date).AddSeconds($WaitTimeoutSeconds)
     $timedOut = $false
     $firstRead = $true
 
@@ -499,9 +514,10 @@ function Wait-RebootBatchBootTimes {
             if ($newBootByVm.ContainsKey([string]$pendingItem.VMName)) {
                 $observed = $newBootByVm[[string]$pendingItem.VMName]
                 $pendingItem.BootTimeObserved = $observed
+                $pendingItem.UptimeObservedSeconds = Get-RuntimePropertyValue -InputObject $readResult -Name 'UptimeSeconds'
                 if (Test-BootTimeNewer -Baseline $pendingItem.BootTimeBaseline -Observed $observed) {
                     $confirmed = $true
-                    $records += New-RebootActionRecord -VMName $pendingItem.VMName -Action 'Initiated' -ProcessId $pendingItem.ProcessId -RebootReason $pendingItem.RebootReason -BatchNumber $pendingItem.BatchNumber -Sequence $pendingItem.Sequence -BootTimeBaseline $pendingItem.BootTimeBaseline -BootTimeObserved $observed -ValidationStatus 'Confirmed' -WaitSeconds ([int](Get-Date).Subtract($windowStart).TotalSeconds) -AttemptCount $pendingItem.AttemptCount -TimeoutCount $pendingItem.TimeoutCount -LastErrorMessage $pendingItem.LastErrorMessage
+                    $records += New-RebootActionRecord -VMName $pendingItem.VMName -Action 'Initiated' -ProcessId $pendingItem.ProcessId -RebootReason $pendingItem.RebootReason -BatchNumber $pendingItem.BatchNumber -Sequence $pendingItem.Sequence -BootTimeBaseline $pendingItem.BootTimeBaseline -BootTimeObserved $observed -UptimeBaselineSeconds $pendingItem.UptimeBaselineSeconds -UptimeObservedSeconds $pendingItem.UptimeObservedSeconds -ValidationStatus 'Confirmed' -WaitSeconds ([int](Get-Date).Subtract($windowStart).TotalSeconds) -AttemptCount $pendingItem.AttemptCount -TimeoutCount $pendingItem.TimeoutCount -LastErrorMessage $pendingItem.LastErrorMessage
                 }
             }
 
@@ -519,7 +535,9 @@ function Wait-RebootBatchBootTimes {
                 break
             }
 
-            $sleepSeconds = [int][math]::Floor([math]::Min($PollSeconds, $remainingSeconds))
+            # Ceiling, not Floor: a sub-second remainder must still sleep at least 1s, matching
+            # Wait-GuestProcess. A zero sleep here would skip straight to another full read wave.
+            $sleepSeconds = [int][math]::Ceiling([math]::Min($PollSeconds, $remainingSeconds))
             if ($sleepSeconds -gt 0) {
                 & $SleepScript $sleepSeconds
             }
@@ -539,6 +557,7 @@ function Invoke-RebootBatchCoordinator {
         [int]$BatchSize,
         [int]$WaitTimeoutSeconds,
         [int]$PollSeconds,
+        [int]$GraceSeconds = 90,
         [scriptblock]$ReadBootTimeScript,
         [scriptblock]$InitiateRebootScript,
         [scriptblock]$DecisionPromptScript,
@@ -571,10 +590,11 @@ function Invoke-RebootBatchCoordinator {
                 BatchNumber = $batchNumber
                 BootTimeBaseline = $null
                 BootTimeObserved = $null
+                UptimeBaselineSeconds = $null
+                UptimeObservedSeconds = $null
                 ValidationRequired = $false
                 Initiated = $false
                 ProcessId = $null
-                Confirmed = $false
                 AttemptCount = 0
                 TimeoutCount = 0
                 LastErrorMessage = $null
@@ -620,6 +640,8 @@ function Invoke-RebootBatchCoordinator {
                 if ($readByVm.ContainsKey([string]$item.VMName)) {
                     $item.BootTimeBaseline = $readByVm[[string]$item.VMName]
                     $item.BootTimeObserved = $readByVm[[string]$item.VMName]
+                    $item.UptimeBaselineSeconds = Get-RuntimePropertyValue -InputObject $readResult -Name 'UptimeSeconds'
+                    $item.UptimeObservedSeconds = $item.UptimeBaselineSeconds
                 }
             }
 
@@ -712,8 +734,12 @@ function Invoke-RebootBatchCoordinator {
 
         if ($pendingItems.Count -gt 0) {
             $validationAborted = $false
+            # Only the first wait pays the grace: on RETRY the batch has already been down for a
+            # full timeout period, so there is nothing left to wait out before reading again.
+            $waitGraceSeconds = $GraceSeconds
             while ($true) {
-                $wait = Wait-RebootBatchBootTimes -Items $pendingItems -WaitTimeoutSeconds $WaitTimeoutSeconds -PollSeconds $PollSeconds -ReadBootTimeScript $ReadBootTimeScript -SleepScript $SleepScript
+                $wait = Wait-RebootBatchBootTimes -Items $pendingItems -WaitTimeoutSeconds $WaitTimeoutSeconds -PollSeconds $PollSeconds -GraceSeconds $waitGraceSeconds -ReadBootTimeScript $ReadBootTimeScript -SleepScript $SleepScript
+                $waitGraceSeconds = 0
                 $records += $wait.Records
                 $pendingItems = $wait.Pending
 
@@ -738,13 +764,13 @@ function Invoke-RebootBatchCoordinator {
                 }
                 elseif ($decision -eq 'CONTINUE') {
                     foreach ($item in $pendingItems) {
-                        $records += New-RebootActionRecord -VMName $item.VMName -Action 'Initiated' -ProcessId $item.ProcessId -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -BootTimeBaseline $item.BootTimeBaseline -BootTimeObserved $item.BootTimeObserved -ValidationStatus 'Unverified' -OperatorDecision 'CONTINUE' -AttemptCount $item.AttemptCount -TimeoutCount $item.TimeoutCount -LastErrorMessage $item.LastErrorMessage
+                        $records += New-RebootActionRecord -VMName $item.VMName -Action 'Initiated' -ProcessId $item.ProcessId -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -BootTimeBaseline $item.BootTimeBaseline -BootTimeObserved $item.BootTimeObserved -UptimeBaselineSeconds $item.UptimeBaselineSeconds -UptimeObservedSeconds $item.UptimeObservedSeconds -ValidationStatus 'Unverified' -OperatorDecision 'CONTINUE' -AttemptCount $item.AttemptCount -TimeoutCount $item.TimeoutCount -LastErrorMessage $item.LastErrorMessage
                     }
                     break
                 }
                 else {
                     foreach ($item in $pendingItems) {
-                        $records += New-RebootActionRecord -VMName $item.VMName -Action 'Initiated' -ProcessId $item.ProcessId -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -BootTimeBaseline $item.BootTimeBaseline -BootTimeObserved $item.BootTimeObserved -ValidationStatus 'Timeout' -OperatorDecision 'ABORT' -AttemptCount $item.AttemptCount -TimeoutCount $item.TimeoutCount -LastErrorMessage $item.LastErrorMessage
+                        $records += New-RebootActionRecord -VMName $item.VMName -Action 'Initiated' -ProcessId $item.ProcessId -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -BootTimeBaseline $item.BootTimeBaseline -BootTimeObserved $item.BootTimeObserved -UptimeBaselineSeconds $item.UptimeBaselineSeconds -UptimeObservedSeconds $item.UptimeObservedSeconds -ValidationStatus 'Timeout' -OperatorDecision 'ABORT' -AttemptCount $item.AttemptCount -TimeoutCount $item.TimeoutCount -LastErrorMessage $item.LastErrorMessage
                     }
                     $validationAborted = $true
                     break

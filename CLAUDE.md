@@ -75,6 +75,30 @@ files per VM per run behind on production servers. Because the output path is re
 that died would otherwise leave the previous attempt's JSON in place and have it read back as a
 fresh boot time.
 
+Boot-time reads run **in the orchestrator process**, sequentially over the batch, against the
+vCenter connection the run already holds — unlike discovery, apply, and reboot initiation, which
+use `Start-Job`. A child job would re-import PowerCLI and log in to vCenter once per VM per polling
+round, so sequential in-process reads finish a batch sooner than parallel jobs and leave no extra
+vCenter sessions behind; PowerCLI has no supported way to hand a live session to a child process.
+Two consequences are load-bearing: the read loop must catch per VM (no job boundary to contain a
+throw), and `Set-PowerCLIConfiguration -WebOperationTimeoutSeconds 60` replaces the job timeout as
+the bound on a hung SOAP call, because the read's own budget is only checked between GuestOps steps.
+
+The gate is **level-triggered**: `LastBootUpTime` is durable state, so a skipped poll delays
+detection but never loses it — polling cadence cannot cause a false positive or a false negative.
+That is what makes the call-count reductions safe. The helper and working directory are uploaded
+**once per VM** (`-SkipHelperUpload` on later reads; any failed read re-arms the upload, so a guest
+that lost the file self-heals), and observation waits out a **grace period** (`GraceSeconds`,
+default 90s, coordinator-level, not a CLI parameter) before the first read, since a guest that was
+just told to shut down cannot report a newer boot time yet. The grace sits outside the timeout
+budget and is paid once per batch, not again on `RETRY`.
+
+The helper also emits `uptimeSeconds` from the same CIM snapshot as the boot time, recorded as
+`uptimeBaselineSeconds`/`uptimeObservedSeconds`. This is **diagnostic only** — the gate still
+decides on boot time alone. It exists for the one false-negative vector the gate cannot see: a
+guest clock stepped backwards during boot (NTP correcting a fast clock) can make the post-reboot
+`LastBootUpTime` older than the baseline, and uptime is what explains that in the artifact.
+
 `-RebootTimeoutMinutes` defaults to 30 minutes. `-PollSeconds` controls polling cadence, not the
 timeout. GuestOps/VMware Tools errors during observation are transient until timeout. At a baseline
 shortfall or timeout the operator must choose `RETRY`, `CONTINUE`, or `ABORT`; `-SkipConfirmation`
@@ -85,7 +109,7 @@ targets as `NotStartedAfterAbort`; either outcome makes the final exit code `1`.
 
 Each `reboot-actions.json` record retains the existing reboot fields and adds the batch number,
 the target sequence (records are ordered by `batchNumber, sequence` because `Sort-Object` is not
-stable on 5.1),
+stable on 5.1), the baseline/observed uptime pair,
 baseline/observed boot times, validation status, wait/timeout data, operator decision, and the
 latest error. `summary.md` separates confirmed, unverified/forced, timeout, initiation-error,
 skipped, and not-started-after-abort restarts. A confirmed boot-time gate proves OS reboot and

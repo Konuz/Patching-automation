@@ -398,13 +398,55 @@ Assert-Equal -Actual (Get-ObjectPropertyValue -InputObject (@($retryRecords)[0])
 $sleepDurations = New-Object System.Collections.Generic.List[int]
 $waitItem = [pscustomobject]@{
     Sequence = 1; VMName = 'VM01'; ProcessId = 44; RebootReason = 'Reported after apply'; BatchNumber = 1
-    BootTimeBaseline = $baseTime; BootTimeObserved = $baseTime; Confirmed = $false
+    BootTimeBaseline = $baseTime; BootTimeObserved = $baseTime
+    UptimeBaselineSeconds = $null; UptimeObservedSeconds = $null
     AttemptCount = 0; TimeoutCount = 0; LastErrorMessage = $null; ReadTimeoutSeconds = $null
 }
 $boundedWait = Wait-RebootBatchBootTimes -Items @($waitItem) -WaitTimeoutSeconds 1 -PollSeconds 10 -ReadBootTimeScript $neverConfirmReadScript -SleepScript { param($Seconds) $sleepDurations.Add($Seconds) }
 Assert-Equal -Actual $boundedWait.TimedOut -Expected $true -Message 'boot time wait honors the timeout deadline'
 Assert-Equal -Actual (@($sleepDurations | Where-Object { $_ -gt 1 }).Count) -Expected 0 -Message 'boot time polling never sleeps past the timeout'
 Assert-Equal -Actual $waitItem.ReadTimeoutSeconds -Expected 1 -Message 'boot time read receives remaining timeout budget'
+
+# Grace period: the first read is deferred, the observation budget starts afterwards, and the
+# uptime pair travels from the read into the record.
+$graceSleeps = New-Object System.Collections.Generic.List[int]
+$graceReadCount = New-Object System.Collections.Generic.List[string]
+$graceItem = [pscustomobject]@{
+    Sequence = 1; VMName = 'VM01'; ProcessId = 44; RebootReason = 'Reported after apply'; BatchNumber = 1
+    BootTimeBaseline = $baseTime; BootTimeObserved = $baseTime
+    UptimeBaselineSeconds = 900; UptimeObservedSeconds = 900
+    AttemptCount = 0; TimeoutCount = 0; LastErrorMessage = $null; ReadTimeoutSeconds = $null
+}
+$graceReadScript = {
+    param($Items)
+    $graceReadCount.Add('read')
+    return @($Items | ForEach-Object { [pscustomobject]@{ VMName = $_.VMName; BootTimeUtc = $newTime; UptimeSeconds = 12; Error = $null } })
+}
+$graceWait = Wait-RebootBatchBootTimes -Items @($graceItem) -WaitTimeoutSeconds 60 -PollSeconds 5 -GraceSeconds 90 -ReadBootTimeScript $graceReadScript -SleepScript { param($Seconds) $graceSleeps.Add($Seconds) }
+Assert-Equal -Actual $graceSleeps.Count -Expected 1 -Message 'grace period sleeps exactly once before the first read'
+Assert-Equal -Actual $graceSleeps[0] -Expected 90 -Message 'grace period sleeps for the requested time'
+Assert-Equal -Actual $graceReadCount.Count -Expected 1 -Message 'grace period defers the first read without repeating it'
+Assert-Equal -Actual $graceWait.Records.Count -Expected 1 -Message 'grace period leaves the observation budget intact'
+Assert-Equal -Actual (Get-ObjectPropertyValue -InputObject (@($graceWait.Records)[0]) -Path @('uptimeBaselineSeconds')) -Expected 900 -Message 'confirmed record keeps the baseline uptime'
+Assert-Equal -Actual (Get-ObjectPropertyValue -InputObject (@($graceWait.Records)[0]) -Path @('uptimeObservedSeconds')) -Expected 12 -Message 'confirmed record captures the observed uptime'
+
+# A read that does not report uptime at all must stay a valid confirmation - uptime is diagnostic.
+$noUptimeItem = [pscustomobject]@{
+    Sequence = 1; VMName = 'VM01'; ProcessId = 44; RebootReason = 'Reported after apply'; BatchNumber = 1
+    BootTimeBaseline = $baseTime; BootTimeObserved = $baseTime
+    UptimeBaselineSeconds = $null; UptimeObservedSeconds = $null
+    AttemptCount = 0; TimeoutCount = 0; LastErrorMessage = $null; ReadTimeoutSeconds = $null
+}
+$noUptimeWait = Wait-RebootBatchBootTimes -Items @($noUptimeItem) -WaitTimeoutSeconds 60 -PollSeconds 5 -ReadBootTimeScript { param($Items) @($Items | ForEach-Object { [pscustomobject]@{ VMName = $_.VMName; BootTimeUtc = $newTime; Error = $null } }) } -SleepScript { param($Seconds) $null = $Seconds }
+Assert-Equal -Actual (Get-ObjectPropertyValue -InputObject (@($noUptimeWait.Records)[0]) -Path @('validationStatus')) -Expected 'Confirmed' -Message 'missing uptime does not block confirmation'
+Assert-Equal -Actual (Get-ObjectPropertyValue -InputObject (@($noUptimeWait.Records)[0]) -Path @('uptimeObservedSeconds')) -Expected $null -Message 'missing uptime is recorded as null'
+
+# RETRY must not pay the grace again: the batch has already been down for a full timeout period.
+Reset-RebootTestState
+$graceCoordinatorSleeps = New-Object System.Collections.Generic.List[int]
+$graceRetryRecords = @(Invoke-RebootBatchCoordinator -RebootTargets @($abortTargets[0]) -BatchSize 1 -WaitTimeoutSeconds 0 -PollSeconds 1 -GraceSeconds 90 -ReadBootTimeScript $retryReadScript -InitiateRebootScript $successInitiateScript -DecisionPromptScript $retryDecisionScript -SleepScript { param($Seconds) $graceCoordinatorSleeps.Add($Seconds) })
+Assert-Equal -Actual (@($graceCoordinatorSleeps | Where-Object { $_ -eq 90 }).Count) -Expected 1 -Message 'grace is paid once per batch, not once per retry'
+Assert-Equal -Actual (Get-ObjectPropertyValue -InputObject (@($graceRetryRecords)[0]) -Path @('validationStatus')) -Expected 'Confirmed' -Message 'grace does not change the retry outcome'
 
 $pollGuardThrew = $false
 try {

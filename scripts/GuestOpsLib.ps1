@@ -669,7 +669,8 @@ function Invoke-VMGuestBootTimeRead {
         [string]$GuestWorkingDirectory,
         [string]$BootTimeHelperPath,
         [int]$TimeoutSeconds = 120,
-        [int]$PollSeconds = 5
+        [int]$PollSeconds = 5,
+        [switch]$SkipHelperUpload
     )
 
     $vm = Get-ExactVM -Name $VMName
@@ -707,14 +708,20 @@ function Invoke-VMGuestBootTimeRead {
         # burn most of a poll interval per attempt just noticing that a one-second job is done.
         $shortOperationPollSeconds = [int][math]::Max(1, [math]::Min(5, $PollSeconds))
 
-        $mkdirProcessId = New-GuestDirectory -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -DirectoryPath $GuestWorkingDirectory
-        $mkdirTimeoutSeconds = [int][math]::Min(120, (& $getRemainingSeconds))
-        $mkdirResult = Wait-GuestProcess -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -ProcessId $mkdirProcessId -TimeoutSeconds $mkdirTimeoutSeconds -PollSeconds $shortOperationPollSeconds
-        if (-not $mkdirResult.Completed -or ($null -ne $mkdirResult.ExitCode -and $mkdirResult.ExitCode -ne 0)) {
-            throw ('Failed to create guest working directory. Completed={0}; ExitCode={1}' -f $mkdirResult.Completed, $mkdirResult.ExitCode)
-        }
+        # The working directory and the helper survive a reboot - it is the same ProgramData path
+        # the WUA agent uses - so re-creating and re-uploading them on every observation round is
+        # pure waste on the data plane. The caller drops the switch again after any failed read,
+        # so a guest that lost the file self-heals on the next attempt.
+        if (-not $SkipHelperUpload) {
+            $mkdirProcessId = New-GuestDirectory -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -DirectoryPath $GuestWorkingDirectory
+            $mkdirTimeoutSeconds = [int][math]::Min(120, (& $getRemainingSeconds))
+            $mkdirResult = Wait-GuestProcess -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -ProcessId $mkdirProcessId -TimeoutSeconds $mkdirTimeoutSeconds -PollSeconds $shortOperationPollSeconds
+            if (-not $mkdirResult.Completed -or ($null -ne $mkdirResult.ExitCode -and $mkdirResult.ExitCode -ne 0)) {
+                throw ('Failed to create guest working directory. Completed={0}; ExitCode={1}' -f $mkdirResult.Completed, $mkdirResult.ExitCode)
+            }
 
-        Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $BootTimeHelperPath -GuestPath $guestHelperPath -TimeoutSeconds (& $getRemainingSeconds)
+            Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $BootTimeHelperPath -GuestPath $guestHelperPath -TimeoutSeconds (& $getRemainingSeconds)
+        }
 
         $queryProcessId = Start-GuestBootTimeQuery -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -BootTimeHelperPath $guestHelperPath -OutputPath $guestOutputPath
         $queryTimeoutSeconds = & $getRemainingSeconds
@@ -744,9 +751,13 @@ function Invoke-VMGuestBootTimeRead {
             $bootTimeUtc = [datetime]::Parse($bootTimeUtcText, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal)
         }
 
+        $uptimeSecondsValue = Get-ObjectPropertyValue -InputObject $parsed -Path @('uptimeSeconds')
+        $uptimeSeconds = if ($null -eq $uptimeSecondsValue) { $null } else { [int]$uptimeSecondsValue }
+
         return [pscustomobject]@{
             VMName = $VMName
             BootTimeUtc = $bootTimeUtc
+            UptimeSeconds = $uptimeSeconds
         }
     }
     finally {

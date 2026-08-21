@@ -159,7 +159,10 @@ Krok po kroku:
    przejście przez `CONTINUE`.
 
    Czas oczekiwania jednej paczki określa `-RebootTimeoutMinutes` (domyślnie 30), a częstotliwość
-   odpytywania — `-PollSeconds`. Po timeoucie operator wybiera `RETRY` (bez ponownego restartu),
+   odpytywania — `-PollSeconds`. Pierwszy odczyt po wysłaniu restartu jest odkładany o ok. 90
+   sekund, bo wcześniej maszyna i tak nie może zgłosić nowszego czasu startu. Odczyty idą
+   sekwencyjnie z procesu narzędzia, bez osobnych zadań i bez dodatkowych sesji vCenter.
+   Po timeoucie operator wybiera `RETRY` (bez ponownego restartu),
    `CONTINUE` (wymuszone, niezweryfikowane przejście) albo `ABORT`. Te decyzje są wymagane także
    przy braku wartości bazowej lub błędzie inicjacji; błąd wysłania restartu nie jest automatycznie
    ponawiany. `CONTINUE` i `ABORT` pozostawiają ślad w raporcie i kończą przebieg kodem 1.
@@ -184,7 +187,7 @@ Krok po kroku:
 | `-PatchPlanPath .\out\<run>\patch-plan.json` | Wznów z zapisanego planu. |
 | `-ThrottleLimit <n>` | Ile VM przetwarzać równolegle (domyślnie 3). |
 | `-RebootTimeoutMinutes <n>` | Maksymalny czas potwierdzania każdej paczki rebootu (domyślnie 30 minut). |
-| `-PollSeconds <n>` | Odstęp między odczytami boot time podczas oczekiwania na reboot. |
+| `-PollSeconds <n>` | Odstęp odpytywania procesów gościa w fazach discovery i apply oraz odczytów boot time podczas oczekiwania na reboot (domyślnie 15). |
 | `-SkipConfirmation` | Pomiń pytanie o plan (**nie** pomija promptu o restart). |
 | `-SkipStaticChecks` | Pomiń lokalne testy przed uruchomieniem. |
 | `-IgnoreVCenterCertificate` | Zignoruj błąd certyfikatu vCenter. |
@@ -222,7 +225,7 @@ Zawartość katalogu przebiegu:
 | `patch-plan.json` | Plan per-VM (co, gdzie, co pominięte). |
 | `apply-results.json` | Wynik instalacji per-VM. |
 | `summary.md`, `summary.csv` | Raport końcowy dla człowieka. |
-| `reboot-actions.json` | Wynik restartów: paczka, baseline/observed boot time, status walidacji, decyzja operatora i błędy. |
+| `reboot-actions.json` | Wynik restartów: paczka, baseline/observed boot time i uptime, status walidacji, decyzja operatora i błędy. |
 | `NNN-<vm>\status.json`, `agent.log` | Surowe artefakty agenta z każdej maszyny. |
 
 `status.json` i `agent.log` to podstawowe źródło do diagnostyki, jeśli coś pójdzie nie tak na

@@ -195,51 +195,6 @@ function Get-GuestRebootJobScript {
     }
 }
 
-function Get-GuestBootTimeJobScript {
-    return {
-        param($JobInput)
-
-        Set-StrictMode -Version 2.0
-        $ErrorActionPreference = 'Stop'
-
-        $connections = @()
-        try {
-            Import-Module VMware.VimAutomation.Core -ErrorAction Stop
-            if ($JobInput.IgnoreVCenterCertificate) {
-                Set-PowerCLIConfiguration -Scope Session -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
-            }
-            . $JobInput.GuestOpsLibPath
-
-            $connections = @(Connect-VIServersWithCredentialMap -VIServers @($JobInput.VIServers) -CredentialMap $JobInput.VIServerCredentialMap)
-            $guestAuth = New-GuestAuthentication -Credential $JobInput.GuestCredential
-            $bootTime = Invoke-VMGuestBootTimeRead -VMName $JobInput.VMName -Managers $null -GuestAuth $guestAuth -CurlPath $JobInput.CurlPath -GuestWorkingDirectory $JobInput.GuestWorkingDirectory -BootTimeHelperPath $JobInput.BootTimeHelperPath -TimeoutSeconds $JobInput.TimeoutSeconds -PollSeconds $JobInput.PollSeconds
-
-            return [pscustomobject]@{
-                Sequence = $JobInput.Sequence
-                VMName = $JobInput.VMName
-                BootTimeUtc = $bootTime.BootTimeUtc
-                Error = $null
-            }
-        }
-        catch {
-            return [pscustomobject]@{
-                Sequence = $JobInput.Sequence
-                VMName = $JobInput.VMName
-                BootTimeUtc = $null
-                Error = $_.Exception.Message
-            }
-        }
-        finally {
-            if ($connections.Count -gt 0) {
-                try {
-                    Disconnect-VIServer -Server $connections -Confirm:$false | Out-Null
-                }
-                catch { }
-            }
-        }
-    }
-}
-
 function Get-SafeFileName {
     param([string]$Value)
     return ($Value -replace '[^a-zA-Z0-9_.-]', '_')
@@ -813,38 +768,47 @@ function Invoke-GuestRebootPhase {
         }
     }
 
-    $readJobScript = Get-GuestBootTimeJobScript
     $restartJobScript = Get-GuestRebootJobScript
 
+    # Boot-time reads run in this process, against the vCenter connection the orchestrator already
+    # holds. A child job would re-import PowerCLI and log in to vCenter once per VM per polling
+    # round - tens of seconds of startup wrapped around a few seconds of real work - so sequential
+    # in-process reads finish a batch sooner than parallel jobs and leave no extra vCenter sessions
+    # behind. PowerCLI exposes no supported way to hand a live session to a child process.
+    $helperUploadedByVm = @{}
     $readBootTimeScript = {
         param($Items)
-        $jobInputs = @()
-        # TimeoutSeconds bounds the work *inside* the guest, but the job must import PowerCLI
-        # and connect to vCenter before that budget starts ticking. Giving the job the same
-        # number would kill it before the read even begins, so the outer timeout is the largest
-        # inner budget plus startup headroom - and it takes the max, so no item is cut short.
-        $jobStartupHeadroomSeconds = 120
-        $maxItemTimeoutSeconds = 1
+        $results = @()
         foreach ($item in @($Items)) {
+            $vmName = [string]$item.VMName
             $timeoutSeconds = if ($null -eq $item.ReadTimeoutSeconds) { 120 } else { [int][math]::Max(1, [math]::Min(120, $item.ReadTimeoutSeconds)) }
-            $maxItemTimeoutSeconds = [int][math]::Max($maxItemTimeoutSeconds, $timeoutSeconds)
-            $jobInputs += [pscustomobject]@{
-                Sequence = $item.Sequence
-                VMName = $item.VMName
-                VIServers = @($VIServers)
-                VIServerCredentialMap = $VIServerCredentialMap
-                GuestCredential = $GuestCredentialMap[$item.VMName]
-                IgnoreVCenterCertificate = [bool]$IgnoreVCenterCertificate
-                GuestOpsLibPath = $GuestOpsLibPath
-                CurlPath = $CurlPath
-                GuestWorkingDirectory = $GuestWorkingDirectory
-                BootTimeHelperPath = $bootTimeHelperPath
-                TimeoutSeconds = $timeoutSeconds
-                PollSeconds = $PollSeconds
+            try {
+                $guestAuth = New-GuestAuthentication -Credential $GuestCredentialMap[$vmName]
+                $bootTime = Invoke-VMGuestBootTimeRead -VMName $vmName -Managers $null -GuestAuth $guestAuth -CurlPath $CurlPath -GuestWorkingDirectory $GuestWorkingDirectory -BootTimeHelperPath $bootTimeHelperPath -TimeoutSeconds $timeoutSeconds -PollSeconds $PollSeconds -SkipHelperUpload:([bool]$helperUploadedByVm[$vmName])
+                $helperUploadedByVm[$vmName] = $true
+                $results += [pscustomobject]@{
+                    Sequence = $item.Sequence
+                    VMName = $vmName
+                    BootTimeUtc = $bootTime.BootTimeUtc
+                    UptimeSeconds = $bootTime.UptimeSeconds
+                    Error = $null
+                }
+            }
+            catch {
+                # Without a job around each read, one guest throwing would end the whole phase, so
+                # every failure has to become this VM's transient error instead. It also re-arms the
+                # upload: a guest that lost the helper must not stay locked into skipping it.
+                $helperUploadedByVm[$vmName] = $false
+                $results += [pscustomobject]@{
+                    Sequence = $item.Sequence
+                    VMName = $vmName
+                    BootTimeUtc = $null
+                    UptimeSeconds = $null
+                    Error = $_.Exception.Message
+                }
             }
         }
-        $jobTimeoutSeconds = $maxItemTimeoutSeconds + $jobStartupHeadroomSeconds
-        return @(Invoke-ThrottledJobs -Items $jobInputs -ThrottleLimit $ThrottleLimit -JobTimeoutSeconds $jobTimeoutSeconds -ScriptBlock $readJobScript)
+        return @($results)
     }
 
     $initiateRebootScript = {
@@ -860,7 +824,6 @@ function Invoke-GuestRebootPhase {
                 GuestCredential = $GuestCredentialMap[$item.VMName]
                 IgnoreVCenterCertificate = [bool]$IgnoreVCenterCertificate
                 GuestOpsLibPath = $GuestOpsLibPath
-                VMOutputDirectory = ''
             }
         }
         return @(Invoke-ThrottledJobs -Items $jobInputs -ThrottleLimit $ThrottleLimit -JobTimeoutSeconds 300 -ScriptBlock $restartJobScript)
@@ -1190,6 +1153,12 @@ $curlPath = Assert-LocalPrerequisites -LocalAgentPath $AgentPath
 Import-Module VMware.VimAutomation.Core -ErrorAction Stop
 
 Set-PowerCLIConfiguration -Scope User -ParticipateInCEIP $false -Confirm:$false | Out-Null
+
+# PowerCLI defaults to a 300s web operation timeout. Boot-time reads run in this process and get
+# at most a 120s budget, but that budget is only checked between GuestOps steps - so a single
+# hung SOAP call would outlive the whole read and stall the reboot batch. Every call this tool
+# makes is a short, server-side-filtered query, so 60s is generous for all of them.
+Set-PowerCLIConfiguration -Scope Session -WebOperationTimeoutSeconds 60 -Confirm:$false | Out-Null
 
 if ($IgnoreVCenterCertificate) {
     Set-PowerCLIConfiguration -Scope Session -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
