@@ -281,8 +281,13 @@ if ($existingScripts.ContainsKey($guestOpsLibPath)) {
     Assert-NoReservedVariableName -Ast $guestOpsLibAst -RelativePath $guestOpsLibPath -ReservedNames $reservedVariableNames
     Assert-NoOrphanedBranchKeyword -Ast $guestOpsLibAst -RelativePath $guestOpsLibPath
     Assert-TextDoesNotMatch -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
-    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Invoke-VMAgentCycle'
-    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Invoke-GuestAgentRun'
+    # The agent cycle is the three phases the fleet drives. Invoke-VMAgentCycle and
+    # Invoke-GuestAgentRun were their single-shot predecessors; they lost their last caller
+    # when discovery and apply moved in-process, and needles demanding their names were
+    # keeping dead code alive.
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Start-VMAgentCycle'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Test-VMAgentCycleComplete'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Complete-VMAgentCycle'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'New-GuestAuthentication'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Get-ObjectPropertyValue'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'StartProgramInGuest'
@@ -461,7 +466,9 @@ if ($existingScripts.ContainsKey($runtimeHelperPath)) {
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Write-RebootActionArtifacts'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'reboot-actions.json'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Invoke-InProcessAgentFleet'
-    Assert-TextDoesNotMatch -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Pattern '(?i)\bRead-Host\b' -Reason 'runtime coordination must stay free of interactive prompts'
+    # AST, not text: the rule is "no interactive prompt is called from here", which a comment
+    # explaining why the prompt lives elsewhere must not trip.
+    Assert-NoForbiddenCommand -Ast $runtimeHelperAst -RelativePath $runtimeHelperPath -ForbiddenNames @('Read-Host')
 }
 
 if ($existingScripts.ContainsKey($launcherPath)) {

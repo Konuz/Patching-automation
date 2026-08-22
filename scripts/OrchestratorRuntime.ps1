@@ -213,6 +213,9 @@ function Invoke-InProcessAgentFleet {
                     $timeoutPayload = & $CompleteScript $entry.Handle
                 }
                 catch {
+                    # Say why the harvest failed. Swallowing it silently would leave a timed
+                    # out VM with no payload and no explanation of what went wrong fetching it.
+                    Write-Warning ('Could not collect artifacts for {0} after its timeout: {1}' -f (Get-RuntimePropertyValue -InputObject $entry.Item -Name 'VMName'), $_.Exception.Message)
                     $timeoutPayload = $null
                 }
 
@@ -251,7 +254,9 @@ function Invoke-InProcessAgentFleet {
 function Test-IsTerminalAgentOutcome {
     param([string]$Outcome)
 
-    return ($Outcome -in @('InstallSucceeded', 'InstallSucceededWithErrors', 'InstallFailed', 'DownloadFailed', 'NoSelectedUpdates', 'NoApplicableUpdates', 'SearchOnly'))
+    # Apply outcomes only. 'SearchOnly' belongs to discovery, which has its own record
+    # builder, so accepting it here would only ever mask a mismatched status.json.
+    return ($Outcome -in @('InstallSucceeded', 'InstallSucceededWithErrors', 'InstallFailed', 'DownloadFailed', 'NoSelectedUpdates', 'NoApplicableUpdates'))
 }
 
 function New-ApplyResultFromCycle {
@@ -264,9 +269,8 @@ function New-ApplyResultFromCycle {
     # orchestrator ends in exit and cannot be dot-sourced by the offline tests. It uses
     # Get-ObjectPropertyValue from GuestOpsLib, which both the orchestrator and the runtime
     # test harness dot-source before this file.
-    $cycle = $Cycle
-    $status = Get-RuntimePropertyValue -InputObject $cycle -Name 'Status'
-    $agentResult = Get-RuntimePropertyValue -InputObject $cycle -Name 'AgentResult'
+    $status = Get-RuntimePropertyValue -InputObject $Cycle -Name 'Status'
+    $agentResult = Get-RuntimePropertyValue -InputObject $Cycle -Name 'AgentResult'
     $outcome = Get-ObjectPropertyValue -InputObject $status -Path @('outcome')
     $finishedAt = [string](Get-ObjectPropertyValue -InputObject $status -Path @('finishedAt'))
     $installResult = Get-ObjectPropertyValue -InputObject $status -Path @('installResult', 'result')
@@ -582,7 +586,9 @@ function Get-PatchRoundDecision {
         $CompletionStates,
         [int]$Round,
         [int]$MaxRounds,
-        [string]$OperatorDecision
+        [string]$OperatorDecision,
+        [bool]$ExplicitSelectionOnly = $false,
+        [bool]$NonInteractive = $false
     )
 
     $states = @($CompletionStates)
@@ -626,6 +632,29 @@ function Get-PatchRoundDecision {
             NeedsOperatorDecision = $false
             PendingVMNames = $pendingVMNames
             Reason = ('Stopping after round {0}: MaxPatchRounds is {1}.' -f $Round, $MaxRounds)
+        }
+    }
+
+    # Both of these stop before the prompt rather than at it. Everything past this point
+    # needs an operator, and a run that cannot produce one must end with an exit code
+    # instead of blocking forever on Read-Host.
+    if ($ExplicitSelectionOnly) {
+        return [pscustomobject]@{
+            Action = 'Stop'
+            AllGreen = $false
+            NeedsOperatorDecision = $false
+            PendingVMNames = $pendingVMNames
+            Reason = 'Stopping after the first round: -SelectedUpdateKeys names revisions that do not appear in a later round, so there is nothing to carry forward.'
+        }
+    }
+
+    if ($NonInteractive) {
+        return [pscustomobject]@{
+            Action = 'Stop'
+            AllGreen = $false
+            NeedsOperatorDecision = $false
+            PendingVMNames = $pendingVMNames
+            Reason = 'Stopping with updates still pending: -SkipConfirmation leaves nobody to answer whether to run another round.'
         }
     }
 

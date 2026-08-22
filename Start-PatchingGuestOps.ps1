@@ -9,12 +9,16 @@ param(
     [int]$MaxUpdates = 1,
     [string]$InstallSelection,
     [string[]]$SelectedUpdateKeys,
+    # No defaults here on purpose: these three are forwarded only when actually typed, so a
+    # default written here would advertise a value the orchestrator never receives.
+    # ThrottleLimit defaults to the whole target list and MaxPatchRounds to 3, both resolved
+    # in scripts\Invoke-GuestOpsPatchValidation.ps1.
     [ValidateRange(1, 2147483647)]
-    [int]$ThrottleLimit = 3,
+    [int]$ThrottleLimit,
     [ValidateRange(1, 2147483647)]
     [int]$RebootBatchSize,
     [ValidateRange(1, 2147483647)]
-    [int]$MaxPatchRounds = 3,
+    [int]$MaxPatchRounds,
     [int]$TimeoutMinutes = 180,
     [ValidateRange(1, 2147483647)]
     [int]$RebootTimeoutMinutes = 30,

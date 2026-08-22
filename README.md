@@ -62,8 +62,12 @@ Potrzebne poświadczenia (skrypt o nie zapyta, jeśli ich nie podasz):
 # VM rozproszone po kilku vCenter:
 .\Start-PatchingGuestOps.ps1 -VIServer 'vc01;vc02;vc03' -VMNames vm1,vm2,vm3
 
-# Wiele maszyn z pliku, 2 równolegle:
-.\Start-PatchingGuestOps.ps1 -VMListPath .\vms.txt -ThrottleLimit 2
+# Wiele maszyn z pliku — discovery i apply obejmują domyślnie wszystkie naraz,
+# restart idzie po 2 maszyny na paczkę:
+.\Start-PatchingGuestOps.ps1 -VMListPath .\vms.txt -RebootBatchSize 2
+
+# Ograniczenie równoległości apply bez zmiany promienia rażenia restartu:
+.\Start-PatchingGuestOps.ps1 -VMListPath .\vms.txt -ThrottleLimit 5 -RebootBatchSize 1
 
 # Bez interaktywnego wyboru — wskaż grupy po kluczu UpdateID|RevisionNumber:
 .\Start-PatchingGuestOps.ps1 -SelectedUpdateKeys '<UpdateID>|<RevisionNumber>'
@@ -153,7 +157,8 @@ Krok po kroku:
 8. **Restart** — jeśli któraś maszyna zgłosi `rebootRequired` po apply albo już w discovery miała
    `pendingRebootBefore.isPending=true`, skrypt pokazuje listę i prosi o wpisanie **`REBOOT`**
    (samo `-SkipConfirmation` tego promptu **nie** pomija). Restart idzie przez GuestOps.
-   Cele są dzielone na stałe paczki po `-ThrottleLimit`; kolejna paczka startuje dopiero po
+   Cele są dzielone na stałe paczki po `-RebootBatchSize` (gdy go nie podasz, skrypt zapyta
+   o rozmiar zaraz po `REBOOT`; Enter oznacza 1); kolejna paczka startuje dopiero po
    potwierdzeniu, że każda VM z poprzedniej paczki **z odczytaną wartością bazową** zgłosiła
    `LastBootUpTime` bezwzględnie nowszy od tej wartości — chyba że operator świadomie wymusił
    przejście przez `CONTINUE`.
@@ -167,9 +172,23 @@ Krok po kroku:
    przy braku wartości bazowej lub błędzie inicjacji; błąd wysłania restartu nie jest automatycznie
    ponawiany. `CONTINUE` i `ABORT` pozostawiają ślad w raporcie i kończą przebieg kodem 1.
 
-> `-ThrottleLimit > 1` określa równoległość wewnątrz jednej paczki rebootu, ale nie pozwala
-> rozpocząć następnej paczki przed przejściem bramki boot time. Discovery i apply zachowują swoje
-> dotychczasowe użycie tego limitu.
+> `-RebootBatchSize` określa równoległość wewnątrz jednej paczki rebootu i nie pozwala rozpocząć
+> następnej przed przejściem bramki boot time. `-ThrottleLimit` to osobna gałka — steruje wyłącznie
+> tym, ile VM przechodzi jednocześnie przez discovery i apply.
+
+9. **Kolejna runda** — po potwierdzonym restarcie przebieg wraca do discovery i sprawdza, czy
+   maszyny są już aktualne. „Zielona" znaczy: nie została żadna grupa, którą polityka domyślna by
+   wybrała (sterowniki, preview i optional nie blokują), pomniejszona o grupy, które sam odznaczyłeś.
+   Jeśli coś zostało, skrypt pyta `CONTINUE`/`FINISH` i przy `CONTINUE` patchuje te maszyny
+   ponownie. Limit rund to `-MaxPatchRounds` (domyślnie 3 rundy instalacji plus końcowe discovery
+   weryfikacyjne). Artefakty każdej rundy trafiają do `out\<run>\round-NN\`, a `out\<run>\summary.md`
+   zbiera stan końcowy. Kolejna runda **nie** startuje, jeśli którakolwiek restartowana maszyna nie
+   potwierdziła nowszego czasu startu.
+
+> Przebieg nieinteraktywny: `-SkipConfirmation` sprawia, że po rundzie 1 skrypt kończy pracę
+> zamiast pytać `CONTINUE`/`FINISH`. To samo dzieje się przy `-SelectedUpdateKeys`, bo wskazane
+> klucze zawierają `RevisionNumber`, którego nie ma w grupach kolejnej rundy. W obu wypadkach
+> przebieg kończy się kodem 1, jeśli zostały niezainstalowane aktualizacje.
 
 ---
 
@@ -185,10 +204,12 @@ Krok po kroku:
 | `-SearchOnly` | Tylko skan (bez pobierania/instalacji). |
 | `-PlanOnly` | Zbuduj plan i zakończ (bez instalacji). |
 | `-PatchPlanPath .\out\<run>\patch-plan.json` | Wznów z zapisanego planu. |
-| `-ThrottleLimit <n>` | Ile VM przetwarzać równolegle (domyślnie 3). |
+| `-ThrottleLimit <n>` | Ile VM przechodzi jednocześnie przez discovery i apply (domyślnie: wszystkie z listy celów). |
+| `-RebootBatchSize <n>` | Ile VM restartuje się w jednej paczce (gdy pominiesz — skrypt zapyta, Enter = 1). |
+| `-MaxPatchRounds <n>` | Limit rund instalacji (domyślnie 3). |
 | `-RebootTimeoutMinutes <n>` | Maksymalny czas potwierdzania każdej paczki rebootu (domyślnie 30 minut). |
 | `-PollSeconds <n>` | Odstęp odpytywania procesów gościa w fazach discovery i apply oraz odczytów boot time podczas oczekiwania na reboot (domyślnie 15). |
-| `-SkipConfirmation` | Pomiń pytanie o plan (**nie** pomija promptu o restart). |
+| `-SkipConfirmation` | Pomiń pytanie o plan i zakończ po rundzie 1 zamiast pytać `CONTINUE`/`FINISH` (**nie** pomija promptu o restart ani o rozmiar paczki). |
 | `-SkipStaticChecks` | Pomiń lokalne testy przed uruchomieniem. |
 | `-IgnoreVCenterCertificate` | Zignoruj błąd certyfikatu vCenter. |
 | `-KeepConnected` | Nie rozłączaj się z vCenter po zakończeniu. |
@@ -296,13 +317,14 @@ się je testować offline.
 
 ## Testy
 
-Brak Pester i kroku budowania — są trzy lekkie bramki offline. **Uruchom je po każdej zmianie
+Brak Pester i kroku budowania — są cztery lekkie bramki. **Uruchom je po każdej zmianie
 w plikach `.ps1`:**
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-StaticChecks.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-ModelChecks.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-RuntimeChecks.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-GuestOpsHarnessChecks.ps1
 ```
 
 - **StaticChecks** — pilnuje twardych ograniczeń (zakazane komendy, brak PS7, itd.).
@@ -318,8 +340,9 @@ Launcher odpala te bramki automatycznie przed każdym przebiegiem (chyba że dod
 
 - **Bez WinRM / PSRemoting** — celowo. Zakazane są m.in. `Invoke-Command`, `New-PSSession`,
   `Invoke-VMScript`, `Copy-VMGuestFile` (pilnuje tego StaticChecks).
-- **Tylko PowerShell 5.1** — żadnego `ForEach-Object -Parallel` (to PS7). Równoległość robią
-  zadania (`Start-Job`) sterowane przez `-ThrottleLimit`.
+- **Tylko PowerShell 5.1** — żadnego `ForEach-Object -Parallel` (to PS7). Discovery i apply
+  startują agenta na wszystkich gościach po kolei i odpytują ich z jednej pętli w procesie
+  narzędzia, w jednej sesji vCenter; `Start-Job` został już tylko przy inicjacji restartu.
 - **Agent nigdy sam nie restartuje** — restart zawsze wymaga świadomego wpisania `REBOOT`
   przez operatora.
 - **Failover Cluster = twardy skip** — maszyny klastra trzeba aktualizować ręcznie, węzeł

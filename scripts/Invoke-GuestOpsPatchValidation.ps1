@@ -1246,7 +1246,22 @@ try {
             $scriptExitCode = if ($failedDiscoveryRecords.Count -gt 0) { 1 } else { 0 }
 
             if ($PlanOnly) {
-                $selectedKeysForPlan = if ($SearchOnly) { @() } elseif ($hasExplicitSelectedUpdateKeys) { Resolve-SelectedUpdateKeys -UpdateGroups $updateGroups -ExplicitSelectedUpdateKeys $SelectedUpdateKeys } else { @(@($updateGroups) | Where-Object { $_.selectedByDefault } | ForEach-Object { [string]$_.identityKey }) }
+                # -SearchOnly -PlanOnly is a pure dry run and selects nothing, matching the
+                # old flow. -PlanOnly on its own still asks: the point of a dry-run plan is
+                # to show what the operator's own selection would produce, and quietly
+                # substituting the default policy would hide exactly what they came to see.
+                if ($SearchOnly) {
+                    $selectedKeysForPlan = @()
+                }
+                elseif ($hasExplicitSelectedUpdateKeys) {
+                    $selectedKeysForPlan = Resolve-SelectedUpdateKeys -UpdateGroups $updateGroups -ExplicitSelectedUpdateKeys $SelectedUpdateKeys
+                }
+                elseif ($updateGroups.Count -gt 0) {
+                    $selectedKeysForPlan = Read-UpdateGroupSelection -UpdateGroups $updateGroups
+                }
+                else {
+                    $selectedKeysForPlan = @()
+                }
                 $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
                 $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
                 $patchPlanPath = Join-Path $roundOutputDirectory 'patch-plan.json'
@@ -1258,9 +1273,9 @@ try {
             break
         }
 
-        $roundDecision = Get-PatchRoundDecision -CompletionStates $completionStates -Round $roundNumber -MaxRounds $MaxPatchRounds -OperatorDecision $null
+        $roundDecision = Get-PatchRoundDecision -CompletionStates $completionStates -Round $roundNumber -MaxRounds $MaxPatchRounds -OperatorDecision $null -ExplicitSelectionOnly $hasExplicitSelectedUpdateKeys -NonInteractive ([bool]$SkipConfirmation)
         if ($roundDecision.NeedsOperatorDecision) {
-            $roundDecision = Get-PatchRoundDecision -CompletionStates $completionStates -Round $roundNumber -MaxRounds $MaxPatchRounds -OperatorDecision (Read-ContinuePatchingDecision -CompletionStates $completionStates -Round ($roundNumber - 1))
+            $roundDecision = Get-PatchRoundDecision -CompletionStates $completionStates -Round $roundNumber -MaxRounds $MaxPatchRounds -OperatorDecision (Read-ContinuePatchingDecision -CompletionStates $completionStates -Round ($roundNumber - 1)) -ExplicitSelectionOnly $hasExplicitSelectedUpdateKeys -NonInteractive ([bool]$SkipConfirmation)
         }
 
         if ($roundDecision.Action -ne 'Continue') {
@@ -1271,10 +1286,10 @@ try {
             break
         }
 
-        # Explicit keys are round-one only: they carry a RevisionNumber that will not appear
-        # in a later round's groups, so Resolve-SelectedUpdateKeys would throw on them.
-        $useExplicitKeys = ($hasExplicitSelectedUpdateKeys -and $roundNumber -eq 1)
-        if ($useExplicitKeys) {
+        # Only round one can get here with explicit keys; Get-PatchRoundDecision stops the
+        # loop before round two rather than letting Resolve-SelectedUpdateKeys throw on
+        # revisions that no longer exist.
+        if ($hasExplicitSelectedUpdateKeys) {
             $selectedKeysForPlan = Resolve-SelectedUpdateKeys -UpdateGroups $updateGroups -ExplicitSelectedUpdateKeys $SelectedUpdateKeys
         }
         elseif ($updateGroups.Count -gt 0) {

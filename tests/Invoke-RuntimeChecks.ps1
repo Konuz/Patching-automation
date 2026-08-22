@@ -378,6 +378,25 @@ $roundPending = @(
 Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundPending -Round 1 -MaxRounds 3 -OperatorDecision $null).NeedsOperatorDecision -Expected $false -Message 'round one needs no continue prompt'
 Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundPending -Round 2 -MaxRounds 3 -OperatorDecision $null).Action -Expected 'Ask' -Message 'a later round with pending VMs asks the operator'
 Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundPending -Round 2 -MaxRounds 3 -OperatorDecision 'CONTINUE').Action -Expected 'Continue' -Message 'operator CONTINUE runs another round'
+
+# Explicit -SelectedUpdateKeys cannot survive into a later round: the keys carry a
+# RevisionNumber that will not appear in the next round's groups. Stop rather than fall
+# through to the interactive picker, which a scheduled run cannot answer.
+$explicitDecision = Get-PatchRoundDecision -CompletionStates $roundPending -Round 2 -MaxRounds 3 -OperatorDecision $null -ExplicitSelectionOnly $true
+Assert-Equal -Actual $explicitDecision.Action -Expected 'Stop' -Message 'an explicit key selection ends the run after round one'
+Assert-Equal -Actual $explicitDecision.NeedsOperatorDecision -Expected $false -Message 'an explicit key selection never reaches a prompt'
+Assert-Contains -Text ([string]$explicitDecision.Reason) -Needle 'SelectedUpdateKeys' -Message 'stopping for explicit keys explains itself'
+Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundPending -Round 1 -MaxRounds 3 -OperatorDecision $null -ExplicitSelectionOnly $true).Action -Expected 'Continue' -Message 'explicit keys still drive round one'
+
+# A non-interactive run must end instead of blocking on a question nobody can answer.
+$nonInteractiveDecision = Get-PatchRoundDecision -CompletionStates $roundPending -Round 2 -MaxRounds 3 -OperatorDecision $null -NonInteractive $true
+Assert-Equal -Actual $nonInteractiveDecision.Action -Expected 'Stop' -Message 'a non-interactive run stops rather than asking whether to continue'
+Assert-Equal -Actual $nonInteractiveDecision.NeedsOperatorDecision -Expected $false -Message 'a non-interactive run never reaches a prompt'
+Assert-Equal -Actual $nonInteractiveDecision.AllGreen -Expected $false -Message 'stopping with pending VMs is still not all green'
+Assert-Contains -Text ([string]$nonInteractiveDecision.Reason) -Needle 'SkipConfirmation' -Message 'stopping non-interactively explains itself'
+
+# An all-green non-interactive run must still report success, not be treated as a forced stop.
+Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundGreen -Round 2 -MaxRounds 3 -OperatorDecision $null -NonInteractive $true).AllGreen -Expected $true -Message 'a non-interactive run that reached green reports green'
 Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundPending -Round 2 -MaxRounds 3 -OperatorDecision 'FINISH').Action -Expected 'Stop' -Message 'operator FINISH ends the loop'
 Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundPending -Round 2 -MaxRounds 3 -OperatorDecision 'FINISH').AllGreen -Expected $false -Message 'finishing with pending VMs is not all green'
 
