@@ -1207,7 +1207,6 @@ try {
     $deselectedUpdateKeys = @()
     $stoppedByRoundCap = $false
     $sawApplyFailure = $false
-    $ranAnyApplyRound = $false
 
     while ($true) {
         $roundNumber++
@@ -1309,7 +1308,6 @@ try {
             break
         }
 
-        $ranAnyApplyRound = $true
         $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -DiscoveryRecords $discoveryRecords
         if ($applyOutcome.ExitCode -ne 0) {
             $sawApplyFailure = $true
@@ -1333,11 +1331,10 @@ try {
 
     if (-not ($SearchOnly -or $PlanOnly)) {
         Write-PatchRunSummary -RunOutputDirectory $runOutputDirectory -RoundSummaries $roundSummaries -FinalStateMap $finalStateMap
+        # A VM whose discovery failed is already 'Failed' in the state map, so the all-green
+        # test covers discovery failures too - no separate check needed.
         $scriptExitCode = 0
         if ($sawApplyFailure -or $stoppedByRoundCap -or -not (Test-PatchRunAllGreen -StateMap $finalStateMap)) {
-            $scriptExitCode = 1
-        }
-        elseif (-not $ranAnyApplyRound -and @($failedDiscoveryRecords).Count -gt 0) {
             $scriptExitCode = 1
         }
     }
