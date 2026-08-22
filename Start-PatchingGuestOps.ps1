@@ -91,6 +91,7 @@ if ([string]::IsNullOrWhiteSpace($root)) {
 $staticCheckPath = Resolve-RequiredFile -Root $root -RelativePath 'tests\Invoke-StaticChecks.ps1'
 $modelCheckPath = Resolve-RequiredFile -Root $root -RelativePath 'tests\Invoke-ModelChecks.ps1'
 $runtimeCheckPath = Resolve-RequiredFile -Root $root -RelativePath 'tests\Invoke-RuntimeChecks.ps1'
+$harnessCheckPath = Resolve-RequiredFile -Root $root -RelativePath 'tests\Invoke-GuestOpsHarnessChecks.ps1'
 $orchestratorPath = Resolve-RequiredFile -Root $root -RelativePath 'scripts\Invoke-GuestOpsPatchValidation.ps1'
 $agentPath = Resolve-RequiredFile -Root $root -RelativePath 'guest\Run-LocalPatch.ps1'
 
@@ -113,6 +114,14 @@ if (-not $SkipStaticChecks) {
 
     Write-Host 'Running local runtime checks...'
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runtimeCheckPath
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+
+    # Exercises the real guest agent cycle against a fake vSphere. Skips itself when the
+    # VMware.Vim types are unavailable, so it costs nothing on a machine without PowerCLI.
+    Write-Host 'Running local GuestOps harness checks...'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $harnessCheckPath
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }

@@ -211,9 +211,10 @@ $vmTargetLibPath = 'scripts\VMTargetLib.ps1'
 $modelPath = 'scripts\PatchPlanModel.ps1'
 $modelTestPath = 'tests\Invoke-ModelChecks.ps1'
 $runtimeTestPath = 'tests\Invoke-RuntimeChecks.ps1'
+$harnessTestPath = 'tests\Invoke-GuestOpsHarnessChecks.ps1'
 
 $existingScripts = @{}
-foreach ($relativePath in @($agentPath, $identityHelperPath, $bootTimeHelperPath, $orchestratorPath, $runtimeHelperPath, $guestOpsLibPath, $vmTargetLibPath, $launcherPath, $modelPath, $modelTestPath, $runtimeTestPath)) {
+foreach ($relativePath in @($agentPath, $identityHelperPath, $bootTimeHelperPath, $orchestratorPath, $runtimeHelperPath, $guestOpsLibPath, $vmTargetLibPath, $launcherPath, $modelPath, $modelTestPath, $runtimeTestPath, $harnessTestPath)) {
     $path = Assert-FileExists -RelativePath $relativePath
     if ($path) {
         $existingScripts[$relativePath] = $path
@@ -535,6 +536,24 @@ if ($existingScripts.ContainsKey($runtimeTestPath)) {
     Assert-NoReservedVariableName -Ast $runtimeTestAst -RelativePath $runtimeTestPath -ReservedNames $reservedVariableNames
     Assert-NoOrphanedBranchKeyword -Ast $runtimeTestAst -RelativePath $runtimeTestPath
     Assert-TextContains -RelativePath $runtimeTestPath -Text $runtimeTestText -Needle 'Runtime checks passed.'
+}
+
+if ($existingScripts.ContainsKey($harnessTestPath)) {
+    $harnessTestAst = Get-ScriptAst -RelativePath $harnessTestPath -Path $existingScripts[$harnessTestPath]
+    $harnessTestText = Get-ScriptText -Path $existingScripts[$harnessTestPath]
+
+    Assert-NoForbiddenCommand -Ast $harnessTestAst -RelativePath $harnessTestPath -ForbiddenNames $forbiddenCommands
+    Assert-NoForbiddenCommandLiteral -RelativePath $harnessTestPath -Text $harnessTestText -ForbiddenNames $forbiddenCommands
+    Assert-NoOrphanedBranchKeyword -Ast $harnessTestAst -RelativePath $harnessTestPath
+    Assert-NoReservedVariableName -Ast $harnessTestAst -RelativePath $harnessTestPath -ReservedNames $reservedVariableNames
+    Assert-TextDoesNotMatch -RelativePath $harnessTestPath -Text $harnessTestText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
+    Assert-TextContains -RelativePath $harnessTestPath -Text $harnessTestText -Needle 'Harness checks passed.'
+    # The harness must stay optional: it is the only gate that needs PowerCLI installed.
+    Assert-TextContains -RelativePath $harnessTestPath -Text $harnessTestText -Needle 'Harness checks skipped'
+    # It must exercise the real cycle functions, not a reimplementation of them.
+    Assert-TextContains -RelativePath $harnessTestPath -Text $harnessTestText -Needle 'Start-VMAgentCycle'
+    Assert-TextContains -RelativePath $harnessTestPath -Text $harnessTestText -Needle 'Test-VMAgentCycleComplete'
+    Assert-TextContains -RelativePath $harnessTestPath -Text $harnessTestText -Needle 'Complete-VMAgentCycle'
 }
 
 if ($failures.Count -gt 0) {

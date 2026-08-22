@@ -15,6 +15,7 @@ The committed code is the staged **full GuestOps patch orchestrator**: discovery
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-StaticChecks.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-ModelChecks.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-RuntimeChecks.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-GuestOpsHarnessChecks.ps1
 
 # Full run via the central launcher (prompts for vCenter/VM/credentials; runs local checks first).
 .\Start-PatchingGuestOps.ps1
@@ -49,6 +50,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-RuntimeCh
 ```
 
 There is no build step, no linter, and no Pester. `Invoke-StaticChecks.ps1` is a monolithic AST/text check, and `Invoke-ModelChecks.ps1` is the offline model behavior check — there is no "run one test" subset.
+
+`Invoke-GuestOpsHarnessChecks.ps1` is the odd one out: it runs the **real** `Start-`/`Test-`/`Complete-VMAgentCycle` against a fake vSphere (stubbed `Get-ExactVM`, `Get-VMHostNameForTransfer` and `Invoke-Curl`, plus hand-built process/file managers). It needs the PowerCLI submodules installed for their .NET types — `GuestProgramSpec`, `GuestFileAttributes`, `NamePasswordAuthentication` — but no vCenter, no VM and no ESXi data plane. Without those types it **skips itself and exits 0**, which is why it lives outside `Invoke-RuntimeChecks.ps1`: that gate has to stay runnable anywhere. It covers what unit tests cannot: that a fleet timeout still downloads `status.json`, that a guest which dropped out of vSphere's process list ends its poll instead of spinning, that every transfer carries `--max-time`, and that vSphere is asked about a process once per round rather than twice.
 
 ## Architecture: two planes, runtime scripts, offline model
 

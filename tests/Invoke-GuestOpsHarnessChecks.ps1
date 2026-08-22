@@ -1,0 +1,382 @@
+[CmdletBinding()]
+param(
+    [string]$Root
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+if (-not $Root) {
+    $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+}
+
+# Integration harness for the guest agent cycle: it runs the real Start-/Test-/Complete-
+# VMAgentCycle against a fake vSphere. The PowerCLI submodules only have to be installed for
+# their .NET types (GuestProgramSpec, GuestFileAttributes, NamePasswordAuthentication) - no
+# vCenter, no VM and no ESXi data plane are involved.
+#
+# This lives outside Invoke-RuntimeChecks.ps1 on purpose: that gate must stay runnable on a
+# machine with no PowerCLI at all, and the launcher runs it before every job.
+
+. (Join-Path $Root 'scripts\GuestOpsLib.ps1')
+. (Join-Path $Root 'scripts\OrchestratorRuntime.ps1')
+
+$failures = @()
+
+function Add-Failure {
+    param([string]$Message)
+    $script:failures += $Message
+}
+
+function Assert-Equal {
+    param($Actual, $Expected, [string]$Message)
+
+    if ($Actual -ne $Expected) {
+        Add-Failure -Message ('{0}. Expected: {1}; Actual: {2}' -f $Message, $Expected, $Actual)
+    }
+}
+
+function Assert-Contains {
+    param([string]$Text, [string]$Needle, [string]$Message)
+
+    if ($Text.IndexOf($Needle, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+        Add-Failure -Message ('{0}. Missing: {1}. Text: {2}' -f $Message, $Needle, $Text)
+    }
+}
+
+$hasVimTypes = $false
+try {
+    Import-Module VMware.VimAutomation.Core -ErrorAction Stop 3>$null 4>$null | Out-Null
+    $null = New-Object VMware.Vim.GuestProgramSpec
+    $hasVimTypes = $true
+}
+catch {
+    $hasVimTypes = $false
+}
+
+if (-not $hasVimTypes) {
+    Write-Host 'Harness checks skipped: VMware.Vim types are unavailable on this machine.'
+    exit 0
+}
+
+# --- fake vSphere ---------------------------------------------------------------------
+
+$script:guestState = @{}
+$script:curlCalls = @()
+
+function New-FakeGuest {
+    param(
+        [string]$VMName,
+        [int]$PollsBeforeFinish = 1,
+        $ExitCode = 0,
+        [string]$StatusJson = '{"outcome":"InstallSucceeded","finishedAt":"2026-08-22T10:00:00.0000000Z"}',
+        [switch]$NeverFinishes,
+        [switch]$VanishesFromProcessList,
+        [switch]$FailsToResolve
+    )
+
+    $script:guestState[$VMName] = [pscustomobject]@{
+        VMName = $VMName
+        NextProcessId = 1000
+        PollsRemaining = $PollsBeforeFinish
+        ExitCode = $ExitCode
+        StatusJson = $StatusJson
+        NeverFinishes = [bool]$NeverFinishes
+        VanishesFromProcessList = [bool]$VanishesFromProcessList
+        FailsToResolve = [bool]$FailsToResolve
+        MkdirProcessIds = @{}
+        ListProcessCallCount = 0
+        StartProgramCallCount = 0
+    }
+}
+
+function New-FakeManagers {
+    param([string]$VMName)
+
+    $state = $script:guestState[$VMName]
+
+    $processManager = New-Object psobject
+    $processManager | Add-Member -MemberType NoteProperty -Name State -Value $state
+    $processManager | Add-Member -MemberType ScriptMethod -Name StartProgramInGuest -Value {
+        param($MoRef, $Auth, $Spec)
+        $this.State.StartProgramCallCount++
+        $this.State.NextProcessId++
+        # cmd.exe is the mkdir call; it always finishes at once so the cycle can get past setup.
+        if ([string]$Spec.ProgramPath -like '*cmd.exe') {
+            $this.State.MkdirProcessIds[[string]$this.State.NextProcessId] = $true
+        }
+        return [long]$this.State.NextProcessId
+    }
+    $processManager | Add-Member -MemberType ScriptMethod -Name ListProcessesInGuest -Value {
+        param($MoRef, $Auth, $ProcessIds)
+        $this.State.ListProcessCallCount++
+        $processId = @($ProcessIds)[0]
+
+        if ($this.State.MkdirProcessIds.ContainsKey([string]$processId)) {
+            return @([pscustomobject]@{ Pid = $processId; EndTime = (Get-Date); ExitCode = 0 })
+        }
+
+        if ($this.State.VanishesFromProcessList) {
+            return @()
+        }
+
+        if ($this.State.NeverFinishes) {
+            return @([pscustomobject]@{ Pid = $processId; EndTime = $null; ExitCode = $null })
+        }
+
+        $this.State.PollsRemaining--
+        if ($this.State.PollsRemaining -gt 0) {
+            return @([pscustomobject]@{ Pid = $processId; EndTime = $null; ExitCode = $null })
+        }
+
+        return @([pscustomobject]@{ Pid = $processId; EndTime = (Get-Date); ExitCode = $this.State.ExitCode })
+    }
+
+    $fileManager = New-Object psobject
+    $fileManager | Add-Member -MemberType ScriptMethod -Name InitiateFileTransferToGuest -Value {
+        param($MoRef, $Auth, $GuestPath, $Attributes, $FileSize, $Overwrite)
+        return 'https://*/guestFile?id=1&token=upload'
+    }
+    $fileManager | Add-Member -MemberType ScriptMethod -Name InitiateFileTransferFromGuest -Value {
+        param($MoRef, $Auth, $GuestPath)
+        return [pscustomobject]@{ Url = 'https://*/guestFile?id=1&token=download'; Size = 10 }
+    }
+
+    return [pscustomobject]@{ ProcessManager = $processManager; FileManager = $fileManager }
+}
+
+function New-FakeVMView {
+    param([string]$VMName)
+
+    return [pscustomobject]@{
+        MoRef = ('vm-{0}' -f $VMName)
+        Guest = [pscustomobject]@{ ToolsRunningStatus = 'guestToolsRunning' }
+    }
+}
+
+# Shadow the three functions that would otherwise reach a real vCenter or the ESXi data
+# plane. Everything else - the cycle split, the transfer plumbing, the process polling and
+# the artifact parsing - is the production code.
+function Get-ExactVM {
+    param([string]$Name)
+
+    $state = $script:guestState[$Name]
+    if ($null -eq $state) {
+        throw ('VM not found: {0}' -f $Name)
+    }
+    if ($state.FailsToResolve) {
+        throw ('More than one VM matched exact name: {0}' -f $Name)
+    }
+
+    return [pscustomobject]@{
+        Name = $Name
+        PowerState = 'PoweredOn'
+        ExtensionData = New-FakeVMView -VMName $Name
+    }
+}
+
+function Get-VMHostNameForTransfer {
+    param($VMView)
+    return 'esxi-fake.invalid'
+}
+
+function Invoke-Curl {
+    param(
+        [string]$CurlPath,
+        [string[]]$Arguments,
+        [string]$Description
+    )
+
+    $script:curlCalls += [pscustomobject]@{ Arguments = @($Arguments); Description = $Description }
+
+    $outputIndex = [array]::IndexOf(@($Arguments), '--output')
+    if ($outputIndex -ge 0) {
+        $localPath = @($Arguments)[$outputIndex + 1]
+        $vmName = ($Description -split "'")[0]
+        # Description is "Downloading guest path X to Y"; recover the guest from the local
+        # path instead, which always sits under the per-VM output directory.
+        $ownerName = Split-Path -Leaf (Split-Path -Parent $localPath)
+        $state = $script:guestState[$ownerName]
+        $content = if ($null -eq $state) { '{}' } else { [string]$state.StatusJson }
+        Set-Content -LiteralPath $localPath -Value $content -Encoding UTF8
+    }
+}
+
+function New-HarnessWorkspace {
+    $path = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-harness-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $path | Out-Null
+    return $path
+}
+
+$agentPath = Join-Path $Root 'guest\Run-LocalPatch.ps1'
+$identityHelperPath = Join-Path $Root 'guest\UpdateIdentity.ps1'
+$guestWorkingDirectory = 'C:\ProgramData\PatchingGuestOps'
+
+function New-HarnessFleetScripts {
+    param([string]$Workspace, [int]$TransferTimeoutSeconds = 300)
+
+    # Mirrors Invoke-GuestAgentFleet in the orchestrator. The orchestrator ends in exit so it
+    # cannot be dot-sourced; the functions being exercised below are the real ones.
+    #
+    # GetNewClosure is required here and only here: these scriptblocks outlive this function,
+    # so $Workspace and $TransferTimeoutSeconds would be gone by the time the fleet runs them.
+    # The production ones are inline arguments to a call made from within the frame that owns
+    # their variables, so they resolve dynamically and need no closure.
+    return [pscustomobject]@{
+        StartScript = {
+            param($Item)
+            $auth = New-GuestAuthentication -Credential $Item.Credential
+            return Start-VMAgentCycle -VMName $Item.VMName -Managers (New-FakeManagers -VMName $Item.VMName) -GuestAuth $auth -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -VMOutputDirectory (Join-Path $Workspace $Item.VMName) -MaxUpdates 1 -SearchOnly:([bool]$Item.SearchOnly) -TransferTimeoutSeconds $TransferTimeoutSeconds
+        }.GetNewClosure()
+        PollScript = {
+            param($Handle)
+            $agentResult = Test-VMAgentCycleComplete -Handle $Handle
+            $Handle.AgentResult = $agentResult
+            return ($null -ne $agentResult)
+        }
+        CompleteScript = {
+            param($Handle)
+            return Complete-VMAgentCycle -Handle $Handle -AgentResult $Handle.AgentResult
+        }
+    }
+}
+
+$harnessCredential = New-Object System.Management.Automation.PSCredential('CONTOSO\svc', (ConvertTo-SecureString 'password' -AsPlainText -Force))
+
+function New-HarnessItem {
+    param([int]$Sequence, [string]$VMName, [bool]$SearchOnly = $true)
+
+    return [pscustomobject]@{
+        Sequence = $Sequence
+        VMName = $VMName
+        SearchOnly = $SearchOnly
+        Credential = $harnessCredential
+    }
+}
+
+# --- a healthy fleet ------------------------------------------------------------------
+
+$script:guestState = @{}
+$script:curlCalls = @()
+$workspace = New-HarnessWorkspace
+try {
+    New-FakeGuest -VMName 'VM01' -PollsBeforeFinish 2
+    New-FakeGuest -VMName 'VM02' -PollsBeforeFinish 1
+    New-FakeGuest -VMName 'VM03' -PollsBeforeFinish 3
+
+    $scripts = New-HarnessFleetScripts -Workspace $workspace
+    $items = @(
+        (New-HarnessItem -Sequence 1 -VMName 'VM01'),
+        (New-HarnessItem -Sequence 2 -VMName 'VM02'),
+        (New-HarnessItem -Sequence 3 -VMName 'VM03')
+    )
+
+    $results = @(Invoke-InProcessAgentFleet -Items $items -MaxInFlight 3 -PollSeconds 1 -ItemTimeoutSeconds 120 -StartScript $scripts.StartScript -PollScript $scripts.PollScript -CompleteScript $scripts.CompleteScript -SleepScript { param([int]$Seconds) })
+
+    Assert-Equal -Actual $results.Count -Expected 3 -Message 'harness: fleet returns one result per guest'
+    Assert-Equal -Actual (@($results | Where-Object { $_.Error }).Count) -Expected 0 -Message 'harness: a healthy fleet reports no errors'
+    Assert-Equal -Actual ([string]@($results | Where-Object { $_.VMName -eq 'VM01' })[0].Payload.Status.outcome) -Expected 'InstallSucceeded' -Message 'harness: status.json is downloaded and parsed'
+    Assert-Equal -Actual ([bool]@($results | Where-Object { $_.VMName -eq 'VM01' })[0].Payload.AgentResult.Completed) -Expected $true -Message 'harness: a finished guest reports a completed process result'
+    Assert-Equal -Actual (Test-Path -LiteralPath (Join-Path (Join-Path $workspace 'VM01') 'status.json')) -Expected $true -Message 'harness: status.json lands in the per-VM output directory'
+
+    # Every VM must have been started before the first guest was polled for its agent.
+    Assert-Equal -Actual $script:guestState['VM03'].StartProgramCallCount -Expected 2 -Message 'harness: each guest gets one mkdir and one agent start'
+
+    # The whole point of the poll/complete split: vSphere is asked once per round, not twice.
+    # A second question can come back as "ended, exit code lost" and be read as a failure.
+    $vm02Listens = $script:guestState['VM02'].ListProcessCallCount
+    Assert-Equal -Actual $vm02Listens -Expected 2 -Message 'harness: one mkdir wait plus one agent poll, with no extra question from the completion script'
+
+    # Transfer budgets: nothing else bounds a hung curl now that the job wrapper is gone.
+    $transfersWithoutTimeout = @($script:curlCalls | Where-Object { @($_.Arguments) -notcontains '--max-time' })
+    Assert-Equal -Actual $transfersWithoutTimeout.Count -Expected 0 -Message 'harness: every guest transfer carries --max-time'
+    Assert-Equal -Actual (@($script:curlCalls).Count -gt 0) -Expected $true -Message 'harness: transfers actually happened'
+}
+finally {
+    Remove-Item -LiteralPath $workspace -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- a timeout must still harvest the artifacts ---------------------------------------
+
+$script:guestState = @{}
+$script:curlCalls = @()
+$workspace = New-HarnessWorkspace
+try {
+    New-FakeGuest -VMName 'VM10' -NeverFinishes -StatusJson '{"outcome":"InstallSucceeded","finishedAt":"2026-08-22T10:00:00.0000000Z","installResult":{"result":"Succeeded","rebootRequired":true},"pendingRebootAfter":{"isPending":true}}'
+
+    $scripts = New-HarnessFleetScripts -Workspace $workspace
+    $results = @(Invoke-InProcessAgentFleet -Items @((New-HarnessItem -Sequence 1 -VMName 'VM10' -SearchOnly $false)) -MaxInFlight 1 -PollSeconds 1 -ItemTimeoutSeconds 0 -StartScript $scripts.StartScript -PollScript $scripts.PollScript -CompleteScript $scripts.CompleteScript -SleepScript { param([int]$Seconds) })
+
+    Assert-Equal -Actual $results.Count -Expected 1 -Message 'harness: a timed out guest still yields a result'
+    Assert-Contains -Text ([string]$results[0].Error) -Needle 'timed out' -Message 'harness: the timeout is reported'
+    Assert-Equal -Actual ($null -ne $results[0].Payload) -Expected $true -Message 'harness: a timeout still harvests the payload'
+    Assert-Equal -Actual (Test-Path -LiteralPath (Join-Path (Join-Path $workspace 'VM10') 'status.json')) -Expected $true -Message 'harness: a timeout still leaves status.json on disk for diagnosis'
+
+    # The end of the chain: a guest that really did finish must not be reported as a total
+    # failure just because vSphere never handed back a process result.
+    $applyResult = New-ApplyResultFromCycle -VMName 'VM10' -Cycle $results[0].Payload 3>$null
+    Assert-Equal -Actual $applyResult.outcome -Expected 'InstallSucceeded' -Message 'harness: a harvested terminal status.json outweighs the lost process result'
+    Assert-Equal -Actual $applyResult.rebootRequired -Expected $true -Message 'harness: reboot requirement survives the lost process result'
+}
+finally {
+    Remove-Item -LiteralPath $workspace -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- a guest that dropped out of the process list --------------------------------------
+
+$script:guestState = @{}
+$script:curlCalls = @()
+$workspace = New-HarnessWorkspace
+try {
+    New-FakeGuest -VMName 'VM20' -VanishesFromProcessList
+
+    $scripts = New-HarnessFleetScripts -Workspace $workspace
+    $results = @(Invoke-InProcessAgentFleet -Items @((New-HarnessItem -Sequence 1 -VMName 'VM20' -SearchOnly $false)) -MaxInFlight 1 -PollSeconds 1 -ItemTimeoutSeconds 120 -StartScript $scripts.StartScript -PollScript $scripts.PollScript -CompleteScript $scripts.CompleteScript -SleepScript { param([int]$Seconds) })
+
+    # vSphere forgetting a finished process must end the poll, not spin until the item
+    # timeout. The completed flag is false because the exit code is genuinely unknown.
+    Assert-Equal -Actual $results.Count -Expected 1 -Message 'harness: a vanished process still yields a result'
+    Assert-Equal -Actual ([string]$results[0].Error) -Expected '' -Message 'harness: a vanished process is not an error, it is a finished run with no exit code'
+    Assert-Equal -Actual ([bool]$results[0].Payload.AgentResult.Completed) -Expected $false -Message 'harness: a vanished process reports an unknown completion'
+    Assert-Equal -Actual ([string]$results[0].Payload.Status.outcome) -Expected 'InstallSucceeded' -Message 'harness: the artifacts still decide the outcome'
+}
+finally {
+    Remove-Item -LiteralPath $workspace -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- one guest failing must not take the phase down ------------------------------------
+
+$script:guestState = @{}
+$script:curlCalls = @()
+$workspace = New-HarnessWorkspace
+try {
+    New-FakeGuest -VMName 'VM30' -PollsBeforeFinish 1
+    New-FakeGuest -VMName 'VM31' -FailsToResolve
+    New-FakeGuest -VMName 'VM32' -PollsBeforeFinish 1
+
+    $scripts = New-HarnessFleetScripts -Workspace $workspace
+    $items = @(
+        (New-HarnessItem -Sequence 1 -VMName 'VM30'),
+        (New-HarnessItem -Sequence 2 -VMName 'VM31'),
+        (New-HarnessItem -Sequence 3 -VMName 'VM32')
+    )
+    $results = @(Invoke-InProcessAgentFleet -Items $items -MaxInFlight 3 -PollSeconds 1 -ItemTimeoutSeconds 120 -StartScript $scripts.StartScript -PollScript $scripts.PollScript -CompleteScript $scripts.CompleteScript -SleepScript { param([int]$Seconds) })
+
+    Assert-Equal -Actual $results.Count -Expected 3 -Message 'harness: a failing guest still produces a result row'
+    Assert-Contains -Text ([string]@($results | Where-Object { $_.VMName -eq 'VM31' })[0].Error) -Needle 'More than one VM matched' -Message 'harness: the guest error is carried through'
+    Assert-Equal -Actual (@($results | Where-Object { $_.VMName -ne 'VM31' -and $_.Error }).Count) -Expected 0 -Message 'harness: one unresolvable guest does not poison the rest of the fleet'
+}
+finally {
+    Remove-Item -LiteralPath $workspace -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+if ($failures.Count -gt 0) {
+    Write-Host 'Harness checks failed:'
+    foreach ($failure in $failures) {
+        Write-Host (' - {0}' -f $failure)
+    }
+    exit 1
+}
+
+Write-Host 'Harness checks passed.'
+exit 0
