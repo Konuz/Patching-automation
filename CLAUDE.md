@@ -34,8 +34,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-RuntimeCh
 # Reboot prompt is automatic when any VM reports rebootRequired=true after apply,
 # or had pendingRebootBefore.isPending=true in discovery for this run.
 # The operator must type REBOOT; -SkipConfirmation does not skip this prompt.
-# Reboots run in fixed batches of ThrottleLimit and wait for a newer guest boot time.
-.\Start-PatchingGuestOps.ps1 -VMListPath .\vms.txt -ThrottleLimit 2
+# Reboots run in fixed batches of RebootBatchSize and wait for a newer guest boot time.
+# Discovery and apply default to every VM in the list at once; reboot batching is separate.
+.\Start-PatchingGuestOps.ps1 -VMListPath .\vms.txt -RebootBatchSize 2
+
+# Cap apply concurrency without widening the reboot blast radius:
+.\Start-PatchingGuestOps.ps1 -VMListPath .\vms.txt -ThrottleLimit 5 -RebootBatchSize 1
+
+# Allow more patch rounds than the default 3 (each round is discovery -> apply -> reboot):
+.\Start-PatchingGuestOps.ps1 -VMListPath .\vms.txt -RebootBatchSize 2 -MaxPatchRounds 5
 
 # Run the orchestrator directly, bypassing the launcher:
 .\scripts\Invoke-GuestOpsPatchValidation.ps1 -VIServer '<vc1>;<vc2>' -VMName <vm> -SearchOnly -IgnoreVCenterCertificate
@@ -53,16 +60,80 @@ The hard-won insight (validated empirically, see `spec/spec-patching-guestops.md
 Execution flows through layered runtime scripts plus the offline planning model and tests:
 
 1. **`Start-PatchingGuestOps.ps1`** (root launcher) — prompts for any missing params, runs static + model checks unless `-SkipStaticChecks`, rejects legacy `-InstallSelection` before credential prompts, then splats everything into the orchestrator. `-VIServer` can hold one vCenter or several vCenters separated by semicolons; the launcher normalizes that list and passes through `-VIServerCredential` only when the operator explicitly supplied one. Guest credentials are resolved per VM into a `name -> pscredential` map: one `Get-Credential` prompt per FQDN domain suffix and one per local (no-dot) machine (`Resolve-GuestCredentialMap` + `Get-GuestCredentialGroups`). The VM list therefore holds FQDNs; `Get-ExactVM` resolves each by short name first, then full FQDN. An explicit `-GuestCredential` overrides this for all VMs (non-interactive runs). This is the single entry point; users should never have to call the orchestrator directly.
-2. **`scripts/Invoke-GuestOpsPatchValidation.ps1`** (orchestrator, runs on the stepping stone) — resolves one or many VM targets, connects to one or more semicolon-separated vCenters, runs discovery cycles over GuestOps, builds grouped update records, resolves selection from explicit `-SelectedUpdateKeys` or interactive grouped selection, writes a per-VM patch plan, asks for final confirmation, then applies selected groups. vCenter credentials are resolved into `VIServerCredentialMap`: explicit `-VIServerCredential` applies to every vCenter, otherwise prompts are grouped by FQDN domain and failed vCenter logins retry only that vCenter so the operator can enter local credentials. With `-ThrottleLimit > 1`, child jobs reconnect to the same vCenter list using that credential map and dot-source GuestOps helpers independently. Throttling, apply-result, and reboot-action semantics live in `scripts/OrchestratorRuntime.ps1` and are covered by `tests/Invoke-RuntimeChecks.ps1`; that helper also writes the `reboot-actions.json` artifact and appends the reboot sections to `summary.md`. Keep PowerCLI/GuestOps calls and interactive prompts (`Read-Host`) outside it — its only side effects are local artifact writes. `-PatchPlanPath` resumes from a saved `patch-plan.json`: it skips discovery and group selection, shows the saved plan, asks for confirmation unless `-SkipConfirmation` is set, and runs apply against the selected updates in the plan. After apply, the normal discovery-driven path evaluates reboot targets from both per-VM apply `rebootRequired` and the run's discovery `pendingRebootBefore.isPending`; the `-PatchPlanPath` resume path has no discovery records, so it only uses apply `rebootRequired`. If any VM requires reboot, it shows a separate VM list and requires the operator to type `REBOOT`; `-SkipConfirmation` never skips this reboot prompt. Confirmed reboot is initiated inside the guest through GuestOps by starting `shutdown.exe /r /t 0 /c "PatchingGuestOps reboot after updates"`, limited by the existing `-ThrottleLimit`. The script records `reboot-actions.json` and appends reboot sections to `summary.md`, but it does not wait for shutdown, boot, VMware Tools, or application readiness after reboot.
+2. **`scripts/Invoke-GuestOpsPatchValidation.ps1`** (orchestrator, runs on the stepping stone) — resolves one or many VM targets, connects to one or more semicolon-separated vCenters, runs discovery cycles over GuestOps, builds grouped update records, resolves selection from explicit `-SelectedUpdateKeys` or interactive grouped selection, writes a per-VM patch plan, asks for final confirmation, then applies selected groups. vCenter credentials are resolved into `VIServerCredentialMap`: explicit `-VIServerCredential` applies to every vCenter, otherwise prompts are grouped by FQDN domain and failed vCenter logins retry only that vCenter so the operator can enter local credentials. Discovery and apply run **in this process** as one fleet (see "In-process fleet" below), so a run holds a single vCenter session throughout; `Connect-VIServersWithCredentialMap` also reuses a session that is already connected, which is what makes `-KeepConnected` worth setting. Apply-result, fleet, round-decision and reboot-action semantics live in `scripts/OrchestratorRuntime.ps1` and are covered by `tests/Invoke-RuntimeChecks.ps1`; that helper also writes `reboot-actions.json`, `rounds.json` and the summaries. Keep PowerCLI/GuestOps calls and interactive prompts (`Read-Host`) outside it — its only side effects are local artifact writes. `-PatchPlanPath` resumes from a saved `patch-plan.json`: it skips discovery and group selection, shows the saved plan, asks for confirmation unless `-SkipConfirmation` is set, runs apply against the selected updates in the plan, and stays **single-round** (there is no discovery to judge the starting state from, and the saved keys carry a `RevisionNumber` that will not match a later round's groups). After apply, the normal discovery-driven path evaluates reboot targets from both per-VM apply `rebootRequired` and the run's discovery `pendingRebootBefore.isPending`; the `-PatchPlanPath` resume path has no discovery records, so it only uses apply `rebootRequired`. If any VM requires reboot, it shows a separate VM list and requires the operator to type `REBOOT`; `-SkipConfirmation` never skips this reboot prompt, nor the follow-up prompt for `-RebootBatchSize`. Confirmed reboot is initiated inside the guest through GuestOps by starting `shutdown.exe /r /t 0 /c "PatchingGuestOps reboot after updates"`, limited by `-RebootBatchSize`.
 3. **`scripts/PatchPlanModel.ps1`** (offline model) — pure planning/reporting logic for update identity validation, default group selection, Failover Cluster skips, per-VM patch plans, summaries, and PlanOnly exit semantics. Keep it free of PowerCLI, GuestOps calls, `Read-Host`, and top-level runtime flow.
-4. **`scripts/GuestOpsLib.ps1`** (GuestOps helpers) — shared PowerCLI/GuestOps file transfer and process-run helpers used by direct and throttled apply/discovery cycles.
+4. **`scripts/GuestOpsLib.ps1`** (GuestOps helpers) — shared PowerCLI/GuestOps file transfer and process-run helpers. The guest agent cycle is split into `Start-VMAgentCycle` (upload + `StartProgramInGuest`), `Test-VMAgentCycleComplete` (one `ListProcessesInGuest`) and `Complete-VMAgentCycle` (download + parse); `Invoke-VMAgentCycle` and `Invoke-GuestAgentRun` remain as compositions of the three.
 5. **`guest/Run-LocalPatch.ps1`** (agent, runs *inside* the guest) — WUA COM only: `Microsoft.Update.Session` → searcher → downloader → installer. Writes `status.json` + `agent.log` to the working directory (`C:\ProgramData\PatchingGuestOps`). **Never reboots** — it only reports `pendingReboot`.
 6. **`guest/Read-BootTime.ps1`** (helper, runs *inside* the guest) — reads `Win32_OperatingSystem.LastBootUpTime` and writes a UTC/ISO 8601 result for the reboot validation gate.
 
+### In-process fleet: how discovery and apply run
+
+`StartProgramInGuest` returns a process id without waiting, so discovery and apply start the guest
+agent on every VM in turn and then poll all of them from **one loop in the orchestrator process**,
+against the vCenter session the run already holds. `-ThrottleLimit` bounds how many VMs are in
+flight and **defaults to the whole target list**; it costs GuestOps calls rather than one
+PowerShell host plus a PowerCLI import per VM, which is what capped the old `Start-Job` model at a
+handful of machines. `Start-Job` now survives only in reboot initiation.
+
+`Invoke-InProcessAgentFleet` (`OrchestratorRuntime.ps1`) is the coordinator and takes injected
+start/poll/complete scriptblocks, so it is tested offline. Three consequences are load-bearing:
+
+- **Every step is wrapped per VM.** There is no job boundary, so one guest throwing would otherwise
+  end the whole phase.
+- **Every transfer carries `-TimeoutSeconds`.** `JobTimeoutSeconds` used to bound a hung curl;
+  nothing else does now.
+- **A timed-out item still runs the completion script.** `status.json` is the primary result, the
+  job path always downloaded the artifacts even when the process result timed out, and dropping
+  them would turn a guest run that actually finished into a reported failure. The timeout error is
+  recorded alongside the harvested payload, not instead of it.
+
+Because a fleet starts sequentially, the first VM can finish before the poll loop reaches it and
+fall out of vSphere's short-lived process list. `Test-VMAgentCycleComplete` therefore reports an
+empty process list as "ended, exit code lost" rather than "still running", and
+`New-ApplyResultFromCycle` accepts a terminal `outcome` **plus** a non-empty `finishedAt` as
+authoritative when the process result is missing — the same resolution discovery already used.
+Both halves are required: the agent saves `status.json` eagerly, so an outcome can be present while
+the stage that stamps `finishedAt` never ran.
+
+### Patch rounds
+
+A run repeats **discovery → group selection → plan → confirm → apply → reboot** until every VM is
+green or the operator stops. There is no separate verification phase: round N+1's discovery *is*
+the verification of round N.
+
+- **Green** means "no group the default policy would select (`selectedByDefault`) still applies to
+  this VM" — not "no updates at all". Drivers, preview and optional updates never go away, so
+  counting them would keep the loop running forever. Groups the operator unticked accumulate in a
+  deselected set and stop blocking green (`GreenByOperatorChoice`); that set is matched on the bare
+  `updateId` too, because the identity key carries `RevisionNumber` and a revised package would
+  otherwise resurrect a group that was already refused. A Failover Cluster VM is `Excluded`: never
+  green, never a target.
+- **Another round only starts when every rebooted VM confirmed a newer boot time**
+  (`Test-RebootActionsAllConfirmed`, stricter than `Test-RebootActionsSuccessful`, which tolerates
+  an operator skip). Re-discovering a half-booted guest would either fail or describe a state
+  nobody should act on.
+- Round 1 always reaches group selection even when nothing is preselected, so the operator can
+  still tick something the default policy skipped.
+- Round ≥ 2 always uses the interactive selection. `-SelectedUpdateKeys` is round-one only: its
+  keys carry a `RevisionNumber` that will not appear in a later round's groups.
+- `-MaxPatchRounds` (default 3) counts **apply** rounds; round `MaxPatchRounds + 1` still runs its
+  verification discovery and then stops.
+- Each round writes to `<run>\round-NN\` with the existing artifact names; the run root gets
+  `rounds.json` and an aggregate `summary.md`. This applies to single-round runs too.
+- **Exit code** is 0 only when every VM ends `Green`/`GreenByOperatorChoice`/`Excluded` in the
+  state map **merged across rounds**, every apply succeeded and every reboot was confirmed. The
+  merge matters: later rounds only target VMs that were still pending, so a VM that failed
+  discovery in round 1 is absent from round 2 and reading the verdict off the last round alone
+  would let it vanish. `-SearchOnly`, `-PlanOnly` and `-PatchPlanPath` keep their existing
+  single-pass exit semantics and are not subject to the all-green rule.
+
 ### Reboot batches and boot-time gate
 
-The reboot phase is deliberately separate from discovery and apply throttling semantics. It keeps
-the target order and splits reboot targets into fixed batches of `ThrottleLimit`. Within one batch,
+The reboot phase is deliberately separate from apply concurrency: `-ThrottleLimit` is throughput,
+`-RebootBatchSize` is blast radius. When `-RebootBatchSize` is not supplied the operator is asked
+for it after approving the reboot (Enter = 1); like the `REBOOT` prompt, `-SkipConfirmation` does
+not skip that question, so a non-interactive run passes the value on the command line. The phase
+keeps the target order and splits reboot targets into fixed batches of `RebootBatchSize`. Within one batch,
 baseline `Win32_OperatingSystem.LastBootUpTime` values are read through GuestOps, `shutdown.exe`
 is initiated in parallel, and the next batch is blocked until every VM with a baseline reports a
 strictly newer boot time. The boot-time helper runs inside the VM; no WinRM, PSRemoting,
@@ -76,13 +147,14 @@ that died would otherwise leave the previous attempt's JSON in place and have it
 fresh boot time.
 
 Boot-time reads run **in the orchestrator process**, sequentially over the batch, against the
-vCenter connection the run already holds — unlike discovery, apply, and reboot initiation, which
-use `Start-Job`. A child job would re-import PowerCLI and log in to vCenter once per VM per polling
-round, so sequential in-process reads finish a batch sooner than parallel jobs and leave no extra
-vCenter sessions behind; PowerCLI has no supported way to hand a live session to a child process.
-Two consequences are load-bearing: the read loop must catch per VM (no job boundary to contain a
-throw), and `Set-PowerCLIConfiguration -WebOperationTimeoutSeconds 60` replaces the job timeout as
-the bound on a hung SOAP call, because the read's own budget is only checked between GuestOps steps.
+vCenter connection the run already holds — as do discovery and apply now; only reboot initiation
+still uses `Start-Job`. A child job would re-import PowerCLI and log in to vCenter once per VM per
+polling round, so sequential in-process reads finish a batch sooner than parallel jobs and leave no
+extra vCenter sessions behind; PowerCLI has no supported way to hand a live session to a child
+process. Two consequences are load-bearing: the read loop must catch per VM (no job boundary to
+contain a throw), and `Set-PowerCLIConfiguration -WebOperationTimeoutSeconds 60` replaces the job
+timeout as the bound on a hung SOAP call, because the read's own budget is only checked between
+GuestOps steps.
 
 The gate is **level-triggered**: `LastBootUpTime` is durable state, so a skipped poll delays
 detection but never loses it — polling cadence cannot cause a false positive or a false negative.
@@ -135,6 +207,8 @@ These are not style preferences — the static check **fails the build** on them
 - **Agent must not reference `$x.HResult` directly** — WUA COM objects can lack `HResult` under StrictMode. Go through `Get-OptionalPropertyValue` / `Format-HResult`.
 - **Orchestrator must not use `$kbArticleIds.Count`** — `ConvertFrom-Json` collapses a single KB id to a scalar under StrictMode. Wrap in `@(...)` first.
 - **Orchestrator apply must pass selected updates by `UpdateID|RevisionNumber` keys through `-SelectedUpdateKeys`** — never by display index. Guest argument values are joined into one comma-delimited argument to avoid PowerShell binding extra tokens as positional `SearchCriteria`.
+- **No orphaned `elseif`/`else`** — detaching one from its `if` while restructuring a long flow is *not* a parse error: PowerShell reads it as a call to a command named `elseif`. All three gates stay green and the run dies at runtime with `CommandNotFoundException`, which the top-level catch turns into a bare exit 1. `Assert-NoOrphanedBranchKeyword` scans for it.
+- **No `return` in the orchestrator below the `-PatchPlanPath` branch** — an existing needle forbids dotall-matching any `return` after `IsNullOrWhiteSpace($PatchPlanPath))` to the end of the file, so define new functions above `$targetVMNames = @(Resolve-VMTargetNames ...)` and use `break`/assignments in the round loop.
 - Static checks protect hard constraints and architectural boundaries. Behavior belongs in `Invoke-ModelChecks.ps1` and `Invoke-RuntimeChecks.ps1`; do not add a text needle when a small offline behavior test can cover the rule.
 
 Runtime and model scripts run under `Set-StrictMode -Version 2.0` + `$ErrorActionPreference = 'Stop'`. That is *why* the defensive property-access helpers exist — keep using them rather than touching COM/JSON properties directly.
