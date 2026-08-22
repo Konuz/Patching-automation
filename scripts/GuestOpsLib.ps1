@@ -97,7 +97,9 @@ function Connect-VIServersWithCredentialMap {
         [hashtable]$CredentialMap,
         [scriptblock]$ConnectScript,
         [scriptblock]$CredentialPromptScript,
-        [switch]$RetryOnFailure
+        [scriptblock]$GetExistingConnectionsScript,
+        [switch]$RetryOnFailure,
+        [switch]$ReuseExisting
     )
 
     if ($null -eq $CredentialMap) {
@@ -118,10 +120,51 @@ function Connect-VIServersWithCredentialMap {
         }
     }
 
+    if ($null -eq $GetExistingConnectionsScript) {
+        # Go through Get-Variable rather than reading $global:DefaultVIServers directly:
+        # under StrictMode reading it before PowerCLI has ever connected is a terminating
+        # error, and the offline tests dot-source this file without PowerCLI at all.
+        $GetExistingConnectionsScript = {
+            return @(Get-Variable -Name DefaultVIServers -Scope Global -ValueOnly -ErrorAction SilentlyContinue)
+        }
+    }
+
+    $existingByName = @{}
+    if ($ReuseExisting) {
+        foreach ($existingConnection in @(& $GetExistingConnectionsScript)) {
+            if ($null -eq $existingConnection) {
+                continue
+            }
+
+            $existingName = ([string](Get-ObjectPropertyValue -InputObject $existingConnection -Path @('Name'))).Trim()
+            $isConnected = [bool](Get-ObjectPropertyValue -InputObject $existingConnection -Path @('IsConnected') -DefaultValue $false)
+            if ($isConnected -and -not [string]::IsNullOrWhiteSpace($existingName) -and -not $existingByName.ContainsKey($existingName)) {
+                $existingByName[$existingName] = $existingConnection
+            }
+        }
+    }
+
+    # Two lists, because they answer different questions: $connections is what this run may
+    # use, $openedConnections is what it is allowed to tear down. Disconnecting a session the
+    # caller established before invoking us would kill it out from under them.
     $connections = @()
+    $openedConnections = @()
     foreach ($server in @($VIServers)) {
         $serverName = ([string]$server).Trim()
         if ([string]::IsNullOrWhiteSpace($serverName)) {
+            continue
+        }
+
+        $reusedConnection = $null
+        foreach ($existingName in @($existingByName.Keys)) {
+            if ([string]::Equals($existingName, $serverName, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $reusedConnection = $existingByName[$existingName]
+                break
+            }
+        }
+
+        if ($null -ne $reusedConnection) {
+            $connections += @($reusedConnection)
             continue
         }
 
@@ -136,12 +179,14 @@ function Connect-VIServersWithCredentialMap {
             }
 
             try {
-                $connections += @(& $ConnectScript $serverName $credential)
+                $newConnections = @(& $ConnectScript $serverName $credential)
+                $connections += $newConnections
+                $openedConnections += $newConnections
                 break
             }
             catch {
                 if (-not $RetryOnFailure) {
-                    foreach ($connection in @($connections)) {
+                    foreach ($connection in @($openedConnections)) {
                         try {
                             Disconnect-VIServer -Server $connection -Confirm:$false | Out-Null
                         }
@@ -157,7 +202,10 @@ function Connect-VIServersWithCredentialMap {
         }
     }
 
-    return @($connections)
+    return [pscustomobject]@{
+        Connections = @($connections)
+        OpenedConnections = @($openedConnections)
+    }
 }
 
 function Get-VMHostNameForTransfer {

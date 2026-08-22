@@ -821,7 +821,7 @@ $retryVIServerCredentialMap = @{
 }
 $script:connectAttempts = @{}
 $script:retryPromptMessages = @()
-$retryConnections = @(Connect-VIServersWithCredentialMap -VIServers @('vc01.contoso.com', 'vc02.contoso.com') -CredentialMap $retryVIServerCredentialMap -RetryOnFailure -ConnectScript {
+$retryConnections = @((Connect-VIServersWithCredentialMap -VIServers @('vc01.contoso.com', 'vc02.contoso.com') -CredentialMap $retryVIServerCredentialMap -RetryOnFailure -ConnectScript {
     param($Server, $Credential)
     if (-not $script:connectAttempts.ContainsKey($Server)) {
         $script:connectAttempts[$Server] = 0
@@ -840,7 +840,7 @@ $retryConnections = @(Connect-VIServersWithCredentialMap -VIServers @('vc01.cont
     param([string]$Message)
     $script:retryPromptMessages += $Message
     return New-TestCredential -UserName 'administrator@vsphere.local'
-} 3>$null)
+} 3>$null).Connections)
 
 Assert-Equal -Actual $retryConnections.Count -Expected 2 -Message 'retrying vCenter connection returns both successful connections'
 Assert-Equal -Actual $script:connectAttempts['vc01.contoso.com'] -Expected 1 -Message 'successful same-domain vCenter is not retried'
@@ -849,6 +849,48 @@ Assert-Equal -Actual $script:retryPromptMessages.Count -Expected 1 -Message 'vCe
 Assert-Contains -Text $script:retryPromptMessages[0] -Needle 'vc02.contoso.com' -Message 'vCenter retry prompt names the failed vCenter'
 Assert-Equal -Actual $retryVIServerCredentialMap['vc01.contoso.com'].UserName -Expected 'CONTOSO\vc-admin' -Message 'retry does not replace credential for successful vCenter'
 Assert-Equal -Actual $retryVIServerCredentialMap['vc02.contoso.com'].UserName -Expected 'administrator@vsphere.local' -Message 'retry stores replacement credential for failed vCenter'
+
+# Reusing a live vCenter session: the run must not log in again, and must not disconnect a
+# session it did not open.
+$reuseConnectAttempts = New-Object System.Collections.Generic.List[string]
+$reuseResult = Connect-VIServersWithCredentialMap -VIServers @('vc1.example.local', 'vc2.example.local') `
+    -CredentialMap @{ 'vc1.example.local' = (New-TestCredential -UserName 'u1'); 'vc2.example.local' = (New-TestCredential -UserName 'u2') } `
+    -ReuseExisting `
+    -GetExistingConnectionsScript { return @([pscustomobject]@{ Name = 'vc1.example.local'; IsConnected = $true }) } `
+    -ConnectScript {
+        param([string]$Server, [pscredential]$Credential)
+        $reuseConnectAttempts.Add($Server)
+        return [pscustomobject]@{ Name = $Server; IsConnected = $true }
+    }
+
+Assert-Equal -Actual @($reuseResult.Connections).Count -Expected 2 -Message 'reuse returns every requested vCenter connection'
+Assert-Equal -Actual $reuseConnectAttempts.Count -Expected 1 -Message 'an already connected vCenter is not logged into again'
+Assert-Equal -Actual $reuseConnectAttempts[0] -Expected 'vc2.example.local' -Message 'only the missing vCenter is connected'
+Assert-Equal -Actual @($reuseResult.OpenedConnections).Count -Expected 1 -Message 'only self-opened connections are tracked for disconnect'
+Assert-Equal -Actual ([string]@($reuseResult.OpenedConnections)[0].Name) -Expected 'vc2.example.local' -Message 'a pre-existing session must not be disconnected by this run'
+
+# A disconnected session in DefaultVIServers is not reusable.
+$staleConnectAttempts = New-Object System.Collections.Generic.List[string]
+$staleResult = Connect-VIServersWithCredentialMap -VIServers @('vc1.example.local') `
+    -CredentialMap @{ 'vc1.example.local' = (New-TestCredential -UserName 'u1') } `
+    -ReuseExisting `
+    -GetExistingConnectionsScript { return @([pscustomobject]@{ Name = 'vc1.example.local'; IsConnected = $false }) } `
+    -ConnectScript {
+        param([string]$Server, [pscredential]$Credential)
+        $staleConnectAttempts.Add($Server)
+        return [pscustomobject]@{ Name = $Server; IsConnected = $true }
+    }
+
+Assert-Equal -Actual $staleConnectAttempts.Count -Expected 1 -Message 'a stale session is reconnected rather than reused'
+Assert-Equal -Actual @($staleResult.OpenedConnections).Count -Expected 1 -Message 'a reconnected session counts as self-opened'
+
+# The default existing-connection lookup must survive being dot-sourced without PowerCLI:
+# reading $global:DefaultVIServers directly throws under StrictMode when it is not set.
+$noPowerCliResult = Connect-VIServersWithCredentialMap -VIServers @('vc3.example.local') `
+    -CredentialMap @{ 'vc3.example.local' = (New-TestCredential -UserName 'u3') } `
+    -ReuseExisting `
+    -ConnectScript { param([string]$Server, [pscredential]$Credential) return [pscustomobject]@{ Name = $Server; IsConnected = $true } }
+Assert-Equal -Actual @($noPowerCliResult.Connections).Count -Expected 1 -Message 'the default existing-connection lookup works without PowerCLI loaded'
 
 $script:vcenterPrompts = @()
 $vcenterResponses = New-Object System.Collections.Queue

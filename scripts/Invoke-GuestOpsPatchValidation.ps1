@@ -111,7 +111,7 @@ function Get-GuestOpsCycleJobScript {
             . $JobInput.GuestOpsLibPath
             $script:SuppressStepMessages = [bool](Get-ObjectPropertyValue -InputObject $JobInput -Path @('SuppressStepMessages'))
 
-            $connections = @(Connect-VIServersWithCredentialMap -VIServers @($JobInput.VIServers) -CredentialMap $JobInput.VIServerCredentialMap)
+            $connections = @((Connect-VIServersWithCredentialMap -VIServers @($JobInput.VIServers) -CredentialMap $JobInput.VIServerCredentialMap).OpenedConnections)
             $managers = $null
             $guestAuth = New-GuestAuthentication -Credential $JobInput.GuestCredential
             $jobLocalSelectionPath = [string](Get-ObjectPropertyValue -InputObject $JobInput -Path @('LocalSelectionPath'))
@@ -162,7 +162,9 @@ function Get-GuestRebootJobScript {
             }
             . $JobInput.GuestOpsLibPath
 
-            $connections = @(Connect-VIServersWithCredentialMap -VIServers @($JobInput.VIServers) -CredentialMap $JobInput.VIServerCredentialMap)
+            # A child job starts cold, so there is never a session to reuse here; everything
+            # it opens is its own to disconnect.
+            $connections = @((Connect-VIServersWithCredentialMap -VIServers @($JobInput.VIServers) -CredentialMap $JobInput.VIServerCredentialMap).OpenedConnections)
             $managers = $null
             $guestAuth = New-GuestAuthentication -Credential $JobInput.GuestCredential
             $rebootResult = Invoke-VMGuestReboot -VMName $JobInput.VMName -Managers $managers -GuestAuth $guestAuth
@@ -1171,7 +1173,11 @@ $retryVIServerLogin = ($null -eq $VIServerCredential)
 
 try {
     Write-Step -Message ('Connecting to vCenter(s) {0}.' -f ($resolvedVIServers -join ', '))
-    $connections = @(Connect-VIServersWithCredentialMap -VIServers $resolvedVIServers -CredentialMap $viserverCredentialMap -RetryOnFailure:$retryVIServerLogin)
+    # Only the sessions this run opened go into $connections: the finally block disconnects
+    # them, and a session the operator already had (-KeepConnected from an earlier run) must
+    # survive this one.
+    $connectResult = Connect-VIServersWithCredentialMap -VIServers $resolvedVIServers -CredentialMap $viserverCredentialMap -RetryOnFailure:$retryVIServerLogin -ReuseExisting
+    $connections = @($connectResult.OpenedConnections)
 
     $managers = if ($resolvedVIServers.Count -eq 1) { Get-GuestOpsManagers } else { $null }
 
