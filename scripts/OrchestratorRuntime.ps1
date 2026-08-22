@@ -498,6 +498,21 @@ function Test-RebootActionsSuccessful {
     return $true
 }
 
+function Test-RebootActionsAllConfirmed {
+    param($RebootActions)
+
+    # Stricter than Test-RebootActionsSuccessful: that one tolerates an operator skip, this
+    # one answers "is every rebooted guest provably back up", which is what gates the next
+    # discovery round. An unverified, skipped or failed restart is not proof of anything.
+    foreach ($record in @($RebootActions)) {
+        if ([string]$record.action -ne 'Initiated' -or [string]$record.validationStatus -ne 'Confirmed') {
+            return $false
+        }
+    }
+
+    return $true
+}
+
 function Write-RebootActionArtifacts {
     param(
         [string]$CycleOutputDirectory,

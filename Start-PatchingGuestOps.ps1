@@ -11,6 +11,10 @@ param(
     [string[]]$SelectedUpdateKeys,
     [ValidateRange(1, 2147483647)]
     [int]$ThrottleLimit = 3,
+    [ValidateRange(1, 2147483647)]
+    [int]$RebootBatchSize,
+    [ValidateRange(1, 2147483647)]
+    [int]$MaxPatchRounds = 3,
     [int]$TimeoutMinutes = 180,
     [ValidateRange(1, 2147483647)]
     [int]$RebootTimeoutMinutes = 30,
@@ -132,10 +136,19 @@ $orchestratorParams = @{
     GuestWorkingDirectory = $GuestWorkingDirectory
     LocalOutputDirectory = $LocalOutputDirectory
     MaxUpdates = $MaxUpdates
-    ThrottleLimit = $ThrottleLimit
     TimeoutMinutes = $TimeoutMinutes
     RebootTimeoutMinutes = $RebootTimeoutMinutes
     PollSeconds = $PollSeconds
+}
+
+# Pass these through only when the operator actually typed them. ThrottleLimit defaults to
+# "every target at once" inside the orchestrator, which it works out from the resolved VM
+# list; splatting the launcher's own default would always look like an explicit choice and
+# pin concurrency at 3. RebootBatchSize left unbound means "prompt before rebooting".
+foreach ($passThroughName in @('ThrottleLimit', 'RebootBatchSize', 'MaxPatchRounds')) {
+    if ($PSBoundParameters.ContainsKey($passThroughName)) {
+        $orchestratorParams[$passThroughName] = $PSBoundParameters[$passThroughName]
+    }
 }
 
 if ($VIServerCredential) {

@@ -30,6 +30,12 @@ param(
     [ValidateRange(1, 2147483647)]
     [int]$ThrottleLimit = 3,
 
+    [ValidateRange(1, 2147483647)]
+    [int]$RebootBatchSize,
+
+    [ValidateRange(1, 2147483647)]
+    [int]$MaxPatchRounds = 3,
+
     [switch]$SearchOnly,
 
     [switch]$PlanOnly,
@@ -368,6 +374,28 @@ function Confirm-PatchPlan {
 
     $answer = Read-Host 'Proceed with this plan? [Y/N]'
     return ($answer -ieq 'Y' -or $answer -ieq 'Yes')
+}
+
+function Read-RebootBatchSize {
+    param([int]$TargetCount)
+
+    Write-Host ''
+    Write-Host 'Reboots run in batches; the next batch starts only after every VM in the current batch reports a newer boot time.'
+    Write-Host ('There are {0} VM(s) to reboot.' -f $TargetCount)
+
+    $resolvedBatchSize = 0
+    while ($resolvedBatchSize -lt 1) {
+        $answer = ([string](Read-Host 'How many VMs per reboot batch? (Enter for 1)')).Trim()
+        if ([string]::IsNullOrWhiteSpace($answer)) {
+            $resolvedBatchSize = 1
+        }
+        elseif (-not ([int]::TryParse($answer, [ref]$resolvedBatchSize)) -or $resolvedBatchSize -lt 1) {
+            $resolvedBatchSize = 0
+            Write-Warning 'Enter a whole number greater than or equal to 1, or press Enter for 1.'
+        }
+    }
+
+    return $resolvedBatchSize
 }
 
 function Confirm-GuestReboot {
@@ -725,7 +753,7 @@ function Invoke-GuestRebootPhase {
         [string]$GuestWorkingDirectory,
         [int]$RebootTimeoutSeconds,
         [int]$PollSeconds,
-        [int]$ThrottleLimit = 1
+        [int]$RebootBatchSize = 1
     )
 
     $bootTimeHelperPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'guest\Read-BootTime.ps1'
@@ -799,7 +827,7 @@ function Invoke-GuestRebootPhase {
                 GuestOpsLibPath = $GuestOpsLibPath
             }
         }
-        return @(Invoke-ThrottledJobs -Items $jobInputs -ThrottleLimit $ThrottleLimit -JobTimeoutSeconds 300 -ScriptBlock $restartJobScript)
+        return @(Invoke-ThrottledJobs -Items $jobInputs -ThrottleLimit $RebootBatchSize -JobTimeoutSeconds 300 -ScriptBlock $restartJobScript)
     }
 
     $decisionPromptScript = {
@@ -807,7 +835,7 @@ function Invoke-GuestRebootPhase {
         return Read-RebootDecision -Context $Context
     }
 
-    return @(Invoke-RebootBatchCoordinator -RebootTargets $targetInputs -BatchSize $ThrottleLimit -WaitTimeoutSeconds $RebootTimeoutSeconds -PollSeconds $PollSeconds -ReadBootTimeScript $readBootTimeScript -InitiateRebootScript $initiateRebootScript -DecisionPromptScript $decisionPromptScript)
+    return @(Invoke-RebootBatchCoordinator -RebootTargets $targetInputs -BatchSize $RebootBatchSize -WaitTimeoutSeconds $RebootTimeoutSeconds -PollSeconds $PollSeconds -ReadBootTimeScript $readBootTimeScript -InitiateRebootScript $initiateRebootScript -DecisionPromptScript $decisionPromptScript)
 }
 
 function Write-PatchingSummary {
@@ -912,6 +940,7 @@ function Invoke-ApplyAndOptionalReboot {
         [int]$PollSeconds,
         [string]$CycleOutputDirectory,
         [int]$ThrottleLimit,
+        [int]$RebootBatchSize = 0,
         $DiscoveryRecords = @()
     )
 
@@ -923,7 +952,15 @@ function Invoke-ApplyAndOptionalReboot {
     Write-FinalReport -PatchPlanRecords $PatchPlanRecords -ApplyResults $applyResults -CycleOutputDirectory $CycleOutputDirectory -RebootTargets $rebootTargets
     if ($rebootTargets.Count -gt 0) {
         if (Confirm-GuestReboot -RebootTargets $rebootTargets) {
-            $rebootActions = @(Invoke-GuestRebootPhase -RebootTargets $rebootTargets -GuestCredentialMap $GuestCredentialMap -VIServers $VIServers -VIServerCredentialMap $VIServerCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $GuestOpsLibPath -CurlPath $CurlPath -GuestWorkingDirectory $GuestWorkingDirectory -RebootTimeoutSeconds $RebootTimeoutSeconds -PollSeconds $PollSeconds -ThrottleLimit $ThrottleLimit)
+            # Blast radius is a separate decision from apply concurrency, so it gets its own
+            # answer. Like the REBOOT prompt this one is not skipped by -SkipConfirmation;
+            # a non-interactive run supplies -RebootBatchSize instead.
+            $resolvedRebootBatchSize = $RebootBatchSize
+            if ($resolvedRebootBatchSize -lt 1) {
+                $resolvedRebootBatchSize = Read-RebootBatchSize -TargetCount $rebootTargets.Count
+            }
+
+            $rebootActions = @(Invoke-GuestRebootPhase -RebootTargets $rebootTargets -GuestCredentialMap $GuestCredentialMap -VIServers $VIServers -VIServerCredentialMap $VIServerCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $GuestOpsLibPath -CurlPath $CurlPath -GuestWorkingDirectory $GuestWorkingDirectory -RebootTimeoutSeconds $RebootTimeoutSeconds -PollSeconds $PollSeconds -RebootBatchSize $resolvedRebootBatchSize)
         }
         else {
             Write-Warning 'Guest reboot was not approved. Reboot phase skipped.'
@@ -1073,6 +1110,16 @@ $targetVMNames = @(Resolve-VMTargetNames -SingleVMName $VMName -ManyVMNames $VMN
 $resolvedVIServers = @(Split-VIServerInput -InputText $VIServer)
 $hasExplicitSelectedUpdateKeys = $PSBoundParameters.ContainsKey('SelectedUpdateKeys')
 
+# Default to every target in flight at once. Discovery and apply are in-process now, so
+# concurrency costs GuestOps calls rather than one PowerShell host plus a PowerCLI import
+# per VM. An explicit -ThrottleLimit still wins.
+if (-not $PSBoundParameters.ContainsKey('ThrottleLimit')) {
+    $ThrottleLimit = [math]::Max(1, $targetVMNames.Count)
+}
+
+# 0 means "ask the operator once a reboot is actually confirmed".
+$resolvedRebootBatchSize = if ($PSBoundParameters.ContainsKey('RebootBatchSize')) { $RebootBatchSize } else { 0 }
+
 if ($resolvedVIServers.Count -eq 0) {
     throw 'At least one vCenter is required. Use -VIServer with one or more names separated by semicolons.'
 }
@@ -1142,7 +1189,7 @@ try {
         }
         else {
             $guestCredentialMap = Resolve-GuestCredentialMap -TargetNames @(@($patchPlanRecords) | ForEach-Object { [string]$_.vmName }) -OverrideCredential $GuestCredential
-            $scriptExitCode = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit
+            $scriptExitCode = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize
         }
 
         exit $scriptExitCode
@@ -1191,7 +1238,7 @@ try {
             $scriptExitCode = 1
         }
         else {
-            $scriptExitCode = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit -DiscoveryRecords $discoveryRecords
+            $scriptExitCode = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -DiscoveryRecords $discoveryRecords
         }
     }
     elseif ($PlanOnly) {

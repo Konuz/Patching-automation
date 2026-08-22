@@ -287,6 +287,26 @@ $failedRebootActions = @(
 )
 Assert-Equal -Actual (Test-RebootActionsSuccessful -RebootActions $failedRebootActions) -Expected $false -Message 'failed reboot action makes reboot phase unsuccessful'
 
+# The post-reboot verification gate is stricter than the run-success check: it asks whether
+# every rebooted guest is provably back up, so an operator skip does not qualify.
+$allConfirmed = @(
+    [pscustomobject]@{ vmName = 'VM01'; action = 'Initiated'; validationStatus = 'Confirmed' },
+    [pscustomobject]@{ vmName = 'VM02'; action = 'Initiated'; validationStatus = 'Confirmed' }
+)
+Assert-Equal -Actual (Test-RebootActionsAllConfirmed -RebootActions $allConfirmed) -Expected $true -Message 'every confirmed reboot passes the verification gate'
+
+foreach ($blockingStatus in @('Unverified', 'Timeout')) {
+    $mixedConfirmation = @(
+        [pscustomobject]@{ vmName = 'VM01'; action = 'Initiated'; validationStatus = 'Confirmed' },
+        [pscustomobject]@{ vmName = 'VM02'; action = 'Initiated'; validationStatus = $blockingStatus }
+    )
+    Assert-Equal -Actual (Test-RebootActionsAllConfirmed -RebootActions $mixedConfirmation) -Expected $false -Message ('a {0} reboot blocks post-reboot discovery' -f $blockingStatus)
+}
+
+Assert-Equal -Actual (Test-RebootActionsAllConfirmed -RebootActions @([pscustomobject]@{ vmName = 'VM01'; action = 'SkippedByOperator'; validationStatus = 'NotRequested' })) -Expected $false -Message 'a skipped reboot is not proof the VM is up'
+Assert-Equal -Actual (Test-RebootActionsAllConfirmed -RebootActions @([pscustomobject]@{ vmName = 'VM01'; action = 'Failed'; validationStatus = 'InitiationError' })) -Expected $false -Message 'a failed initiation is not proof the VM is up'
+Assert-Equal -Actual (Test-RebootActionsAllConfirmed -RebootActions @()) -Expected $true -Message 'no reboot targets means nothing blocks the next discovery'
+
 $telemetryRecord = New-RebootActionRecord -VMName 'VM03' -Action 'Initiated' -ProcessId 43 -RebootReason 'Reported after apply' -BatchNumber 2 -BootTimeBaseline $baseTime -BootTimeObserved $newTime -ValidationStatus 'Timeout' -WaitSeconds 30 -AttemptCount 3 -TimeoutCount 2 -LastErrorMessage 'VMware Tools are not running' -OperatorDecision 'ABORT'
 Assert-Equal -Actual (Get-ObjectPropertyValue -InputObject $telemetryRecord -Path @('attemptCount')) -Expected 3 -Message 'reboot record stores observation attempt count'
 Assert-Equal -Actual (Get-ObjectPropertyValue -InputObject $telemetryRecord -Path @('timeoutCount')) -Expected 2 -Message 'reboot record stores timeout count'
