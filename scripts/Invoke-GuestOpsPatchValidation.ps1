@@ -93,9 +93,12 @@ function Assert-LocalPrerequisites {
         throw 'curl.exe was not found in PATH.'
     }
 
-    $powerCliModule = Get-Module -ListAvailable -Name VMware.PowerCLI
+    # Check for the module this script actually imports, not the VMware.PowerCLI meta-module.
+    # A lean install that has every VimAutomation submodule but not the meta-manifest is a
+    # perfectly working environment, and refusing it here would be a false negative.
+    $powerCliModule = Get-Module -ListAvailable -Name VMware.VimAutomation.Core
     if ($null -eq $powerCliModule) {
-        throw 'VMware.PowerCLI module was not found.'
+        throw 'VMware.VimAutomation.Core module was not found. Install it, or the full VMware.PowerCLI bundle that contains it.'
     }
 
     return $curlCommand.Source

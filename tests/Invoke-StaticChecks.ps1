@@ -323,6 +323,11 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-NoOrphanedBranchKeyword -Ast $orchestratorAst -RelativePath $orchestratorPath
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'curl.exe'
+    # The prerequisite check and the import must name the same module. They drifted once:
+    # the check demanded the VMware.PowerCLI meta-module while the code imported
+    # VimAutomation.Core, so a complete lean install was refused for a missing manifest.
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Get-Module -ListAvailable -Name VMware.VimAutomation.Core'
+    Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?i)-Name\s+VMware\.PowerCLI\b' -Reason 'prerequisite check must name the module the orchestrator imports, not the meta-module'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'InstallSelection'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'VMNames'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'VMListPath'

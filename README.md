@@ -33,7 +33,7 @@ jednoelementowa.
 Na maszynie sterującej (stepping stone):
 
 - **Windows PowerShell 5.1** (domyślny w Windows; PS7 nie jest potrzebny).
-- Moduł **VMware.PowerCLI** (`Install-Module VMware.PowerCLI`).
+- Moduł **VMware.PowerCLI** (`Install-Module VMware.PowerCLI`). Faktycznie wymagany jest tylko **VMware.VimAutomation.Core** — tylko on jest importowany i tylko o niego pyta kontrola wymagań, więc lekka instalacja samego tego modułu też wystarczy.
 - **`curl.exe`** — standardowy składnik Windows (używany do transferu plików; nic nie instalujesz).
 - Sieciowy dostęp do **vCenter (:443)** i do hostów **ESXi (:443)**.
 
