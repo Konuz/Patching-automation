@@ -152,6 +152,53 @@ $partialInstall = [pscustomobject]@{ action = 'Install'; outcome = 'InstallSucce
 Assert-Equal -Actual (Get-ApplySummaryStatus -ApplyResult $partialInstall) -Expected 'Partial' -Message 'apply status: partial install is distinguished from failure'
 Assert-Equal -Actual (Get-ApplySummaryStatus -ApplyResult ([pscustomobject]@{ action = 'Install'; outcome = 'InstallSucceededWithErrors'; reason = ''; rebootRequired = $true })) -Expected 'Partial' -Message 'apply status: partial install wins over reboot-required'
 
+# vSphere keeps finished process info only briefly, so a guest that really did finish can
+# come back with no process result at all. status.json is the primary apply result, and
+# discovery already treats it that way; apply must not call that a total failure.
+$lateStatus = [pscustomobject]@{
+    outcome = 'InstallSucceeded'
+    finishedAt = '2026-08-22T10:00:00.0000000Z'
+    installResult = [pscustomobject]@{ result = 'Succeeded'; rebootRequired = $true }
+    pendingRebootAfter = [pscustomobject]@{ isPending = $true }
+    errors = @()
+}
+
+$lateResult = New-ApplyResultFromCycle -VMName 'VM01' -Cycle ([pscustomobject]@{ AgentResult = $null; Status = $lateStatus }) 3>$null
+Assert-Equal -Actual $lateResult.outcome -Expected 'InstallSucceeded' -Message 'a terminal status.json outweighs a missing GuestOps process result'
+Assert-Equal -Actual $lateResult.rebootRequired -Expected $true -Message 'reboot requirement survives a lost process result'
+
+$notCompletedResult = New-ApplyResultFromCycle -VMName 'VM01' -Cycle ([pscustomobject]@{ AgentResult = [pscustomobject]@{ Completed = $false; ExitCode = $null; EndTime = $null }; Status = $lateStatus }) 3>$null
+Assert-Equal -Actual $notCompletedResult.outcome -Expected 'InstallSucceeded' -Message 'an explicit not-completed result is treated the same as a missing one'
+
+$trulyIncompleteCycle = [pscustomobject]@{
+    AgentResult = [pscustomobject]@{ Completed = $false; ExitCode = $null; EndTime = $null }
+    Status = [pscustomobject]@{ outcome = 'Started'; finishedAt = ''; installResult = $null; pendingRebootAfter = $null; errors = @() }
+}
+$incompleteResult = New-ApplyResultFromCycle -VMName 'VM02' -Cycle $trulyIncompleteCycle
+Assert-Equal -Actual $incompleteResult.outcome -Expected 'Failed' -Message 'a non-terminal status.json is still an apply failure'
+Assert-Contains -Text ([string]$incompleteResult.reason) -Needle 'did not complete' -Message 'a genuinely incomplete apply says so'
+
+# A terminal outcome without finishedAt is not enough: the agent saves status.json eagerly,
+# so an outcome can be present while the stage that would have stamped finishedAt never ran.
+$noFinishedAtCycle = [pscustomobject]@{
+    AgentResult = [pscustomobject]@{ Completed = $false; ExitCode = $null; EndTime = $null }
+    Status = [pscustomobject]@{ outcome = 'InstallSucceeded'; finishedAt = ''; installResult = $null; pendingRebootAfter = $null; errors = @() }
+}
+Assert-Equal -Actual (New-ApplyResultFromCycle -VMName 'VM03' -Cycle $noFinishedAtCycle).outcome -Expected 'Failed' -Message 'a terminal outcome without finishedAt is still an apply failure'
+
+# A real non-zero exit code still fails, and a partial install still survives it.
+$exitCodeCycle = [pscustomobject]@{
+    AgentResult = [pscustomobject]@{ Completed = $true; ExitCode = 1; EndTime = (Get-Date) }
+    Status = [pscustomobject]@{ outcome = 'InstallFailed'; finishedAt = '2026-08-22T10:00:00.0000000Z'; installResult = $null; pendingRebootAfter = $null; errors = @() }
+}
+Assert-Contains -Text ([string](New-ApplyResultFromCycle -VMName 'VM04' -Cycle $exitCodeCycle).reason) -Needle 'exited with code' -Message 'a non-zero exit code with a failed outcome is still a failure'
+
+$partialCycle = [pscustomobject]@{
+    AgentResult = [pscustomobject]@{ Completed = $true; ExitCode = 3; EndTime = (Get-Date) }
+    Status = [pscustomobject]@{ outcome = 'InstallSucceededWithErrors'; finishedAt = '2026-08-22T10:00:00.0000000Z'; installResult = $null; pendingRebootAfter = $null; errors = @() }
+}
+Assert-Equal -Actual (New-ApplyResultFromCycle -VMName 'VM05' -Cycle $partialCycle).outcome -Expected 'InstallSucceededWithErrors' -Message 'a partial install keeps its outcome despite the non-zero exit'
+
 $throttleGuardThrew = $false
 try { Invoke-ThrottledJobs -Items @() -ThrottleLimit 0 -JobTimeoutSeconds 30 -ScriptBlock { param($i) $i } | Out-Null }
 catch { $throttleGuardThrew = $true }

@@ -248,6 +248,85 @@ function Invoke-InProcessAgentFleet {
     return @($results)
 }
 
+function Test-IsTerminalAgentOutcome {
+    param([string]$Outcome)
+
+    return ($Outcome -in @('InstallSucceeded', 'InstallSucceededWithErrors', 'InstallFailed', 'DownloadFailed', 'NoSelectedUpdates', 'NoApplicableUpdates', 'SearchOnly'))
+}
+
+function New-ApplyResultFromCycle {
+    param(
+        [string]$VMName,
+        $Cycle
+    )
+
+    # Reads status.json only, so it lives here rather than in the orchestrator: the
+    # orchestrator ends in exit and cannot be dot-sourced by the offline tests. It uses
+    # Get-ObjectPropertyValue from GuestOpsLib, which both the orchestrator and the runtime
+    # test harness dot-source before this file.
+    $cycle = $Cycle
+    $status = Get-RuntimePropertyValue -InputObject $cycle -Name 'Status'
+    $agentResult = Get-RuntimePropertyValue -InputObject $cycle -Name 'AgentResult'
+    $outcome = Get-ObjectPropertyValue -InputObject $status -Path @('outcome')
+    $finishedAt = [string](Get-ObjectPropertyValue -InputObject $status -Path @('finishedAt'))
+    $installResult = Get-ObjectPropertyValue -InputObject $status -Path @('installResult', 'result')
+    $pendingAfter = [bool](Get-ObjectPropertyValue -InputObject $status -Path @('pendingRebootAfter', 'isPending') -DefaultValue $false)
+    $rebootFromInstall = [bool](Get-ObjectPropertyValue -InputObject $status -Path @('installResult', 'rebootRequired') -DefaultValue $false)
+    $rebootRequired = ($pendingAfter -or $rebootFromInstall)
+    $errors = @(Get-ObjectPropertyValue -InputObject $status -Path @('errors') -DefaultValue @())
+
+    if ($null -eq $agentResult -or -not $agentResult.Completed) {
+        # vSphere keeps finished process info only briefly, and the fleet starts its guests
+        # sequentially, so a guest that really did finish can come back with no process
+        # result. status.json is the primary apply result (see CLAUDE.md) and discovery
+        # already resolves this the same way. Both halves are required: the agent saves
+        # status.json eagerly, so a terminal outcome can be present while the stage that
+        # stamps finishedAt never ran.
+        if ((Test-IsTerminalAgentOutcome -Outcome ([string]$outcome)) -and -not [string]::IsNullOrWhiteSpace($finishedAt)) {
+            Write-Warning ('Apply guest process result was lost for {0}. status.json has a terminal outcome and finishedAt, so it remains the primary apply result.' -f $VMName)
+        }
+        else {
+            $reason = 'Apply guest process did not complete.'
+            $errors += $reason
+            return [pscustomobject]@{
+                vmName = $VMName
+                action = 'Install'
+                outcome = 'Failed'
+                installResult = $installResult
+                reason = $reason
+                rebootRequired = $rebootRequired
+                errors = @($errors)
+            }
+        }
+    }
+    # A partial install (WUA ResultCode 3) exits non-zero but is authoritative in
+    # status.json as 'InstallSucceededWithErrors'. Preserve that outcome so the summary
+    # can distinguish it from a total failure; only an unrecognized non-zero exit fails.
+    elseif ($null -ne $agentResult.ExitCode -and [int]$agentResult.ExitCode -ne 0 -and $outcome -ne 'InstallSucceededWithErrors') {
+        $reason = 'Apply guest process exited with code {0}.' -f $agentResult.ExitCode
+        $errors += $reason
+        return [pscustomobject]@{
+            vmName = $VMName
+            action = 'Install'
+            outcome = 'Failed'
+            installResult = $installResult
+            reason = $reason
+            rebootRequired = $rebootRequired
+            errors = @($errors)
+        }
+    }
+
+    return [pscustomobject]@{
+        vmName = $VMName
+        action = 'Install'
+        outcome = $outcome
+        installResult = $installResult
+        reason = ''
+        rebootRequired = $rebootRequired
+        errors = @($errors)
+    }
+}
+
 function Test-IsApplyResultError {
     param($ApplyResult)
 

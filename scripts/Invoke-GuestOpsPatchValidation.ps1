@@ -563,63 +563,6 @@ function New-DiscoveryRecordFromAgentRun {
     return $record
 }
 
-function New-ApplyResultFromCycle {
-    param(
-        [string]$VMName,
-        $Cycle
-    )
-
-    $cycle = $Cycle
-    $status = $cycle.Status
-    $outcome = Get-ObjectPropertyValue -InputObject $status -Path @('outcome')
-    $installResult = Get-ObjectPropertyValue -InputObject $status -Path @('installResult', 'result')
-    $pendingAfter = [bool](Get-ObjectPropertyValue -InputObject $status -Path @('pendingRebootAfter', 'isPending') -DefaultValue $false)
-    $rebootFromInstall = [bool](Get-ObjectPropertyValue -InputObject $status -Path @('installResult', 'rebootRequired') -DefaultValue $false)
-    $rebootRequired = ($pendingAfter -or $rebootFromInstall)
-    $errors = @(Get-ObjectPropertyValue -InputObject $status -Path @('errors') -DefaultValue @())
-
-    if ($null -eq $cycle.AgentResult -or -not $cycle.AgentResult.Completed) {
-        $reason = 'Apply guest process did not complete.'
-        $errors += $reason
-        return [pscustomobject]@{
-            vmName = $VMName
-            action = 'Install'
-            outcome = 'Failed'
-            installResult = $installResult
-            reason = $reason
-            rebootRequired = $rebootRequired
-            errors = @($errors)
-        }
-    }
-
-    # A partial install (WUA ResultCode 3) exits non-zero but is authoritative in
-    # status.json as 'InstallSucceededWithErrors'. Preserve that outcome so the summary
-    # can distinguish it from a total failure; only an unrecognized non-zero exit fails.
-    if ($null -ne $cycle.AgentResult.ExitCode -and [int]$cycle.AgentResult.ExitCode -ne 0 -and $outcome -ne 'InstallSucceededWithErrors') {
-        $reason = 'Apply guest process exited with code {0}.' -f $cycle.AgentResult.ExitCode
-        $errors += $reason
-        return [pscustomobject]@{
-            vmName = $VMName
-            action = 'Install'
-            outcome = 'Failed'
-            installResult = $installResult
-            reason = $reason
-            rebootRequired = $rebootRequired
-            errors = @($errors)
-        }
-    }
-
-    return [pscustomobject]@{
-        vmName = $VMName
-        action = 'Install'
-        outcome = $outcome
-        installResult = $installResult
-        reason = ''
-        rebootRequired = $rebootRequired
-        errors = @($errors)
-    }
-}
-
 function Invoke-ApplyPhase {
     param(
         $PatchPlanRecords,
