@@ -95,56 +95,67 @@ function Assert-LocalPrerequisites {
     return $curlCommand.Source
 }
 
-function Get-GuestOpsCycleJobScript {
-    return {
-        param($JobInput)
+function New-AgentFleetItem {
+    param(
+        [int]$Sequence,
+        [string]$VMName,
+        [string]$VMOutputDirectory,
+        [int]$MaxUpdates,
+        [string]$LocalSelectionPath = '',
+        [string]$GuestSelectionPath = '',
+        [bool]$SearchOnly = $false
+    )
 
-        Set-StrictMode -Version 2.0
-        $ErrorActionPreference = 'Stop'
-
-        $connections = @()
-        try {
-            Import-Module VMware.VimAutomation.Core -ErrorAction Stop
-            if ($JobInput.IgnoreVCenterCertificate) {
-                Set-PowerCLIConfiguration -Scope Session -InvalidCertificateAction Ignore -Confirm:$false | Out-Null
-            }
-            . $JobInput.GuestOpsLibPath
-            $script:SuppressStepMessages = [bool](Get-ObjectPropertyValue -InputObject $JobInput -Path @('SuppressStepMessages'))
-
-            $connections = @((Connect-VIServersWithCredentialMap -VIServers @($JobInput.VIServers) -CredentialMap $JobInput.VIServerCredentialMap).OpenedConnections)
-            $managers = $null
-            $guestAuth = New-GuestAuthentication -Credential $JobInput.GuestCredential
-            $jobLocalSelectionPath = [string](Get-ObjectPropertyValue -InputObject $JobInput -Path @('LocalSelectionPath'))
-            $jobGuestSelectionPath = [string](Get-ObjectPropertyValue -InputObject $JobInput -Path @('GuestSelectionPath'))
-            $cycle = Invoke-VMAgentCycle -VMName $JobInput.VMName -Managers $managers -GuestAuth $guestAuth -CurlPath $JobInput.CurlPath -AgentPath $JobInput.AgentPath -IdentityHelperPath $JobInput.IdentityHelperPath -GuestWorkingDirectory $JobInput.GuestWorkingDirectory -VMOutputDirectory $JobInput.VMOutputDirectory -MaxUpdates $JobInput.MaxUpdates -LocalSelectionPath $jobLocalSelectionPath -SelectionPath $jobGuestSelectionPath -SearchOnly:$JobInput.SearchOnly -TimeoutSeconds $JobInput.TimeoutSeconds -PollSeconds $JobInput.PollSeconds
-            return [pscustomobject]@{
-                Sequence = $JobInput.Sequence
-                VMName = $JobInput.VMName
-                VMOutputDirectory = $JobInput.VMOutputDirectory
-                Status = $cycle.Status
-                AgentResult = $cycle.AgentResult
-                Error = $null
-            }
-        }
-        catch {
-            return [pscustomobject]@{
-                Sequence = $JobInput.Sequence
-                VMName = $JobInput.VMName
-                VMOutputDirectory = $JobInput.VMOutputDirectory
-                Status = $null
-                AgentResult = $null
-                Error = $_.Exception.Message
-            }
-        }
-        finally {
-            if ($connections.Count -gt 0) {
-                try {
-                    Disconnect-VIServer -Server $connections -Confirm:$false | Out-Null
-                }
-                catch { }
-            }
-        }
+    # Discovery and apply must hand the fleet the same shape: under StrictMode the start
+    # script reading a property one phase happens not to set is a terminating error.
+    return [pscustomobject]@{
+        Sequence = $Sequence
+        VMName = $VMName
+        VMOutputDirectory = $VMOutputDirectory
+        MaxUpdates = $MaxUpdates
+        LocalSelectionPath = $LocalSelectionPath
+        GuestSelectionPath = $GuestSelectionPath
+        SearchOnly = $SearchOnly
     }
+}
+
+function Invoke-GuestAgentFleet {
+    param(
+        [object[]]$FleetItems,
+        $Managers,
+        $GuestCredentialMap,
+        [string]$CurlPath,
+        [string]$AgentPath,
+        [string]$IdentityHelperPath,
+        [string]$GuestWorkingDirectory,
+        [int]$TimeoutSeconds,
+        [int]$PollSeconds,
+        [int]$MaxInFlight
+    )
+
+    return @(Invoke-InProcessAgentFleet -Items $FleetItems -MaxInFlight $MaxInFlight -PollSeconds $PollSeconds -ItemTimeoutSeconds ($TimeoutSeconds + 300) `
+        -StartScript {
+            param($Item)
+            $itemAuth = New-GuestAuthentication -Credential $GuestCredentialMap[[string]$Item.VMName]
+            return Start-VMAgentCycle -VMName $Item.VMName -Managers $Managers -GuestAuth $itemAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $Item.VMOutputDirectory -MaxUpdates $Item.MaxUpdates -LocalSelectionPath $Item.LocalSelectionPath -SelectionPath $Item.GuestSelectionPath -SearchOnly:([bool]$Item.SearchOnly)
+        } `
+        -PollScript {
+            param($Handle)
+            # Ask vSphere once per round and stash the answer. Calling Test-VMAgentCycleComplete
+            # again from the completion script can come back as "ended, exit code lost" once
+            # vSphere has forgotten the process, and the apply result builder would read that
+            # second answer instead of the one that actually decided the poll.
+            $agentResult = Test-VMAgentCycleComplete -Handle $Handle
+            $Handle.AgentResult = $agentResult
+            return ($null -ne $agentResult)
+        } `
+        -CompleteScript {
+            param($Handle)
+            # On the timeout path the poll script never returned true, so AgentResult is
+            # whatever the last poll saw - possibly still $null. Both callers treat that as
+            # "no process result, trust status.json".
+            return Complete-VMAgentCycle -Handle $Handle -AgentResult $Handle.AgentResult
+        })
 }
 
 function Get-GuestRebootJobScript {
@@ -543,10 +554,6 @@ function Invoke-ApplyPhase {
         $PatchPlanRecords,
         $Managers,
         $GuestCredentialMap,
-        [string[]]$VIServers,
-        [hashtable]$VIServerCredentialMap,
-        [switch]$IgnoreVCenterCertificate,
-        [string]$GuestOpsLibPath,
         [string]$CurlPath,
         [string]$AgentPath,
         [string]$IdentityHelperPath,
@@ -554,11 +561,11 @@ function Invoke-ApplyPhase {
         [int]$TimeoutSeconds,
         [int]$PollSeconds,
         [string]$CycleOutputDirectory,
-        [int]$ThrottleLimit = 1
+        [int]$MaxInFlight = 1
     )
 
     $resultEntries = @()
-    $jobInputs = @()
+    $fleetItems = @()
     $recordNumber = 0
 
     foreach ($record in @($PatchPlanRecords)) {
@@ -611,81 +618,45 @@ function Invoke-ApplyPhase {
         $selectionDocument | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $localSelectionPath -Encoding UTF8
         $guestSelectionPath = Join-Path $GuestWorkingDirectory 'selection.json'
 
-        if ($ThrottleLimit -le 1) {
-            try {
-                $vmAuth = New-GuestAuthentication -Credential $GuestCredentialMap[$record.vmName]
-                $cycle = Invoke-VMAgentCycle -VMName $record.vmName -Managers $Managers -GuestAuth $vmAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $vmOutputDirectory -MaxUpdates $selectedKeys.Count -LocalSelectionPath $localSelectionPath -SelectionPath $guestSelectionPath -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
-                $resultEntries += [pscustomobject]@{
-                    Sequence = $recordNumber
-                    Result = New-ApplyResultFromCycle -VMName $record.vmName -Cycle $cycle
-                }
-            }
-            catch {
-                $resultEntries += [pscustomobject]@{
-                    Sequence = $recordNumber
-                    Result = [pscustomobject]@{
-                        vmName = $record.vmName
-                        action = 'Install'
-                        outcome = 'Failed'
-                        installResult = $null
-                        reason = $_.Exception.Message
-                        rebootRequired = $false
-                        errors = @($_.Exception.Message)
-                    }
-                }
-            }
-        }
-        else {
-            $jobInputs += [pscustomobject]@{
-                Sequence = $recordNumber
-                VMName = [string]$record.vmName
-                VIServers = @($VIServers)
-                VIServerCredentialMap = $VIServerCredentialMap
-                GuestCredential = $GuestCredentialMap[$record.vmName]
-                IgnoreVCenterCertificate = [bool]$IgnoreVCenterCertificate
-                GuestOpsLibPath = $GuestOpsLibPath
-                CurlPath = $CurlPath
-                AgentPath = $AgentPath
-                IdentityHelperPath = $IdentityHelperPath
-                GuestWorkingDirectory = $GuestWorkingDirectory
-                VMOutputDirectory = $vmOutputDirectory
-                MaxUpdates = $selectedKeys.Count
-                LocalSelectionPath = $localSelectionPath
-                GuestSelectionPath = $guestSelectionPath
-                SearchOnly = $false
-                TimeoutSeconds = $TimeoutSeconds
-                PollSeconds = $PollSeconds
-            }
-        }
+        $fleetItems += New-AgentFleetItem -Sequence $recordNumber -VMName ([string]$record.vmName) -VMOutputDirectory $vmOutputDirectory -MaxUpdates $selectedKeys.Count -LocalSelectionPath $localSelectionPath -GuestSelectionPath $guestSelectionPath -SearchOnly $false
     }
 
-    if ($ThrottleLimit -gt 1 -and $jobInputs.Count -gt 0) {
-        $jobScript = Get-GuestOpsCycleJobScript
-        $jobResults = @(Invoke-ThrottledJobs -Items $jobInputs -ThrottleLimit $ThrottleLimit -JobTimeoutSeconds ($TimeoutSeconds + 300) -ScriptBlock $jobScript)
-        foreach ($jobResult in @($jobResults | Sort-Object Sequence)) {
-            if (-not [string]::IsNullOrWhiteSpace([string]$jobResult.Error)) {
+    if ($fleetItems.Count -gt 0) {
+        Write-Step -Message ('Apply running with up to {0} VM(s) in flight.' -f $MaxInFlight)
+        $fleetResults = @(Invoke-GuestAgentFleet -FleetItems $fleetItems -Managers $Managers -GuestCredentialMap $GuestCredentialMap -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -MaxInFlight $MaxInFlight)
+
+        $doneCount = 0
+        foreach ($fleetResult in @($fleetResults | Sort-Object Sequence)) {
+            $doneCount++
+            Write-Step -Message ('  {0}/{1} apply finished: {2}' -f $doneCount, $fleetItems.Count, $fleetResult.VMName)
+
+            $hasError = -not [string]::IsNullOrWhiteSpace([string]$fleetResult.Error)
+            $payload = Get-ObjectPropertyValue -InputObject $fleetResult -Path @('Payload')
+
+            if ($hasError -and $null -eq $payload) {
                 $resultEntries += [pscustomobject]@{
-                    Sequence = $jobResult.Sequence
+                    Sequence = $fleetResult.Sequence
                     Result = [pscustomobject]@{
-                        vmName = $jobResult.VMName
+                        vmName = $fleetResult.VMName
                         action = 'Install'
                         outcome = 'Failed'
                         installResult = $null
-                        reason = $jobResult.Error
+                        reason = $fleetResult.Error
                         rebootRequired = $false
-                        errors = @($jobResult.Error)
+                        errors = @($fleetResult.Error)
                     }
                 }
                 continue
             }
 
-            $cycle = [pscustomobject]@{
-                Status = $jobResult.Status
-                AgentResult = $jobResult.AgentResult
+            if ($hasError) {
+                # Timed out, but the artifacts still came down. status.json decides.
+                Write-Warning ('Apply process result timed out for {0}; falling back to the downloaded status.json.' -f $fleetResult.VMName)
             }
+
             $resultEntries += [pscustomobject]@{
-                Sequence = $jobResult.Sequence
-                Result = New-ApplyResultFromCycle -VMName $jobResult.VMName -Cycle $cycle
+                Sequence = $fleetResult.Sequence
+                Result = New-ApplyResultFromCycle -VMName $fleetResult.VMName -Cycle $payload
             }
         }
     }
@@ -944,7 +915,7 @@ function Invoke-ApplyAndOptionalReboot {
         $DiscoveryRecords = @()
     )
 
-    $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $PatchPlanRecords -Managers $Managers -GuestCredentialMap $GuestCredentialMap -VIServers $VIServers -VIServerCredentialMap $VIServerCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $GuestOpsLibPath -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -CycleOutputDirectory $CycleOutputDirectory -ThrottleLimit $ThrottleLimit)
+    $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $PatchPlanRecords -Managers $Managers -GuestCredentialMap $GuestCredentialMap -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -CycleOutputDirectory $CycleOutputDirectory -MaxInFlight $ThrottleLimit)
     Write-PatchingSummary -ApplyResults $applyResults
 
     $rebootActions = @()
@@ -1007,10 +978,6 @@ function Invoke-DiscoveryPhase {
         [string[]]$TargetVMNames,
         $Managers,
         $GuestCredentialMap,
-        [string[]]$VIServers,
-        [hashtable]$VIServerCredentialMap,
-        [switch]$IgnoreVCenterCertificate,
-        [string]$GuestOpsLibPath,
         [string]$CurlPath,
         [string]$AgentPath,
         [string]$IdentityHelperPath,
@@ -1019,11 +986,12 @@ function Invoke-DiscoveryPhase {
         [int]$TimeoutSeconds,
         [int]$PollSeconds,
         [string]$CycleOutputDirectory,
-        [int]$ThrottleLimit = 1
+        [int]$MaxInFlight = 1
     )
 
     $recordEntries = @()
-    $jobInputs = @()
+    $fleetItems = @()
+    $outputDirectoryBySequence = @{}
     $targetNumber = 0
     $previousSuppressStepMessages = $script:SuppressStepMessages
     $script:SuppressStepMessages = $true
@@ -1031,69 +999,43 @@ function Invoke-DiscoveryPhase {
     foreach ($targetVMName in @($TargetVMNames)) {
         $targetNumber++
         $vmOutputDirectory = Join-Path $CycleOutputDirectory ('{0:D3}-{1}' -f $targetNumber, (Get-SafeFileName -Value $targetVMName))
-
-        if ($ThrottleLimit -le 1) {
-            try {
-                $vmAuth = New-GuestAuthentication -Credential $GuestCredentialMap[$targetVMName]
-                $agentRun = Invoke-VMAgentCycle -VMName $targetVMName -Managers $Managers -GuestAuth $vmAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $vmOutputDirectory -MaxUpdates $MaxUpdates -SearchOnly -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
-                $recordEntries += [pscustomobject]@{
-                    Sequence = $targetNumber
-                    Record = New-DiscoveryRecordFromAgentRun -VMName $targetVMName -AgentRun $agentRun -OutputDirectory $vmOutputDirectory
-                }
-            }
-            catch {
-                $errorMessage = $_.Exception.Message
-                Write-Warning ('Discovery failed for {0}: {1}' -f $targetVMName, $errorMessage)
-                $recordEntries += [pscustomobject]@{
-                    Sequence = $targetNumber
-                    Record = New-DiscoveryRecord -VMName $targetVMName -Status $null -OutputDirectory $vmOutputDirectory -Errors @($errorMessage)
-                }
-            }
-        }
-        else {
-            $jobInputs += [pscustomobject]@{
-                Sequence = $targetNumber
-                VMName = [string]$targetVMName
-                VIServers = @($VIServers)
-                VIServerCredentialMap = $VIServerCredentialMap
-                GuestCredential = $GuestCredentialMap[$targetVMName]
-                IgnoreVCenterCertificate = [bool]$IgnoreVCenterCertificate
-                GuestOpsLibPath = $GuestOpsLibPath
-                CurlPath = $CurlPath
-                AgentPath = $AgentPath
-                IdentityHelperPath = $IdentityHelperPath
-                GuestWorkingDirectory = $GuestWorkingDirectory
-                VMOutputDirectory = $vmOutputDirectory
-                MaxUpdates = $MaxUpdates
-                SelectedUpdateKeys = @()
-                SearchOnly = $true
-                SuppressStepMessages = $true
-                TimeoutSeconds = $TimeoutSeconds
-                PollSeconds = $PollSeconds
-            }
-        }
+        $outputDirectoryBySequence[$targetNumber] = $vmOutputDirectory
+        $fleetItems += New-AgentFleetItem -Sequence $targetNumber -VMName ([string]$targetVMName) -VMOutputDirectory $vmOutputDirectory -MaxUpdates $MaxUpdates -SearchOnly $true
     }
 
-    if ($ThrottleLimit -gt 1 -and $jobInputs.Count -gt 0) {
-        $jobScript = Get-GuestOpsCycleJobScript
-        $jobResults = @(Invoke-ThrottledJobs -Items $jobInputs -ThrottleLimit $ThrottleLimit -JobTimeoutSeconds ($TimeoutSeconds + 300) -ScriptBlock $jobScript)
-        foreach ($jobResult in @($jobResults | Sort-Object Sequence)) {
-            if (-not [string]::IsNullOrWhiteSpace([string]$jobResult.Error)) {
-                Write-Warning ('Discovery failed for {0}: {1}' -f $jobResult.VMName, $jobResult.Error)
+    if ($fleetItems.Count -gt 0) {
+        Write-Host ('Discovery running with up to {0} VM(s) in flight.' -f $MaxInFlight)
+        $fleetResults = @(Invoke-GuestAgentFleet -FleetItems $fleetItems -Managers $Managers -GuestCredentialMap $GuestCredentialMap -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -MaxInFlight $MaxInFlight)
+
+        $doneCount = 0
+        foreach ($fleetResult in @($fleetResults | Sort-Object Sequence)) {
+            $doneCount++
+            # Write-Host, not Write-Step: the per-VM step messages are suppressed for the whole
+            # phase, and a fleet of fifty guests must not run for a quarter of an hour in silence.
+            Write-Host ('  {0}/{1} discovery finished: {2}' -f $doneCount, $fleetItems.Count, $fleetResult.VMName)
+
+            $vmOutputDirectory = $outputDirectoryBySequence[[int]$fleetResult.Sequence]
+            $hasError = -not [string]::IsNullOrWhiteSpace([string]$fleetResult.Error)
+            $payload = Get-ObjectPropertyValue -InputObject $fleetResult -Path @('Payload')
+
+            if ($hasError -and $null -eq $payload) {
+                Write-Warning ('Discovery failed for {0}: {1}' -f $fleetResult.VMName, $fleetResult.Error)
                 $recordEntries += [pscustomobject]@{
-                    Sequence = $jobResult.Sequence
-                    Record = New-DiscoveryRecord -VMName $jobResult.VMName -Status $null -OutputDirectory $jobResult.VMOutputDirectory -Errors @($jobResult.Error)
+                    Sequence = $fleetResult.Sequence
+                    Record = New-DiscoveryRecord -VMName $fleetResult.VMName -Status $null -OutputDirectory $vmOutputDirectory -Errors @($fleetResult.Error)
                 }
                 continue
             }
 
-            $agentRun = [pscustomobject]@{
-                Status = $jobResult.Status
-                AgentResult = $jobResult.AgentResult
+            if ($hasError) {
+                # Timed out, but the artifacts still came down. Hand them to the normal record
+                # builder, which decides on the outcome plus finishedAt in status.json.
+                Write-Warning ('Discovery process result timed out for {0}; falling back to the downloaded status.json.' -f $fleetResult.VMName)
             }
+
             $recordEntries += [pscustomobject]@{
-                Sequence = $jobResult.Sequence
-                Record = New-DiscoveryRecordFromAgentRun -VMName $jobResult.VMName -AgentRun $agentRun -OutputDirectory $jobResult.VMOutputDirectory
+                Sequence = $fleetResult.Sequence
+                Record = New-DiscoveryRecordFromAgentRun -VMName $fleetResult.VMName -AgentRun $payload -OutputDirectory $vmOutputDirectory
             }
         }
     }
@@ -1210,7 +1152,7 @@ try {
     $runOutputDirectory = New-UniqueOutputDirectory -BasePath (Join-Path $LocalOutputDirectory $timestamp)
 
     $guestCredentialMap = Resolve-GuestCredentialMap -TargetNames $targetVMNames -OverrideCredential $GuestCredential
-    $discoveryRecords = Invoke-DiscoveryPhase -TargetVMNames $targetVMNames -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit
+    $discoveryRecords = Invoke-DiscoveryPhase -TargetVMNames $targetVMNames -Managers $managers -GuestCredentialMap $guestCredentialMap -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -MaxInFlight $ThrottleLimit
     $failedDiscoveryRecords = @($discoveryRecords | Where-Object { @($_.errors).Count -gt 0 })
     if ($failedDiscoveryRecords.Count -gt 0) {
         $scriptExitCode = 1
