@@ -1262,6 +1262,9 @@ try {
                 else {
                     $selectedKeysForPlan = @()
                 }
+
+                Write-Step -Message ('Selected update group key(s): {0}' -f @($selectedKeysForPlan).Count)
+
                 $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
                 $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
                 $patchPlanPath = Join-Path $roundOutputDirectory 'patch-plan.json'

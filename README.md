@@ -202,7 +202,7 @@ Krok po kroku:
 | `-VMListPath .\vms.txt` | Lista maszyn z pliku (jedna na linię, `#` = komentarz). |
 | `-SelectedUpdateKeys '<UpdateID>\|<RevisionNumber>'` | Nieinteraktywny wybór grup aktualizacji. |
 | `-SearchOnly` | Tylko skan (bez pobierania/instalacji). |
-| `-PlanOnly` | Zbuduj plan i zakończ (bez instalacji). |
+| `-PlanOnly` | Zbuduj plan i zakończ (bez instalacji). Sam pyta o wybór grup jak zwykły przebieg; razem z `-SearchOnly` niczego nie wybiera. |
 | `-PatchPlanPath .\out\<run>\patch-plan.json` | Wznów z zapisanego planu. |
 | `-ThrottleLimit <n>` | Ile VM przechodzi jednocześnie przez discovery i apply (domyślnie: wszystkie z listy celów). |
 | `-RebootBatchSize <n>` | Ile VM restartuje się w jednej paczce (gdy pominiesz — skrypt zapyta, Enter = 1). |
@@ -330,6 +330,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-GuestOpsH
 - **StaticChecks** — pilnuje twardych ograniczeń (zakazane komendy, brak PS7, itd.).
 - **ModelChecks** — sprawdza logikę planowania i wyboru aktualizacji.
 - **RuntimeChecks** — sprawdza helpery runtime, throttling i rozwiązywanie nazw VM.
+- **GuestOpsHarnessChecks** — przepuszcza prawdziwy cykl agenta przez podstawiony vSphere.
+  Wymaga zainstalowanego PowerCLI (tylko dla typów .NET — bez vCenter i bez maszyn); gdy go
+  nie ma, sama się pomija i kończy kodem 0.
 
 Launcher odpala te bramki automatycznie przed każdym przebiegiem (chyba że dodasz
 `-SkipStaticChecks`).

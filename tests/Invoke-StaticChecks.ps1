@@ -467,8 +467,11 @@ if ($existingScripts.ContainsKey($runtimeHelperPath)) {
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'reboot-actions.json'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Invoke-InProcessAgentFleet'
     # AST, not text: the rule is "no interactive prompt is called from here", which a comment
-    # explaining why the prompt lives elsewhere must not trip.
+    # explaining why the prompt lives elsewhere must not trip. The AST pass only sees
+    # statically-named commands, so the literal scan backs it up for dynamic dispatch -
+    # Set-Alias, Invoke-Expression, & $name - exactly as it does for $forbiddenCommands.
     Assert-NoForbiddenCommand -Ast $runtimeHelperAst -RelativePath $runtimeHelperPath -ForbiddenNames @('Read-Host')
+    Assert-NoForbiddenCommandLiteral -RelativePath $runtimeHelperPath -Text $runtimeHelperText -ForbiddenNames @('Read-Host')
 }
 
 if ($existingScripts.ContainsKey($launcherPath)) {

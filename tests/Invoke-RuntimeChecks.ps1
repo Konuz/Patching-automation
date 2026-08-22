@@ -176,6 +176,15 @@ $trulyIncompleteCycle = [pscustomobject]@{
 }
 $incompleteResult = New-ApplyResultFromCycle -VMName 'VM02' -Cycle $trulyIncompleteCycle
 Assert-Equal -Actual $incompleteResult.outcome -Expected 'Failed' -Message 'a non-terminal status.json is still an apply failure'
+
+# 'SearchOnly' is a discovery outcome. Seeing it on the apply path means the guest ran the
+# wrong thing, so it must not be accepted as a terminal apply result that overrides a lost
+# process result - that would report a search as a successful install.
+$searchOnlyOnApplyCycle = [pscustomobject]@{
+    AgentResult = $null
+    Status = [pscustomobject]@{ outcome = 'SearchOnly'; finishedAt = '2026-08-22T10:00:00.0000000Z'; installResult = $null; pendingRebootAfter = $null; errors = @() }
+}
+Assert-Equal -Actual (New-ApplyResultFromCycle -VMName 'VM06' -Cycle $searchOnlyOnApplyCycle).outcome -Expected 'Failed' -Message 'a discovery outcome on the apply path is not a terminal apply result'
 Assert-Contains -Text ([string]$incompleteResult.reason) -Needle 'did not complete' -Message 'a genuinely incomplete apply says so'
 
 # A terminal outcome without finishedAt is not enough: the agent saves status.json eagerly,
@@ -395,8 +404,12 @@ Assert-Equal -Actual $nonInteractiveDecision.NeedsOperatorDecision -Expected $fa
 Assert-Equal -Actual $nonInteractiveDecision.AllGreen -Expected $false -Message 'stopping with pending VMs is still not all green'
 Assert-Contains -Text ([string]$nonInteractiveDecision.Reason) -Needle 'SkipConfirmation' -Message 'stopping non-interactively explains itself'
 
-# An all-green non-interactive run must still report success, not be treated as a forced stop.
+# Both stop rules must sit BELOW the pending-count check, or a run that finished successfully
+# would be reported as a forced stop and exit 1. Without these two assertions the ordering
+# could be inverted and every other round-decision assertion would still pass.
 Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundGreen -Round 2 -MaxRounds 3 -OperatorDecision $null -NonInteractive $true).AllGreen -Expected $true -Message 'a non-interactive run that reached green reports green'
+Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundGreen -Round 2 -MaxRounds 3 -OperatorDecision $null -ExplicitSelectionOnly $true).AllGreen -Expected $true -Message 'an explicit-key run that reached green reports green'
+Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundGreen -Round 2 -MaxRounds 3 -OperatorDecision $null -ExplicitSelectionOnly $true -NonInteractive $true).AllGreen -Expected $true -Message 'both stop rules together still report a green run as green'
 Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundPending -Round 2 -MaxRounds 3 -OperatorDecision 'FINISH').Action -Expected 'Stop' -Message 'operator FINISH ends the loop'
 Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundPending -Round 2 -MaxRounds 3 -OperatorDecision 'FINISH').AllGreen -Expected $false -Message 'finishing with pending VMs is not all green'
 
