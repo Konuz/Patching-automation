@@ -450,6 +450,8 @@ if ($existingScripts.ContainsKey($modelPath)) {
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'New-PatchPlanRecords'
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'ConvertTo-PatchPlanRecords'
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'ConvertTo-PatchSummaryRows'
+    Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'Get-VMPatchCompletionStates'
+    Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'Get-NextRoundVMNames'
 }
 
 if ($existingScripts.ContainsKey($modelTestPath)) {

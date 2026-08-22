@@ -384,6 +384,51 @@ $normalizedKeylessPlan = @(ConvertTo-PatchPlanRecords -InputObject $keylessPlanI
 Assert-Equal -Actual @($normalizedKeylessPlan[0].selectedUpdates).Count -Expected 1 -Message 'resume plan normalization drops a selected update without an identity key'
 Assert-Equal -Actual $normalizedKeylessPlan[0].selectedUpdates[0].identityKey -Expected '99999999-9999-9999-9999-999999999999|3' -Message 'resume plan normalization keeps the keyed selected update'
 
+# --- patch completion state (round loop) ---
+
+$greenDiscovery = @(
+    [pscustomobject]@{ vmName = 'VM01'; outcome = 'NoApplicableUpdates'; errors = @(); roleFlags = $null; updates = @() },
+    [pscustomobject]@{ vmName = 'VM02'; outcome = 'SearchOnly'; errors = @(); roleFlags = $null; updates = @(
+        [pscustomobject]@{ updateId = 'aaaaaaaa-1111-1111-1111-111111111111'; revisionNumber = 1; title = 'Security Update for Windows'; kbArticleIds = @('5000001'); categories = @('Security Updates'); msrcSeverity = 'Critical'; updateType = 'Software' }
+    ) },
+    [pscustomobject]@{ vmName = 'VM03'; outcome = 'SearchOnly'; errors = @(); roleFlags = $null; updates = @(
+        [pscustomobject]@{ updateId = 'bbbbbbbb-2222-2222-2222-222222222222'; revisionNumber = 1; title = 'Intel Driver Update'; kbArticleIds = @(); categories = @('Drivers'); msrcSeverity = $null; updateType = 'Driver' }
+    ) },
+    [pscustomobject]@{ vmName = 'VM04'; outcome = 'SearchOnly'; errors = @(); roleFlags = [pscustomobject]@{ failoverCluster = $true; detected = @('FailoverCluster') }; updates = @() },
+    [pscustomobject]@{ vmName = 'VM05'; outcome = 'DiscoveryFailed'; errors = @('GuestOps timed out'); roleFlags = $null; updates = @() }
+)
+$greenGroups = @(New-UpdateGroupRecords -DiscoveryRecords $greenDiscovery)
+$greenStates = @(Get-VMPatchCompletionStates -DiscoveryRecords $greenDiscovery -UpdateGroups $greenGroups)
+
+function Get-StateFor {
+    param($States, [string]$VMName)
+    return @($States | Where-Object { $_.vmName -eq $VMName })[0]
+}
+
+Assert-Equal -Actual (Get-StateFor -States $greenStates -VMName 'VM01').state -Expected 'Green' -Message 'VM without applicable updates is green'
+Assert-Equal -Actual (Get-StateFor -States $greenStates -VMName 'VM02').state -Expected 'Pending' -Message 'VM with a default-selectable update is pending'
+Assert-Equal -Actual (Get-StateFor -States $greenStates -VMName 'VM02').pendingSelectableCount -Expected 1 -Message 'pending VM reports how many selectable groups remain'
+Assert-Equal -Actual (Get-StateFor -States $greenStates -VMName 'VM03').state -Expected 'Green' -Message 'driver-only leftovers do not block green'
+Assert-Equal -Actual (Get-StateFor -States $greenStates -VMName 'VM04').state -Expected 'Excluded' -Message 'failover cluster VM is excluded, never green'
+Assert-Equal -Actual (Get-StateFor -States $greenStates -VMName 'VM05').state -Expected 'Failed' -Message 'discovery failure is not green'
+
+$deselectedStates = @(Get-VMPatchCompletionStates -DiscoveryRecords $greenDiscovery -UpdateGroups $greenGroups -DeselectedUpdateKeys @('aaaaaaaa-1111-1111-1111-111111111111|1'))
+Assert-Equal -Actual (Get-StateFor -States $deselectedStates -VMName 'VM02').state -Expected 'GreenByOperatorChoice' -Message 'operator-deselected group does not keep the VM pending'
+
+# A revision bump between rounds must not resurrect a group the operator already rejected.
+$revisedDiscovery = @(
+    [pscustomobject]@{ vmName = 'VM02'; outcome = 'SearchOnly'; errors = @(); roleFlags = $null; updates = @(
+        [pscustomobject]@{ updateId = 'aaaaaaaa-1111-1111-1111-111111111111'; revisionNumber = 2; title = 'Security Update for Windows'; kbArticleIds = @('5000001'); categories = @('Security Updates'); msrcSeverity = 'Critical'; updateType = 'Software' }
+    ) }
+)
+$revisedGroups = @(New-UpdateGroupRecords -DiscoveryRecords $revisedDiscovery)
+$revisedStates = @(Get-VMPatchCompletionStates -DiscoveryRecords $revisedDiscovery -UpdateGroups $revisedGroups -DeselectedUpdateKeys @('aaaaaaaa-1111-1111-1111-111111111111|1'))
+Assert-Equal -Actual (Get-StateFor -States $revisedStates -VMName 'VM02').state -Expected 'GreenByOperatorChoice' -Message 'a revision bump does not resurrect a deselected group'
+
+$nextRound = @(Get-NextRoundVMNames -CompletionStates $greenStates)
+Assert-Equal -Actual $nextRound.Count -Expected 1 -Message 'only pending VMs enter the next round'
+Assert-Equal -Actual $nextRound[0] -Expected 'VM02' -Message 'next round targets the pending VM'
+
 if ($failures.Count -gt 0) {
     Write-Host 'Model checks failed:'
     foreach ($failure in $failures) {

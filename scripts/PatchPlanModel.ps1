@@ -472,6 +472,115 @@ function ConvertTo-PatchPlanRecords {
     return @($records)
 }
 
+function Get-VMPatchCompletionStates {
+    param(
+        $DiscoveryRecords,
+        $UpdateGroups,
+        [string[]]$DeselectedUpdateKeys = @()
+    )
+
+    # Match a deselected group both on the full identity key and on the bare updateId. The
+    # key carries RevisionNumber, so WUA revising a package between rounds would otherwise
+    # resurrect a group the operator already rejected and the loop would never converge.
+    $deselectedLookup = @{}
+    foreach ($deselectedKey in @($DeselectedUpdateKeys)) {
+        $keyText = ([string]$deselectedKey).Trim()
+        if ([string]::IsNullOrWhiteSpace($keyText)) {
+            continue
+        }
+
+        $deselectedLookup[$keyText] = $true
+        $deselectedLookup[($keyText -split '\|', 2)[0]] = $true
+    }
+
+    # Only groups the default policy would pick can keep a VM out of "green". Drivers,
+    # preview and optional updates linger on a healthy server forever, so counting them
+    # would mean the patch round loop never converges.
+    $pendingCountByVm = @{}
+    $deselectedCountByVm = @{}
+    foreach ($group in @($UpdateGroups)) {
+        if ($null -eq $group -or -not [bool](Get-ModelPropertyValue -InputObject $group -Name 'selectedByDefault' -DefaultValue $false)) {
+            continue
+        }
+
+        $identityKey = [string](Get-ModelPropertyValue -InputObject $group -Name 'identityKey')
+        $updateIdOnly = [string](Get-ModelPropertyValue -InputObject $group -Name 'updateId')
+        $isDeselected = ($deselectedLookup.ContainsKey($identityKey) -or (-not [string]::IsNullOrWhiteSpace($updateIdOnly) -and $deselectedLookup.ContainsKey($updateIdOnly)))
+
+        foreach ($patchableVmName in @(Get-ModelPropertyValue -InputObject $group -Name 'patchableVmNames' -DefaultValue @())) {
+            $vmKey = [string]$patchableVmName
+            if ([string]::IsNullOrWhiteSpace($vmKey)) {
+                continue
+            }
+
+            if ($isDeselected) {
+                if (-not $deselectedCountByVm.ContainsKey($vmKey)) { $deselectedCountByVm[$vmKey] = 0 }
+                $deselectedCountByVm[$vmKey]++
+            }
+            else {
+                if (-not $pendingCountByVm.ContainsKey($vmKey)) { $pendingCountByVm[$vmKey] = 0 }
+                $pendingCountByVm[$vmKey]++
+            }
+        }
+    }
+
+    $states = @()
+    foreach ($discoveryRecord in @($DiscoveryRecords)) {
+        if ($null -eq $discoveryRecord) {
+            continue
+        }
+
+        $vmName = [string](Get-ModelPropertyValue -InputObject $discoveryRecord -Name 'vmName')
+        if ([string]::IsNullOrWhiteSpace($vmName)) {
+            continue
+        }
+
+        $recordErrors = @(Get-ModelPropertyValue -InputObject $discoveryRecord -Name 'errors' -DefaultValue @() | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+        $outcome = [string](Get-ModelPropertyValue -InputObject $discoveryRecord -Name 'outcome')
+        $pendingCount = if ($pendingCountByVm.ContainsKey($vmName)) { [int]$pendingCountByVm[$vmName] } else { 0 }
+        $deselectedCount = if ($deselectedCountByVm.ContainsKey($vmName)) { [int]$deselectedCountByVm[$vmName] } else { 0 }
+
+        if (Test-IsFailoverClusterDiscoveryRecord -DiscoveryRecord $discoveryRecord) {
+            $state = 'Excluded'
+            $reason = 'Skipped: Failover Cluster detected. Please update manually one by one.'
+        }
+        elseif ($recordErrors.Count -gt 0 -or $outcome -notin @('SearchOnly', 'NoApplicableUpdates')) {
+            $state = 'Failed'
+            $reason = ('Discovery did not succeed (outcome {0}).' -f $outcome)
+        }
+        elseif ($pendingCount -gt 0) {
+            $state = 'Pending'
+            $reason = ('{0} selectable update group(s) still apply.' -f $pendingCount)
+        }
+        elseif ($deselectedCount -gt 0) {
+            $state = 'GreenByOperatorChoice'
+            $reason = ('{0} selectable update group(s) remain but were deselected by the operator.' -f $deselectedCount)
+        }
+        else {
+            $state = 'Green'
+            $reason = 'No selectable updates remain.'
+        }
+
+        $states += [pscustomobject]@{
+            vmName = $vmName
+            state = $state
+            reason = $reason
+            outcome = $outcome
+            pendingSelectableCount = $pendingCount
+            deselectedSelectableCount = $deselectedCount
+            errors = @($recordErrors)
+        }
+    }
+
+    return @($states)
+}
+
+function Get-NextRoundVMNames {
+    param($CompletionStates)
+
+    return @(@($CompletionStates) | Where-Object { [string]$_.state -eq 'Pending' } | ForEach-Object { [string]$_.vmName })
+}
+
 function ConvertTo-PatchSummaryRows {
     param($PatchPlanRecords)
 
