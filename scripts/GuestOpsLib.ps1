@@ -522,66 +522,42 @@ function Get-ObjectPropertyValue {
     return $current
 }
 
-function Invoke-GuestAgentRun {
+function New-VMAgentCycleHandle {
     param(
-        $ProcessManager,
-        $FileManager,
+        [string]$VMName,
+        $Managers,
         $VMView,
         $GuestAuth,
         [string]$HostName,
         [string]$CurlPath,
-        [string]$GuestAgentPath,
-        [string]$GuestWorkingDirectory,
+        [long]$ProcessId,
         [string]$GuestStatusPath,
         [string]$GuestLogPath,
         [string]$LocalStatusPath,
         [string]$LocalLogPath,
-        [int]$MaxUpdates,
-        [string[]]$SelectedUpdateKeys = @(),
-        [string]$SelectionPath,
-        [switch]$SearchOnly,
-        [int]$TimeoutSeconds,
-        [int]$PollSeconds,
-        [string]$Description
+        [int]$TransferTimeoutSeconds = 300
     )
 
-    Write-Step -Message $Description
-    $agentProcessId = Start-GuestAgent -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -SearchOnly:$SearchOnly
-
-    $agentResult = Wait-GuestProcess -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -ProcessId $agentProcessId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
-
-    $artifactErrors = @()
-    try {
-        Receive-GuestFile -FileManager $FileManager -VMView $VMView -GuestAuth $GuestAuth -HostName $HostName -CurlPath $CurlPath -GuestPath $GuestStatusPath -LocalPath $LocalStatusPath
-    }
-    catch {
-        $artifactErrors += ('status.json download failed: {0}' -f $_.Exception.Message)
-    }
-
-    try {
-        Receive-GuestFile -FileManager $FileManager -VMView $VMView -GuestAuth $GuestAuth -HostName $HostName -CurlPath $CurlPath -GuestPath $GuestLogPath -LocalPath $LocalLogPath
-    }
-    catch {
-        $artifactErrors += ('agent.log download failed: {0}' -f $_.Exception.Message)
-    }
-
-    if ($artifactErrors.Count -gt 0) {
-        foreach ($artifactError in $artifactErrors) {
-            Write-Warning $artifactError
-        }
-    }
-
-    if (-not (Test-Path -LiteralPath $LocalStatusPath -PathType Leaf)) {
-        throw ('status.json was not downloaded. Output directory: {0}' -f (Split-Path -Parent $LocalStatusPath))
-    }
-
     return [pscustomobject]@{
-        AgentResult = $agentResult
-        Status = Get-Content -LiteralPath $LocalStatusPath -Raw | ConvertFrom-Json
+        VMName = $VMName
+        Managers = $Managers
+        VMView = $VMView
+        GuestAuth = $GuestAuth
+        HostName = $HostName
+        CurlPath = $CurlPath
+        ProcessId = $ProcessId
+        GuestStatusPath = $GuestStatusPath
+        GuestLogPath = $GuestLogPath
+        LocalStatusPath = $LocalStatusPath
+        LocalLogPath = $LocalLogPath
+        TransferTimeoutSeconds = $TransferTimeoutSeconds
+        # Seeded so the property exists before anything reads it: on the fleet timeout path
+        # it is read without a poll ever having written it, and StrictMode is unforgiving.
+        AgentResult = $null
     }
 }
 
-function Invoke-VMAgentCycle {
+function Start-VMAgentCycle {
     param(
         [string]$VMName,
         $Managers,
@@ -596,8 +572,7 @@ function Invoke-VMAgentCycle {
         [string]$LocalSelectionPath,
         [string]$SelectionPath,
         [switch]$SearchOnly,
-        [int]$TimeoutSeconds,
-        [int]$PollSeconds
+        [int]$TransferTimeoutSeconds = 300
     )
 
     $vm = Get-ExactVM -Name $VMName
@@ -623,37 +598,145 @@ function Invoke-VMAgentCycle {
         throw ('Failed to create guest working directory. Completed={0}; ExitCode={1}' -f $mkdirResult.Completed, $mkdirResult.ExitCode)
     }
 
-    Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $AgentPath -GuestPath $guestAgentPath
+    # Every transfer carries a budget. The fleet puts no job wrapper around these calls, so
+    # nothing else bounds a curl hanging against an unresponsive ESXi data plane.
+    Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $AgentPath -GuestPath $guestAgentPath -TimeoutSeconds $TransferTimeoutSeconds
 
     $guestIdentityHelperPath = Join-Path $GuestWorkingDirectory 'UpdateIdentity.ps1'
-    Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $IdentityHelperPath -GuestPath $guestIdentityHelperPath
+    Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $IdentityHelperPath -GuestPath $guestIdentityHelperPath -TimeoutSeconds $TransferTimeoutSeconds
 
     if (-not [string]::IsNullOrWhiteSpace($LocalSelectionPath) -and -not [string]::IsNullOrWhiteSpace($SelectionPath)) {
-        Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $LocalSelectionPath -GuestPath $SelectionPath
+        Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $LocalSelectionPath -GuestPath $SelectionPath -TimeoutSeconds $TransferTimeoutSeconds
     }
 
-    $agentRunParams = @{
-        ProcessManager = $Managers.ProcessManager
-        FileManager = $Managers.FileManager
-        VMView = $vmView
-        GuestAuth = $GuestAuth
-        HostName = $hostName
-        CurlPath = $CurlPath
-        GuestAgentPath = $guestAgentPath
-        GuestWorkingDirectory = $GuestWorkingDirectory
-        GuestStatusPath = $guestStatusPath
-        GuestLogPath = $guestLogPath
-        LocalStatusPath = $localStatusPath
-        LocalLogPath = $localLogPath
-        TimeoutSeconds = $TimeoutSeconds
-        PollSeconds = $PollSeconds
+    $agentProcessId = Start-GuestAgent -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -GuestAgentPath $guestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -SearchOnly:$SearchOnly
+
+    return New-VMAgentCycleHandle -VMName $VMName -Managers $Managers -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -ProcessId $agentProcessId -GuestStatusPath $guestStatusPath -GuestLogPath $guestLogPath -LocalStatusPath $localStatusPath -LocalLogPath $localLogPath -TransferTimeoutSeconds $TransferTimeoutSeconds
+}
+
+function Test-VMAgentCycleComplete {
+    param($Handle)
+
+    $processes = @($Handle.Managers.ProcessManager.ListProcessesInGuest($Handle.VMView.MoRef, $Handle.GuestAuth, @([long]$Handle.ProcessId)))
+
+    if ($processes.Count -eq 0) {
+        # vSphere keeps finished process info only for a limited window. Starting a fleet is
+        # sequential, so the first guest can finish before the poll loop ever reaches it, and
+        # an empty list then means "ended, exit code lost" - never "still running". Treating
+        # it as running would spin until the item timeout on a guest that finished long ago.
+        # status.json is the primary result anyway, so hand back the shape Wait-GuestProcess
+        # uses for a lost result and let the artifacts decide.
+        return [pscustomobject]@{ Completed = $false; ExitCode = $null; EndTime = $null }
     }
 
-    if ($SearchOnly) {
-        return Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SearchOnly -Description ('Starting guest WUA search for {0}.' -f $VMName)
+    $process = $processes[0]
+    if ($null -ne $process.EndTime -or $null -ne $process.ExitCode) {
+        return [pscustomobject]@{ Completed = $true; ExitCode = $process.ExitCode; EndTime = $process.EndTime }
     }
 
-    return Invoke-GuestAgentRun @agentRunParams -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -Description ('Starting guest WUA install for {0}.' -f $VMName)
+    # A null result means one thing only: the process is still running.
+    return $null
+}
+
+function Complete-VMAgentCycle {
+    param(
+        $Handle,
+        $AgentResult
+    )
+
+    $artifactErrors = @()
+    try {
+        Receive-GuestFile -FileManager $Handle.Managers.FileManager -VMView $Handle.VMView -GuestAuth $Handle.GuestAuth -HostName $Handle.HostName -CurlPath $Handle.CurlPath -GuestPath $Handle.GuestStatusPath -LocalPath $Handle.LocalStatusPath -TimeoutSeconds $Handle.TransferTimeoutSeconds
+    }
+    catch {
+        $artifactErrors += ('status.json download failed: {0}' -f $_.Exception.Message)
+    }
+
+    try {
+        Receive-GuestFile -FileManager $Handle.Managers.FileManager -VMView $Handle.VMView -GuestAuth $Handle.GuestAuth -HostName $Handle.HostName -CurlPath $Handle.CurlPath -GuestPath $Handle.GuestLogPath -LocalPath $Handle.LocalLogPath -TimeoutSeconds $Handle.TransferTimeoutSeconds
+    }
+    catch {
+        $artifactErrors += ('agent.log download failed: {0}' -f $_.Exception.Message)
+    }
+
+    if ($artifactErrors.Count -gt 0) {
+        foreach ($artifactError in $artifactErrors) {
+            Write-Warning $artifactError
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $Handle.LocalStatusPath -PathType Leaf)) {
+        throw ('status.json was not downloaded. Output directory: {0}' -f (Split-Path -Parent $Handle.LocalStatusPath))
+    }
+
+    return [pscustomobject]@{
+        AgentResult = $AgentResult
+        Status = Get-Content -LiteralPath $Handle.LocalStatusPath -Raw | ConvertFrom-Json
+    }
+}
+
+function Invoke-GuestAgentRun {
+    param(
+        $ProcessManager,
+        $FileManager,
+        $VMView,
+        $GuestAuth,
+        [string]$HostName,
+        [string]$CurlPath,
+        [string]$GuestAgentPath,
+        [string]$GuestWorkingDirectory,
+        [string]$GuestStatusPath,
+        [string]$GuestLogPath,
+        [string]$LocalStatusPath,
+        [string]$LocalLogPath,
+        [int]$MaxUpdates,
+        [string[]]$SelectedUpdateKeys = @(),
+        [string]$SelectionPath,
+        [switch]$SearchOnly,
+        [int]$TimeoutSeconds,
+        [int]$PollSeconds,
+        [int]$TransferTimeoutSeconds = 300,
+        [string]$Description
+    )
+
+    Write-Step -Message $Description
+    $agentProcessId = Start-GuestAgent -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -SearchOnly:$SearchOnly
+
+    $agentResult = Wait-GuestProcess -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -ProcessId $agentProcessId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
+
+    $handle = New-VMAgentCycleHandle -VMName '' -Managers ([pscustomobject]@{ ProcessManager = $ProcessManager; FileManager = $FileManager }) -VMView $VMView -GuestAuth $GuestAuth -HostName $HostName -CurlPath $CurlPath -ProcessId $agentProcessId -GuestStatusPath $GuestStatusPath -GuestLogPath $GuestLogPath -LocalStatusPath $LocalStatusPath -LocalLogPath $LocalLogPath -TransferTimeoutSeconds $TransferTimeoutSeconds
+
+    return Complete-VMAgentCycle -Handle $handle -AgentResult $agentResult
+}
+
+function Invoke-VMAgentCycle {
+    param(
+        [string]$VMName,
+        $Managers,
+        $GuestAuth,
+        [string]$CurlPath,
+        [string]$AgentPath,
+        [string]$IdentityHelperPath,
+        [string]$GuestWorkingDirectory,
+        [string]$VMOutputDirectory,
+        [int]$MaxUpdates,
+        [string[]]$SelectedUpdateKeys = @(),
+        [string]$LocalSelectionPath,
+        [string]$SelectionPath,
+        [switch]$SearchOnly,
+        [int]$TimeoutSeconds,
+        [int]$PollSeconds,
+        [int]$TransferTimeoutSeconds = 300
+    )
+
+    $description = if ($SearchOnly) { 'Starting guest WUA search for {0}.' -f $VMName } else { 'Starting guest WUA install for {0}.' -f $VMName }
+    Write-Step -Message $description
+
+    $handle = Start-VMAgentCycle -VMName $VMName -Managers $Managers -GuestAuth $GuestAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $VMOutputDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -LocalSelectionPath $LocalSelectionPath -SelectionPath $SelectionPath -SearchOnly:$SearchOnly -TransferTimeoutSeconds $TransferTimeoutSeconds
+
+    $agentResult = Wait-GuestProcess -ProcessManager $handle.Managers.ProcessManager -VMView $handle.VMView -GuestAuth $handle.GuestAuth -ProcessId $handle.ProcessId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
+
+    return Complete-VMAgentCycle -Handle $handle -AgentResult $agentResult
 }
 
 function Invoke-VMGuestReboot {
