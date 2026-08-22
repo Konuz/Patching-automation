@@ -307,6 +307,66 @@ Assert-Equal -Actual (Test-RebootActionsAllConfirmed -RebootActions @([pscustomo
 Assert-Equal -Actual (Test-RebootActionsAllConfirmed -RebootActions @([pscustomobject]@{ vmName = 'VM01'; action = 'Failed'; validationStatus = 'InitiationError' })) -Expected $false -Message 'a failed initiation is not proof the VM is up'
 Assert-Equal -Actual (Test-RebootActionsAllConfirmed -RebootActions @()) -Expected $true -Message 'no reboot targets means nothing blocks the next discovery'
 
+# --- patch round loop decisions ---
+
+$roundGreen = @(
+    [pscustomobject]@{ vmName = 'VM01'; state = 'Green' },
+    [pscustomobject]@{ vmName = 'VM02'; state = 'GreenByOperatorChoice' },
+    [pscustomobject]@{ vmName = 'VM03'; state = 'Excluded' }
+)
+$decisionGreen = Get-PatchRoundDecision -CompletionStates $roundGreen -Round 2 -MaxRounds 3 -OperatorDecision $null
+Assert-Equal -Actual $decisionGreen.Action -Expected 'Stop' -Message 'an all-green fleet ends the loop'
+Assert-Equal -Actual $decisionGreen.AllGreen -Expected $true -Message 'an excluded cluster VM does not stop the fleet being all green'
+Assert-Equal -Actual $decisionGreen.NeedsOperatorDecision -Expected $false -Message 'an all-green fleet never prompts'
+
+# Round one always proceeds to group selection, even with nothing preselected: the operator
+# must still get to see the group list and tick something the default policy skipped.
+$nothingSelectable = @([pscustomobject]@{ vmName = 'VM01'; state = 'Green' })
+Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $nothingSelectable -Round 1 -MaxRounds 3 -OperatorDecision $null).Action -Expected 'Continue' -Message 'round one reaches group selection even when nothing is preselected'
+
+$roundPending = @(
+    [pscustomobject]@{ vmName = 'VM01'; state = 'Green' },
+    [pscustomobject]@{ vmName = 'VM02'; state = 'Pending' }
+)
+Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundPending -Round 1 -MaxRounds 3 -OperatorDecision $null).NeedsOperatorDecision -Expected $false -Message 'round one needs no continue prompt'
+Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundPending -Round 2 -MaxRounds 3 -OperatorDecision $null).Action -Expected 'Ask' -Message 'a later round with pending VMs asks the operator'
+Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundPending -Round 2 -MaxRounds 3 -OperatorDecision 'CONTINUE').Action -Expected 'Continue' -Message 'operator CONTINUE runs another round'
+Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundPending -Round 2 -MaxRounds 3 -OperatorDecision 'FINISH').Action -Expected 'Stop' -Message 'operator FINISH ends the loop'
+Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundPending -Round 2 -MaxRounds 3 -OperatorDecision 'FINISH').AllGreen -Expected $false -Message 'finishing with pending VMs is not all green'
+
+# MaxRounds counts apply rounds: with 3, rounds 1-3 apply and round 4 only verifies.
+Assert-Equal -Actual (Get-PatchRoundDecision -CompletionStates $roundPending -Round 3 -MaxRounds 3 -OperatorDecision 'CONTINUE').Action -Expected 'Continue' -Message 'the last allowed apply round still runs'
+$decisionCapped = Get-PatchRoundDecision -CompletionStates $roundPending -Round 4 -MaxRounds 3 -OperatorDecision 'CONTINUE'
+Assert-Equal -Actual $decisionCapped.Action -Expected 'Stop' -Message 'the round cap stops the loop even on CONTINUE'
+Assert-Contains -Text ([string]$decisionCapped.Reason) -Needle 'MaxPatchRounds' -Message 'the cap explains itself'
+Assert-Equal -Actual (@($decisionCapped.PendingVMNames)[0]) -Expected 'VM02' -Message 'a stopped round still reports what was left pending'
+
+# A VM that failed in round one drops out of round two's targets, so reading the verdict off
+# the last round alone would let its failure vanish and the run exit 0 on a machine nobody
+# rechecked.
+$mergedStates = @{}
+Merge-PatchRunStates -StateMap $mergedStates -CompletionStates @(
+    [pscustomobject]@{ vmName = 'VM02'; state = 'Pending'; reason = 'r' },
+    [pscustomobject]@{ vmName = 'VM05'; state = 'Failed'; reason = 'r' }
+)
+Merge-PatchRunStates -StateMap $mergedStates -CompletionStates @(
+    [pscustomobject]@{ vmName = 'VM02'; state = 'Green'; reason = 'r' }
+)
+
+Assert-Equal -Actual $mergedStates.Count -Expected 2 -Message 'the merged verdict keeps VMs that dropped out of later rounds'
+Assert-Equal -Actual ([string]$mergedStates['VM02'].state) -Expected 'Green' -Message 'a later round overwrites the state of its own targets'
+Assert-Equal -Actual ([string]$mergedStates['VM05'].state) -Expected 'Failed' -Message 'a VM absent from the later round keeps its earlier failure'
+Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $mergedStates) -Expected $false -Message 'an unresolved failure keeps the run from being all green'
+
+$greenStateMap = @{}
+Merge-PatchRunStates -StateMap $greenStateMap -CompletionStates @(
+    [pscustomobject]@{ vmName = 'VM01'; state = 'Green'; reason = 'r' },
+    [pscustomobject]@{ vmName = 'VM02'; state = 'GreenByOperatorChoice'; reason = 'r' },
+    [pscustomobject]@{ vmName = 'VM03'; state = 'Excluded'; reason = 'r' }
+)
+Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $greenStateMap) -Expected $true -Message 'green, operator-accepted and excluded VMs together are all green'
+Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap @{}) -Expected $true -Message 'an empty run is vacuously all green'
+
 $telemetryRecord = New-RebootActionRecord -VMName 'VM03' -Action 'Initiated' -ProcessId 43 -RebootReason 'Reported after apply' -BatchNumber 2 -BootTimeBaseline $baseTime -BootTimeObserved $newTime -ValidationStatus 'Timeout' -WaitSeconds 30 -AttemptCount 3 -TimeoutCount 2 -LastErrorMessage 'VMware Tools are not running' -OperatorDecision 'ABORT'
 Assert-Equal -Actual (Get-ObjectPropertyValue -InputObject $telemetryRecord -Path @('attemptCount')) -Expected 3 -Message 'reboot record stores observation attempt count'
 Assert-Equal -Actual (Get-ObjectPropertyValue -InputObject $telemetryRecord -Path @('timeoutCount')) -Expected 2 -Message 'reboot record stores timeout count'

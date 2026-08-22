@@ -498,6 +498,116 @@ function Test-RebootActionsSuccessful {
     return $true
 }
 
+function Get-PatchRoundDecision {
+    param(
+        $CompletionStates,
+        [int]$Round,
+        [int]$MaxRounds,
+        [string]$OperatorDecision
+    )
+
+    $states = @($CompletionStates)
+    $pending = @($states | Where-Object { [string]$_.state -eq 'Pending' })
+    $pendingVMNames = @($pending | ForEach-Object { [string]$_.vmName })
+    # Excluded VMs (Failover Cluster) can never be patched by this tool, so they must not
+    # count against "all green" - otherwise the run would never settle over a VM it will
+    # never touch. Failed discovery is not green and is not retryable here either.
+    $allGreen = (@($states | Where-Object { [string]$_.state -in @('Pending', 'Failed') }).Count -eq 0)
+
+    # Round one always proceeds to group selection, even with nothing preselected: the
+    # operator must still get to see the group list and tick something the default policy
+    # skipped. Checking $pending first would end the run before the groups are ever shown.
+    if ($Round -le 1) {
+        return [pscustomobject]@{
+            Action = 'Continue'
+            AllGreen = $allGreen
+            NeedsOperatorDecision = $false
+            PendingVMNames = $pendingVMNames
+            Reason = 'First patching round.'
+        }
+    }
+
+    if ($pending.Count -eq 0) {
+        $stopReason = if ($allGreen) { 'Every VM is green.' } else { 'No VM can be patched further in this run.' }
+        return [pscustomobject]@{
+            Action = 'Stop'
+            AllGreen = $allGreen
+            NeedsOperatorDecision = $false
+            PendingVMNames = @()
+            Reason = $stopReason
+        }
+    }
+
+    # MaxRounds counts apply rounds. Round MaxRounds+1 still runs its discovery, which is the
+    # verification of the last apply, and then stops.
+    if ($Round -gt $MaxRounds) {
+        return [pscustomobject]@{
+            Action = 'Stop'
+            AllGreen = $false
+            NeedsOperatorDecision = $false
+            PendingVMNames = $pendingVMNames
+            Reason = ('Stopping after round {0}: MaxPatchRounds is {1}.' -f $Round, $MaxRounds)
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($OperatorDecision)) {
+        return [pscustomobject]@{
+            Action = 'Ask'
+            AllGreen = $false
+            NeedsOperatorDecision = $true
+            PendingVMNames = $pendingVMNames
+            Reason = ('{0} VM(s) still have selectable updates after the reboot.' -f $pending.Count)
+        }
+    }
+
+    if ($OperatorDecision -eq 'CONTINUE') {
+        return [pscustomobject]@{
+            Action = 'Continue'
+            AllGreen = $false
+            NeedsOperatorDecision = $false
+            PendingVMNames = $pendingVMNames
+            Reason = 'Operator chose to continue patching.'
+        }
+    }
+
+    return [pscustomobject]@{
+        Action = 'Stop'
+        AllGreen = $false
+        NeedsOperatorDecision = $false
+        PendingVMNames = $pendingVMNames
+        Reason = 'Operator finished patching with updates still pending.'
+    }
+}
+
+function Merge-PatchRunStates {
+    param(
+        [hashtable]$StateMap,
+        $CompletionStates
+    )
+
+    # Later rounds only target VMs that were still Pending, so a VM that failed discovery in
+    # round one simply is not in round two's records. Reading the verdict off the last round
+    # alone would let that failure vanish and the run exit 0 on a machine nobody rechecked.
+    foreach ($state in @($CompletionStates)) {
+        $vmName = [string]$state.vmName
+        if (-not [string]::IsNullOrWhiteSpace($vmName)) {
+            $StateMap[$vmName] = $state
+        }
+    }
+}
+
+function Test-PatchRunAllGreen {
+    param([hashtable]$StateMap)
+
+    foreach ($vmName in @($StateMap.Keys)) {
+        if ([string]$StateMap[$vmName].state -in @('Pending', 'Failed')) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
 function Test-RebootActionsAllConfirmed {
     param($RebootActions)
 
@@ -570,6 +680,71 @@ function Write-RebootActionArtifacts {
     }
 
     Add-Content -LiteralPath $summaryPath -Value $lines -Encoding UTF8
+}
+
+function Write-PatchRunSummary {
+    param(
+        [string]$RunOutputDirectory,
+        $RoundSummaries,
+        [hashtable]$FinalStateMap
+    )
+
+    $rounds = @($RoundSummaries)
+    $roundsPath = Join-Path $RunOutputDirectory 'rounds.json'
+    $rounds | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $roundsPath -Encoding UTF8
+
+    $finalStates = @(@($FinalStateMap.Keys) | Sort-Object | ForEach-Object { $FinalStateMap[$_] })
+    $green = @($finalStates | Where-Object { [string]$_.state -eq 'Green' })
+    $greenByChoice = @($finalStates | Where-Object { [string]$_.state -eq 'GreenByOperatorChoice' })
+    $pending = @($finalStates | Where-Object { [string]$_.state -eq 'Pending' })
+    $failed = @($finalStates | Where-Object { [string]$_.state -eq 'Failed' })
+    $excluded = @($finalStates | Where-Object { [string]$_.state -eq 'Excluded' })
+
+    $lines = @()
+    $lines += '# Patch run summary'
+    $lines += ''
+    $lines += ('Output directory: `{0}`' -f $RunOutputDirectory)
+    $lines += ('Patch rounds run: {0}' -f $rounds.Count)
+    $lines += ''
+    $lines += ('- VMs up to date: {0}' -f $green.Count)
+    $lines += ('- VMs up to date except operator-deselected updates: {0}' -f $greenByChoice.Count)
+    $lines += ('- VMs still having selectable updates: {0}' -f $pending.Count)
+    $lines += ('- VMs whose discovery failed: {0}' -f $failed.Count)
+    $lines += ('- VMs excluded from patching: {0}' -f $excluded.Count)
+    $lines += ''
+
+    $lines += '## Rounds'
+    if ($rounds.Count -eq 0) {
+        $lines += '- none'
+    }
+    else {
+        foreach ($round in $rounds) {
+            $lines += ('- Round {0}: {1} VM(s) targeted, artifacts in `{2}`' -f $round.round, @($round.targetVMNames).Count, $round.outputDirectory)
+        }
+    }
+    $lines += ''
+
+    foreach ($section in @(
+        [pscustomobject]@{ Title = 'VMs still having selectable updates'; Rows = $pending },
+        [pscustomobject]@{ Title = 'VMs whose discovery failed'; Rows = $failed },
+        [pscustomobject]@{ Title = 'VMs excluded from patching'; Rows = $excluded },
+        [pscustomobject]@{ Title = 'VMs up to date except operator-deselected updates'; Rows = $greenByChoice },
+        [pscustomobject]@{ Title = 'VMs up to date'; Rows = $green }
+    )) {
+        $lines += ('## {0}' -f $section.Title)
+        if (@($section.Rows).Count -eq 0) {
+            $lines += '- none'
+        }
+        else {
+            foreach ($row in @($section.Rows)) {
+                $lines += ('- {0}: {1}' -f $row.vmName, $row.reason)
+            }
+        }
+        $lines += ''
+    }
+
+    $summaryPath = Join-Path $RunOutputDirectory 'summary.md'
+    Set-Content -LiteralPath $summaryPath -Value $lines -Encoding UTF8
 }
 
 function Wait-RebootBatchBootTimes {

@@ -376,6 +376,49 @@ function Confirm-PatchPlan {
     return ($answer -ieq 'Y' -or $answer -ieq 'Yes')
 }
 
+function Read-ContinuePatchingDecision {
+    param($CompletionStates, [int]$Round)
+
+    Write-Host ''
+    Write-Host ('After round {0} the following VM(s) still have selectable updates:' -f $Round)
+    foreach ($state in @(@($CompletionStates) | Where-Object { [string]$_.state -eq 'Pending' })) {
+        Write-Host ('- {0}: {1}' -f $state.vmName, $state.reason)
+    }
+    Write-Host ''
+    Write-Host 'Actions:'
+    Write-Host '  - CONTINUE  run another patch round for the VMs above.'
+    Write-Host '  - FINISH    stop patching now; the run ends with an error because they are not up to date.'
+    Write-Host ''
+
+    $answer = ''
+    while (@('CONTINUE', 'FINISH') -notcontains $answer) {
+        $answer = ([string](Read-Host 'Choose CONTINUE, FINISH')).Trim().ToUpperInvariant()
+        if (@('CONTINUE', 'FINISH') -notcontains $answer) {
+            Write-Host 'Invalid choice. Options: CONTINUE / FINISH'
+        }
+    }
+
+    return $answer
+}
+
+function Write-PatchRoundVerification {
+    param($CompletionStates, [int]$Round)
+
+    Write-Host ''
+    Write-Host ('Post-reboot verification after round {0}' -f ($Round - 1))
+    Write-Host '---------------------------------------'
+    foreach ($state in @($CompletionStates)) {
+        $verificationColor = switch ([string]$state.state) {
+            'Green' { 'Green' }
+            'GreenByOperatorChoice' { 'Green' }
+            'Excluded' { 'DarkGray' }
+            'Pending' { 'Yellow' }
+            default { 'Red' }
+        }
+        Write-Host ('{0}: {1} - {2}' -f $state.vmName, $state.state, $state.reason) -ForegroundColor $verificationColor
+    }
+}
+
 function Read-RebootBatchSize {
     param([int]$TargetCount)
 
@@ -970,11 +1013,20 @@ function Invoke-ApplyAndOptionalReboot {
         Write-RebootActionArtifacts -CycleOutputDirectory $CycleOutputDirectory -RebootActions $rebootActions
     }
 
+    $exitCode = 1
     if ((Test-ApplyResultsSuccessful -ApplyResults $applyResults) -and (Test-RebootActionsSuccessful -RebootActions $rebootActions)) {
-        return 0
+        $exitCode = 0
     }
 
-    return 1
+    # The round loop needs more than the exit code: it has to know whether a reboot happened
+    # and whether every rebooted guest came back, because it may not run another discovery
+    # against machines that are not provably up.
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        ApplyResults = @($applyResults)
+        RebootActions = @($rebootActions)
+        RebootRan = ($rebootTargets.Count -gt 0)
+    }
 }
 
 function Resolve-GuestCredentialMap {
@@ -1189,7 +1241,12 @@ try {
         }
         else {
             $guestCredentialMap = Resolve-GuestCredentialMap -TargetNames @(@($patchPlanRecords) | ForEach-Object { [string]$_.vmName }) -OverrideCredential $GuestCredential
-            $scriptExitCode = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize
+            # Resume stays a single round. There is no discovery to judge the starting state
+            # from, the saved keys carry a RevisionNumber that will not match a later round's
+            # groups, and resume is typically run non-interactively with -SkipConfirmation,
+            # where a round-two group selection prompt would simply hang.
+            $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize
+            $scriptExitCode = $applyOutcome.ExitCode
         }
 
         exit $scriptExitCode
@@ -1199,20 +1256,80 @@ try {
     $runOutputDirectory = New-UniqueOutputDirectory -BasePath (Join-Path $LocalOutputDirectory $timestamp)
 
     $guestCredentialMap = Resolve-GuestCredentialMap -TargetNames $targetVMNames -OverrideCredential $GuestCredential
-    $discoveryRecords = Invoke-DiscoveryPhase -TargetVMNames $targetVMNames -Managers $managers -GuestCredentialMap $guestCredentialMap -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -MaxInFlight $ThrottleLimit
-    $failedDiscoveryRecords = @($discoveryRecords | Where-Object { @($_.errors).Count -gt 0 })
-    if ($failedDiscoveryRecords.Count -gt 0) {
-        $scriptExitCode = 1
-    }
-    else {
-        $scriptExitCode = 0
-    }
 
-    $updateGroups = @(New-UpdateGroupRecords -DiscoveryRecords $discoveryRecords | Sort-Object kbText,title)
-    Show-UpdateGroups -UpdateGroups $updateGroups
+    $roundTargetVMNames = @($targetVMNames)
+    $roundNumber = 0
+    $roundSummaries = @()
+    $finalStateMap = @{}
+    $deselectedUpdateKeys = @()
+    $stoppedByRoundCap = $false
+    $sawApplyFailure = $false
+    $ranAnyApplyRound = $false
 
-    if (-not $SearchOnly) {
-        if ($hasExplicitSelectedUpdateKeys) {
+    while ($true) {
+        $roundNumber++
+        # Create the round directory up front: nothing else does, and a round where every
+        # fleet start throws would otherwise fail on writing discovery.json.
+        $roundOutputDirectory = Join-Path $runOutputDirectory ('round-{0:D2}' -f $roundNumber)
+        New-Item -ItemType Directory -Force -Path $roundOutputDirectory | Out-Null
+
+        Write-Step -Message ('Patch round {0} over {1} VM(s).' -f $roundNumber, @($roundTargetVMNames).Count)
+        $discoveryRecords = Invoke-DiscoveryPhase -TargetVMNames $roundTargetVMNames -Managers $managers -GuestCredentialMap $guestCredentialMap -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -MaxInFlight $ThrottleLimit
+        $failedDiscoveryRecords = @($discoveryRecords | Where-Object { @($_.errors).Count -gt 0 })
+
+        $updateGroups = @(New-UpdateGroupRecords -DiscoveryRecords $discoveryRecords | Sort-Object kbText,title)
+        $completionStates = @(Get-VMPatchCompletionStates -DiscoveryRecords $discoveryRecords -UpdateGroups $updateGroups -DeselectedUpdateKeys $deselectedUpdateKeys)
+        Merge-PatchRunStates -StateMap $finalStateMap -CompletionStates $completionStates
+
+        $roundSummaries += [pscustomobject]@{
+            round = $roundNumber
+            outputDirectory = $roundOutputDirectory
+            targetVMNames = @($roundTargetVMNames)
+            discoveryFailureCount = $failedDiscoveryRecords.Count
+        }
+
+        if ($roundNumber -gt 1) {
+            Write-PatchRoundVerification -CompletionStates $completionStates -Round $roundNumber
+        }
+
+        Show-UpdateGroups -UpdateGroups $updateGroups
+
+        # -SearchOnly and -PlanOnly report on what they found and keep their existing exit
+        # semantics; neither is subject to the all-green rule, or a dry run against a fleet
+        # with pending updates would start failing.
+        if ($SearchOnly -or $PlanOnly) {
+            $scriptExitCode = if ($failedDiscoveryRecords.Count -gt 0) { 1 } else { 0 }
+
+            if ($PlanOnly) {
+                $selectedKeysForPlan = if ($SearchOnly) { @() } elseif ($hasExplicitSelectedUpdateKeys) { Resolve-SelectedUpdateKeys -UpdateGroups $updateGroups -ExplicitSelectedUpdateKeys $SelectedUpdateKeys } else { @(@($updateGroups) | Where-Object { $_.selectedByDefault } | ForEach-Object { [string]$_.identityKey }) }
+                $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
+                $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
+                $patchPlanPath = Join-Path $roundOutputDirectory 'patch-plan.json'
+                $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
+                Show-PatchPlan -PatchPlanRecords $patchPlanRecords
+                $scriptExitCode = Get-PlanOnlyExitCode -PatchPlanRecords $patchPlanRecords
+            }
+
+            break
+        }
+
+        $roundDecision = Get-PatchRoundDecision -CompletionStates $completionStates -Round $roundNumber -MaxRounds $MaxPatchRounds -OperatorDecision $null
+        if ($roundDecision.NeedsOperatorDecision) {
+            $roundDecision = Get-PatchRoundDecision -CompletionStates $completionStates -Round $roundNumber -MaxRounds $MaxPatchRounds -OperatorDecision (Read-ContinuePatchingDecision -CompletionStates $completionStates -Round ($roundNumber - 1))
+        }
+
+        if ($roundDecision.Action -ne 'Continue') {
+            Write-Step -Message ([string]$roundDecision.Reason)
+            if (@($roundDecision.PendingVMNames).Count -gt 0 -and $roundNumber -gt $MaxPatchRounds) {
+                $stoppedByRoundCap = $true
+            }
+            break
+        }
+
+        # Explicit keys are round-one only: they carry a RevisionNumber that will not appear
+        # in a later round's groups, so Resolve-SelectedUpdateKeys would throw on them.
+        $useExplicitKeys = ($hasExplicitSelectedUpdateKeys -and $roundNumber -eq 1)
+        if ($useExplicitKeys) {
             $selectedKeysForPlan = Resolve-SelectedUpdateKeys -UpdateGroups $updateGroups -ExplicitSelectedUpdateKeys $SelectedUpdateKeys
         }
         elseif ($updateGroups.Count -gt 0) {
@@ -1222,33 +1339,64 @@ try {
             $selectedKeysForPlan = @()
         }
 
+        # Remember what the operator unticked. Without this the next round would rediscover
+        # the same groups, call the VM pending again, and keep asking about updates that were
+        # already refused.
+        $selectedKeyLookup = @{}
+        foreach ($selectedKey in @($selectedKeysForPlan)) {
+            $selectedKeyLookup[[string]$selectedKey] = $true
+        }
+        foreach ($group in @($updateGroups)) {
+            if ([bool]$group.selectedByDefault -and -not $selectedKeyLookup.ContainsKey([string]$group.identityKey)) {
+                $deselectedUpdateKeys += [string]$group.identityKey
+            }
+        }
+
         Write-Step -Message ('Selected update group key(s): {0}' -f @($selectedKeysForPlan).Count)
 
         $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
         $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
-        $patchPlanPath = Join-Path $runOutputDirectory 'patch-plan.json'
+        $patchPlanPath = Join-Path $roundOutputDirectory 'patch-plan.json'
         $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
         Show-PatchPlan -PatchPlanRecords $patchPlanRecords
 
-        if ($PlanOnly) {
-            $scriptExitCode = Get-PlanOnlyExitCode -PatchPlanRecords $patchPlanRecords
-        }
-        elseif (-not (Confirm-PatchPlan -SkipConfirmation:$SkipConfirmation)) {
+        if (-not (Confirm-PatchPlan -SkipConfirmation:$SkipConfirmation)) {
             Write-Warning 'Patch plan was not approved. Apply phase skipped.'
+            $sawApplyFailure = $true
+            break
+        }
+
+        $ranAnyApplyRound = $true
+        $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -DiscoveryRecords $discoveryRecords
+        if ($applyOutcome.ExitCode -ne 0) {
+            $sawApplyFailure = $true
+        }
+
+        # A machine that was told to restart and has not provably come back must not be
+        # re-discovered: the read would either fail or describe a half-booted guest.
+        if ($applyOutcome.RebootRan -and -not (Test-RebootActionsAllConfirmed -RebootActions $applyOutcome.RebootActions)) {
+            Write-Warning 'Not every rebooted VM confirmed a new boot time; stopping before the verification round.'
+            break
+        }
+
+        $nextTargets = @(@($patchPlanRecords) | Where-Object { $_.action -eq 'Install' } | ForEach-Object { [string]$_.vmName })
+        if ($nextTargets.Count -eq 0) {
+            Write-Step -Message 'No VM was patched in this round; nothing left to verify.'
+            break
+        }
+
+        $roundTargetVMNames = $nextTargets
+    }
+
+    if (-not ($SearchOnly -or $PlanOnly)) {
+        Write-PatchRunSummary -RunOutputDirectory $runOutputDirectory -RoundSummaries $roundSummaries -FinalStateMap $finalStateMap
+        $scriptExitCode = 0
+        if ($sawApplyFailure -or $stoppedByRoundCap -or -not (Test-PatchRunAllGreen -StateMap $finalStateMap)) {
             $scriptExitCode = 1
         }
-        else {
-            $scriptExitCode = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -DiscoveryRecords $discoveryRecords
+        elseif (-not $ranAnyApplyRound -and @($failedDiscoveryRecords).Count -gt 0) {
+            $scriptExitCode = 1
         }
-    }
-    elseif ($PlanOnly) {
-        $selectedKeysForPlan = @()
-        $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
-        $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
-        $patchPlanPath = Join-Path $runOutputDirectory 'patch-plan.json'
-        $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
-        Show-PatchPlan -PatchPlanRecords $patchPlanRecords
-        $scriptExitCode = Get-PlanOnlyExitCode -PatchPlanRecords $patchPlanRecords
     }
 }
 catch {

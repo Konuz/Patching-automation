@@ -143,6 +143,34 @@ function Assert-NoForbiddenCommandLiteral {
     }
 }
 
+function Assert-NoOrphanedBranchKeyword {
+    param(
+        [System.Management.Automation.Language.Ast]$Ast,
+        [string]$RelativePath
+    )
+
+    if (-not $Ast) {
+        return
+    }
+
+    # An `elseif`/`else` block left without its `if` - easy to create when restructuring a
+    # long flow - is NOT a parse error: PowerShell reads it as a call to a command named
+    # "elseif". Every gate stays green and the run dies at runtime with
+    # CommandNotFoundException, which the top-level catch turns into a bare exit 1.
+    $branchKeywords = @('elseif', 'else')
+    $commandAsts = $Ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst]
+    }, $true)
+
+    foreach ($commandAst in $commandAsts) {
+        $commandName = $commandAst.GetCommandName()
+        if ($commandName -and ($branchKeywords -contains $commandName.ToLowerInvariant())) {
+            Add-Failure -Message ("Orphaned branch keyword in {0} at line {1}: {2} is being parsed as a command, so its `if` is missing" -f $RelativePath, $commandAst.Extent.StartLineNumber, $commandName)
+        }
+    }
+}
+
 function Assert-NoReservedVariableName {
     param(
         [System.Management.Automation.Language.Ast]$Ast,
@@ -212,6 +240,7 @@ if ($existingScripts.ContainsKey($agentPath)) {
     Assert-NoForbiddenCommand -Ast $agentAst -RelativePath $agentPath -ForbiddenNames $forbiddenCommands
     Assert-NoForbiddenCommandLiteral -RelativePath $agentPath -Text $agentText -ForbiddenNames $forbiddenCommands
     Assert-NoReservedVariableName -Ast $agentAst -RelativePath $agentPath -ReservedNames $reservedVariableNames
+    Assert-NoOrphanedBranchKeyword -Ast $agentAst -RelativePath $agentPath
     Assert-TextDoesNotMatch -RelativePath $agentPath -Text $agentText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Microsoft.Update.Session'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'CreateUpdateSearcher'
@@ -238,6 +267,7 @@ if ($existingScripts.ContainsKey($bootTimeHelperPath)) {
     Assert-NoForbiddenCommand -Ast $bootTimeHelperAst -RelativePath $bootTimeHelperPath -ForbiddenNames $forbiddenCommands
     Assert-NoForbiddenCommandLiteral -RelativePath $bootTimeHelperPath -Text $bootTimeHelperText -ForbiddenNames $forbiddenCommands
     Assert-NoReservedVariableName -Ast $bootTimeHelperAst -RelativePath $bootTimeHelperPath -ReservedNames $reservedVariableNames
+    Assert-NoOrphanedBranchKeyword -Ast $bootTimeHelperAst -RelativePath $bootTimeHelperPath
     Assert-TextDoesNotMatch -RelativePath $bootTimeHelperPath -Text $bootTimeHelperText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
 }
 
@@ -248,6 +278,7 @@ if ($existingScripts.ContainsKey($guestOpsLibPath)) {
     Assert-NoForbiddenCommand -Ast $guestOpsLibAst -RelativePath $guestOpsLibPath -ForbiddenNames $forbiddenCommands
     Assert-NoForbiddenCommandLiteral -RelativePath $guestOpsLibPath -Text $guestOpsLibText -ForbiddenNames $forbiddenCommands
     Assert-NoReservedVariableName -Ast $guestOpsLibAst -RelativePath $guestOpsLibPath -ReservedNames $reservedVariableNames
+    Assert-NoOrphanedBranchKeyword -Ast $guestOpsLibAst -RelativePath $guestOpsLibPath
     Assert-TextDoesNotMatch -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Invoke-VMAgentCycle'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Invoke-GuestAgentRun'
@@ -272,6 +303,7 @@ if ($existingScripts.ContainsKey($vmTargetLibPath)) {
     Assert-NoForbiddenCommand -Ast $vmTargetLibAst -RelativePath $vmTargetLibPath -ForbiddenNames $forbiddenCommands
     Assert-NoForbiddenCommandLiteral -RelativePath $vmTargetLibPath -Text $vmTargetLibText -ForbiddenNames $forbiddenCommands
     Assert-NoReservedVariableName -Ast $vmTargetLibAst -RelativePath $vmTargetLibPath -ReservedNames $reservedVariableNames
+    Assert-NoOrphanedBranchKeyword -Ast $vmTargetLibAst -RelativePath $vmTargetLibPath
     Assert-TextDoesNotMatch -RelativePath $vmTargetLibPath -Text $vmTargetLibText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $vmTargetLibPath -Text $vmTargetLibText -Needle 'Get-UniqueTrimmedNames'
     Assert-TextContains -RelativePath $vmTargetLibPath -Text $vmTargetLibText -Needle 'Split-VMNameInput'
@@ -287,6 +319,7 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-NoForbiddenCommand -Ast $orchestratorAst -RelativePath $orchestratorPath -ForbiddenNames $forbiddenCommands
     Assert-NoForbiddenCommandLiteral -RelativePath $orchestratorPath -Text $orchestratorText -ForbiddenNames $forbiddenCommands
     Assert-NoReservedVariableName -Ast $orchestratorAst -RelativePath $orchestratorPath -ReservedNames $reservedVariableNames
+    Assert-NoOrphanedBranchKeyword -Ast $orchestratorAst -RelativePath $orchestratorPath
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'curl.exe'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'InstallSelection'
@@ -339,7 +372,13 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Select-RebootRequiredApplyResults -ApplyResults $applyResults -DiscoveryRecords $DiscoveryRecords'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Write-FinalReport -PatchPlanRecords $PatchPlanRecords -ApplyResults $applyResults -CycleOutputDirectory $CycleOutputDirectory -RebootTargets $rebootTargets'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '-DiscoveryRecords $discoveryRecords'
-    Assert-TextMatches -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)\$discoveryRecords\s*=\s*Invoke-DiscoveryPhase\b.*?\$scriptExitCode\s*=\s*Invoke-ApplyAndOptionalReboot\b[^\r\n]*-DiscoveryRecords\s+\$discoveryRecords' -Reason 'normal discovery-driven apply path passes discovery records into reboot target selection'
+    Assert-TextMatches -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)\$discoveryRecords\s*=\s*Invoke-DiscoveryPhase\b.*?Invoke-ApplyAndOptionalReboot\b[^\r\n]*-DiscoveryRecords\s+\$discoveryRecords' -Reason 'normal discovery-driven apply path passes discovery records into reboot target selection'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Get-VMPatchCompletionStates'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Get-PatchRoundDecision'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Test-RebootActionsAllConfirmed'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Read-ContinuePatchingDecision'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Write-PatchRunSummary'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "'round-{0:D2}' -f"
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SelectedUpdateKeys'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'InstallSucceeded'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'RebootRequired'
@@ -391,6 +430,7 @@ if ($existingScripts.ContainsKey($runtimeHelperPath)) {
     Assert-NoForbiddenCommand -Ast $runtimeHelperAst -RelativePath $runtimeHelperPath -ForbiddenNames $forbiddenCommands
     Assert-NoForbiddenCommandLiteral -RelativePath $runtimeHelperPath -Text $runtimeHelperText -ForbiddenNames $forbiddenCommands
     Assert-NoReservedVariableName -Ast $runtimeHelperAst -RelativePath $runtimeHelperPath -ReservedNames $reservedVariableNames
+    Assert-NoOrphanedBranchKeyword -Ast $runtimeHelperAst -RelativePath $runtimeHelperPath
     Assert-TextDoesNotMatch -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Invoke-ThrottledJobs'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Test-IsApplyResultError'
@@ -422,6 +462,7 @@ if ($existingScripts.ContainsKey($launcherPath)) {
     Assert-NoForbiddenCommand -Ast $launcherAst -RelativePath $launcherPath -ForbiddenNames $forbiddenCommands
     Assert-NoForbiddenCommandLiteral -RelativePath $launcherPath -Text $launcherText -ForbiddenNames $forbiddenCommands
     Assert-NoReservedVariableName -Ast $launcherAst -RelativePath $launcherPath -ReservedNames $reservedVariableNames
+    Assert-NoOrphanedBranchKeyword -Ast $launcherAst -RelativePath $launcherPath
     Assert-TextDoesNotMatch -RelativePath $launcherPath -Text $launcherText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Invoke-StaticChecks.ps1'
     Assert-TextContains -RelativePath $launcherPath -Text $launcherText -Needle 'Invoke-ModelChecks.ps1'
@@ -447,6 +488,7 @@ if ($existingScripts.ContainsKey($modelPath)) {
     Assert-NoForbiddenCommand -Ast $modelAst -RelativePath $modelPath -ForbiddenNames $forbiddenCommands
     Assert-NoForbiddenCommandLiteral -RelativePath $modelPath -Text $modelText -ForbiddenNames $forbiddenCommands
     Assert-NoReservedVariableName -Ast $modelAst -RelativePath $modelPath -ReservedNames $reservedVariableNames
+    Assert-NoOrphanedBranchKeyword -Ast $modelAst -RelativePath $modelPath
     Assert-TextDoesNotMatch -RelativePath $modelPath -Text $modelText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'New-CanonicalUpdateIdentityKey'
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'New-UpdateGroupRecords'
@@ -465,6 +507,7 @@ if ($existingScripts.ContainsKey($modelTestPath)) {
     Assert-NoForbiddenCommand -Ast $modelTestAst -RelativePath $modelTestPath -ForbiddenNames $forbiddenCommands
     Assert-NoForbiddenCommandLiteral -RelativePath $modelTestPath -Text $modelTestText -ForbiddenNames $forbiddenCommands
     Assert-NoReservedVariableName -Ast $modelTestAst -RelativePath $modelTestPath -ReservedNames $reservedVariableNames
+    Assert-NoOrphanedBranchKeyword -Ast $modelTestAst -RelativePath $modelTestPath
     Assert-TextContains -RelativePath $modelTestPath -Text $modelTestText -Needle 'PatchPlanModel.ps1'
     Assert-TextContains -RelativePath $modelTestPath -Text $modelTestText -Needle 'Model checks passed.'
 }
@@ -476,6 +519,7 @@ if ($existingScripts.ContainsKey($identityHelperPath)) {
     Assert-NoForbiddenCommand -Ast $identityHelperAst -RelativePath $identityHelperPath -ForbiddenNames $forbiddenCommands
     Assert-NoForbiddenCommandLiteral -RelativePath $identityHelperPath -Text $identityHelperText -ForbiddenNames $forbiddenCommands
     Assert-NoReservedVariableName -Ast $identityHelperAst -RelativePath $identityHelperPath -ReservedNames $reservedVariableNames
+    Assert-NoOrphanedBranchKeyword -Ast $identityHelperAst -RelativePath $identityHelperPath
     Assert-TextContains -RelativePath $identityHelperPath -Text $identityHelperText -Needle 'New-CanonicalUpdateIdentityKey'
 }
 
@@ -486,6 +530,7 @@ if ($existingScripts.ContainsKey($runtimeTestPath)) {
     Assert-NoForbiddenCommand -Ast $runtimeTestAst -RelativePath $runtimeTestPath -ForbiddenNames $forbiddenCommands
     Assert-NoForbiddenCommandLiteral -RelativePath $runtimeTestPath -Text $runtimeTestText -ForbiddenNames $forbiddenCommands
     Assert-NoReservedVariableName -Ast $runtimeTestAst -RelativePath $runtimeTestPath -ReservedNames $reservedVariableNames
+    Assert-NoOrphanedBranchKeyword -Ast $runtimeTestAst -RelativePath $runtimeTestPath
     Assert-TextContains -RelativePath $runtimeTestPath -Text $runtimeTestText -Needle 'Runtime checks passed.'
 }
 
