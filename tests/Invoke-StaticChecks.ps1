@@ -409,6 +409,8 @@ if ($existingScripts.ContainsKey($runtimeHelperPath)) {
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Test-RebootActionsSuccessful'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Write-RebootActionArtifacts'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'reboot-actions.json'
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Invoke-InProcessAgentFleet'
+    Assert-TextDoesNotMatch -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Pattern '(?i)\bRead-Host\b' -Reason 'runtime coordination must stay free of interactive prompts'
 }
 
 if ($existingScripts.ContainsKey($launcherPath)) {

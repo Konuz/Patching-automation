@@ -136,6 +136,118 @@ function Invoke-ThrottledJobs {
     return @($results)
 }
 
+function New-FleetErrorResult {
+    param(
+        $InputObject,
+        [string]$ErrorMessage,
+        $Payload = $null
+    )
+
+    return [pscustomobject]@{
+        Sequence = Get-RuntimePropertyValue -InputObject $InputObject -Name 'Sequence'
+        VMName = Get-RuntimePropertyValue -InputObject $InputObject -Name 'VMName'
+        Payload = $Payload
+        Error = $ErrorMessage
+    }
+}
+
+function Invoke-InProcessAgentFleet {
+    param(
+        [object[]]$Items,
+        [int]$MaxInFlight,
+        [int]$PollSeconds,
+        [int]$ItemTimeoutSeconds,
+        [scriptblock]$StartScript,
+        [scriptblock]$PollScript,
+        [scriptblock]$CompleteScript,
+        [scriptblock]$SleepScript = { param([int]$Seconds) Start-Sleep -Seconds $Seconds }
+    )
+
+    if ($MaxInFlight -lt 1) {
+        throw 'MaxInFlight must be greater than or equal to 1.'
+    }
+    if ($PollSeconds -lt 1) {
+        throw 'PollSeconds must be greater than or equal to 1.'
+    }
+
+    $pending = New-Object System.Collections.Queue
+    foreach ($item in @($Items)) {
+        $pending.Enqueue($item)
+    }
+
+    $inFlight = @()
+    $results = @()
+
+    while ($pending.Count -gt 0 -or $inFlight.Count -gt 0) {
+        # Starts are sequential but return immediately: StartProgramInGuest hands back a
+        # process id without waiting, so with MaxInFlight at the target count every guest
+        # is working before the first poll round begins.
+        while ($pending.Count -gt 0 -and $inFlight.Count -lt $MaxInFlight) {
+            $item = $pending.Dequeue()
+            try {
+                $handle = & $StartScript $item
+                $inFlight += [pscustomobject]@{
+                    Item = $item
+                    Handle = $handle
+                    StartedAt = Get-Date
+                }
+            }
+            catch {
+                # There is no job boundary around a start, so a throwing guest would end the
+                # whole phase. Every failure has to become this VM's error instead.
+                $results += New-FleetErrorResult -InputObject $item -ErrorMessage ('Agent start failed: {0}' -f $_.Exception.Message)
+            }
+        }
+
+        $now = Get-Date
+        $kept = @()
+        foreach ($entry in @($inFlight)) {
+            if (($now - $entry.StartedAt).TotalSeconds -ge $ItemTimeoutSeconds) {
+                # Harvest anyway. status.json is the primary result (see CLAUDE.md), and the
+                # job-based path this replaces always downloaded the artifacts even when the
+                # process result timed out. Dropping them here would turn a guest run that
+                # actually finished into a reported failure and throw away the only per-VM
+                # diagnostics. The timeout error stands regardless of what the harvest finds.
+                $timeoutPayload = $null
+                try {
+                    $timeoutPayload = & $CompleteScript $entry.Handle
+                }
+                catch {
+                    $timeoutPayload = $null
+                }
+
+                $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage ('Agent run timed out after {0} seconds.' -f $ItemTimeoutSeconds) -Payload $timeoutPayload
+                continue
+            }
+
+            try {
+                if (& $PollScript $entry.Handle) {
+                    $results += [pscustomobject]@{
+                        Sequence = Get-RuntimePropertyValue -InputObject $entry.Item -Name 'Sequence'
+                        VMName = Get-RuntimePropertyValue -InputObject $entry.Item -Name 'VMName'
+                        Payload = (& $CompleteScript $entry.Handle)
+                        Error = $null
+                    }
+                    continue
+                }
+            }
+            catch {
+                $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage $_.Exception.Message
+                continue
+            }
+
+            $kept += $entry
+        }
+
+        $inFlight = @($kept)
+        if ($inFlight.Count -gt 0) {
+            & $SleepScript $PollSeconds
+        }
+    }
+
+    return @($results)
+}
+
 function Test-IsApplyResultError {
     param($ApplyResult)
 

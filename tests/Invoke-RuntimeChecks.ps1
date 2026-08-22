@@ -162,6 +162,91 @@ try { Invoke-ThrottledJobs -Items @() -ThrottleLimit 1 -JobTimeoutSeconds 0 -Scr
 catch { $timeoutGuardThrew = $true }
 Assert-Equal -Actual $timeoutGuardThrew -Expected $true -Message 'Invoke-ThrottledJobs throws on JobTimeoutSeconds below 1'
 
+# --- in-process agent fleet ---
+
+$fleetEvents = New-Object System.Collections.Generic.List[string]
+$fleetItems = @(
+    [pscustomobject]@{ Sequence = 1; VMName = 'VM01'; PollsNeeded = 2 },
+    [pscustomobject]@{ Sequence = 2; VMName = 'VM02'; PollsNeeded = 1 },
+    [pscustomobject]@{ Sequence = 3; VMName = 'VM03'; PollsNeeded = 3 }
+)
+
+$fleetResults = @(Invoke-InProcessAgentFleet -Items $fleetItems -MaxInFlight 3 -PollSeconds 1 -ItemTimeoutSeconds 60 `
+    -StartScript {
+        param($Item)
+        $fleetEvents.Add('start:' + $Item.VMName)
+        return [pscustomobject]@{ VMName = $Item.VMName; Remaining = [int]$Item.PollsNeeded }
+    } `
+    -PollScript {
+        param($Handle)
+        $fleetEvents.Add('poll:' + $Handle.VMName)
+        $Handle.Remaining--
+        return ($Handle.Remaining -le 0)
+    } `
+    -CompleteScript { param($Handle) return [pscustomobject]@{ Completed = $true; VMName = $Handle.VMName } } `
+    -SleepScript { param([int]$Seconds) })
+
+Assert-Equal -Actual $fleetResults.Count -Expected 3 -Message 'fleet returns one result per item'
+Assert-Equal -Actual (@($fleetResults | Where-Object { $_.Error }).Count) -Expected 0 -Message 'healthy fleet items report no error'
+# Every VM must be started before the first poll: that is the whole point of the model.
+$firstPollIndex = $fleetEvents.IndexOf(($fleetEvents | Where-Object { $_ -like 'poll:*' } | Select-Object -First 1))
+Assert-Equal -Actual (@($fleetEvents[0..($firstPollIndex - 1)] | Where-Object { $_ -like 'start:*' }).Count) -Expected 3 -Message 'all items start before the first poll when MaxInFlight covers them'
+
+# One guest throwing must become that VM's error, not the end of the phase.
+$throwingResults = @(Invoke-InProcessAgentFleet -Items $fleetItems -MaxInFlight 3 -PollSeconds 1 -ItemTimeoutSeconds 60 `
+    -StartScript {
+        param($Item)
+        if ($Item.VMName -eq 'VM02') { throw 'guest ops refused the start' }
+        return [pscustomobject]@{ VMName = $Item.VMName; Remaining = 1 }
+    } `
+    -PollScript { param($Handle) return $true } `
+    -CompleteScript { param($Handle) return [pscustomobject]@{ Completed = $true } } `
+    -SleepScript { param([int]$Seconds) })
+
+Assert-Equal -Actual $throwingResults.Count -Expected 3 -Message 'a failed start still yields a result row'
+Assert-Contains -Text ([string]@($throwingResults | Where-Object { $_.VMName -eq 'VM02' })[0].Error) -Needle 'guest ops refused the start' -Message 'failed start records the guest error'
+Assert-Equal -Actual (@($throwingResults | Where-Object { $_.VMName -ne 'VM02' -and $_.Error }).Count) -Expected 0 -Message 'one failed start does not poison the other items'
+
+# Serialised execution when the operator lowers the limit.
+$serialEvents = New-Object System.Collections.Generic.List[string]
+$serialResults = @(Invoke-InProcessAgentFleet -Items $fleetItems -MaxInFlight 1 -PollSeconds 1 -ItemTimeoutSeconds 60 `
+    -StartScript { param($Item) $serialEvents.Add('start:' + $Item.VMName); return [pscustomobject]@{ VMName = $Item.VMName } } `
+    -PollScript { param($Handle) return $true } `
+    -CompleteScript { param($Handle) return [pscustomobject]@{ Completed = $true } } `
+    -SleepScript { param([int]$Seconds) })
+
+Assert-Equal -Actual $serialResults.Count -Expected 3 -Message 'serialised fleet returns every result'
+Assert-Equal -Actual $serialEvents[0] -Expected 'start:VM01' -Message 'MaxInFlight 1 starts items one at a time'
+
+# A timeout must still harvest the guest artifacts: status.json is the primary result and a
+# run that finished inside the guest must not be reported as a total failure.
+$timeoutCompleted = $false
+$timeoutResults = @(Invoke-InProcessAgentFleet -Items @($fleetItems[0]) -MaxInFlight 1 -PollSeconds 1 -ItemTimeoutSeconds 0 `
+    -StartScript { param($Item) return [pscustomobject]@{ VMName = $Item.VMName } } `
+    -PollScript { param($Handle) return $false } `
+    -CompleteScript { param($Handle) $script:timeoutCompleted = $true; return [pscustomobject]@{ Completed = $false; Harvested = $true } } `
+    -SleepScript { param([int]$Seconds) })
+
+Assert-Equal -Actual $timeoutResults.Count -Expected 1 -Message 'timed out item still yields a result'
+Assert-Contains -Text ([string]$timeoutResults[0].Error) -Needle 'timed out' -Message 'timed out item reports a timeout error'
+Assert-Equal -Actual $timeoutCompleted -Expected $true -Message 'a timeout still tries to download the guest artifacts'
+Assert-Equal -Actual $timeoutResults[0].Payload.Harvested -Expected $true -Message 'a timed out item carries the harvested payload alongside its error'
+
+# Harvesting must not be able to hide the timeout.
+$timeoutThrowResults = @(Invoke-InProcessAgentFleet -Items @($fleetItems[0]) -MaxInFlight 1 -PollSeconds 1 -ItemTimeoutSeconds 0 `
+    -StartScript { param($Item) return [pscustomobject]@{ VMName = $Item.VMName } } `
+    -PollScript { param($Handle) return $false } `
+    -CompleteScript { param($Handle) throw 'status.json was not downloaded' } `
+    -SleepScript { param([int]$Seconds) })
+
+Assert-Contains -Text ([string]$timeoutThrowResults[0].Error) -Needle 'timed out' -Message 'a failed harvest still reports the original timeout'
+Assert-Equal -Actual $timeoutThrowResults[0].Payload -Expected $null -Message 'a failed harvest leaves no payload'
+
+$fleetInFlightGuardThrew = $false
+try { Invoke-InProcessAgentFleet -Items @() -MaxInFlight 0 -PollSeconds 1 -ItemTimeoutSeconds 60 -StartScript { param($i) $i } -PollScript { param($h) $true } -CompleteScript { param($h) $h } | Out-Null }
+catch { $fleetInFlightGuardThrew = $true }
+Assert-Equal -Actual $fleetInFlightGuardThrew -Expected $true -Message 'Invoke-InProcessAgentFleet throws on MaxInFlight below 1'
+
 $mixedApplyResults = @(
     [pscustomobject]@{ vmName = 'VM01'; action = 'Install'; outcome = 'InstallSucceeded'; rebootRequired = $true },
     [pscustomobject]@{ vmName = 'VM02'; action = 'Install'; outcome = 'InstallSucceeded'; rebootRequired = $false },
