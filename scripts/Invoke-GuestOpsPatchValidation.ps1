@@ -321,7 +321,7 @@ function Invoke-OperatorPrompt {
         return (& $Provider[$Key] $Arguments)
     }
 
-    return (& $FallbackScript)
+    return (& $FallbackScript $Arguments)
 }
 
 function Read-UpdateGroupSelection {
@@ -333,6 +333,9 @@ function Read-UpdateGroupSelection {
     $groups = @($UpdateGroups)
 
     return (Invoke-OperatorPrompt -Provider $PromptProvider -Key 'SelectUpdateGroups' -Arguments @{ UpdateGroups = $groups } -FallbackScript {
+        param($promptArgs)
+
+        $groups = @($promptArgs.UpdateGroups)
         $selected = @{}
         for ($i = 0; $i -lt $groups.Count; $i++) {
             $selected[$i] = [bool]$groups[$i].selectedByDefault
@@ -1288,6 +1291,7 @@ try {
                 # old flow. -PlanOnly on its own still asks: the point of a dry-run plan is
                 # to show what the operator's own selection would produce, and quietly
                 # substituting the default policy would hide exactly what they came to see.
+                $planAborted = $false
                 if ($SearchOnly) {
                     $selectedKeysForPlan = @()
                 }
@@ -1299,7 +1303,7 @@ try {
                     if ($planSelection.Aborted) {
                         Write-Warning 'Update group selection was cancelled; no patch plan was written.'
                         $scriptExitCode = 1
-                        $selectedKeysForPlan = $null
+                        $planAborted = $true
                     }
                     else {
                         $selectedKeysForPlan = @($planSelection.Keys)
@@ -1309,7 +1313,7 @@ try {
                     $selectedKeysForPlan = @()
                 }
 
-                if ($null -ne $selectedKeysForPlan) {
+                if (-not $planAborted) {
                     Write-Step -Message ('Selected update group key(s): {0}' -f @($selectedKeysForPlan).Count)
 
                     $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)

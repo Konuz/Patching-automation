@@ -452,6 +452,8 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)IsNullOrWhiteSpace\(\$PatchPlanPath\)\).*?\breturn\b' -Reason 'resume branch must exit with the computed code, not return before the final exit'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern 'Validation summary' -Reason 'Single-VM validation summary path was unified into the phase-based flow'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern 'skipSingleVmValidationSummary' -Reason 'Single-VM validation flag removed by path unification'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$roundSelection.Aborted'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$planSelection.Aborted'
 }
 
 if ($existingScripts.ContainsKey($runtimeHelperPath)) {

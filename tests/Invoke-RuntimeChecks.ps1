@@ -1343,6 +1343,46 @@ else {
     Assert-Equal -Actual (@($abort.Keys).Count) -Expected 0 -Message 'an aborted result carries no keys'
 }
 
+# --- Update group selection end to end (AST-extracted, Read-Host stubbed) ---
+# The restructured function is otherwise uncovered: a static needle pins only its name.
+# Mutants that flipped the result to Aborted, or misspelled the dispatch key so the GUI
+# provider never fired, both passed every gate. The second is the dangerous one - the
+# console fallback then reads '' from a closed stdin as "accept".
+$selectionDefinition = @($orchestratorFunctions | Where-Object { $_.Name -eq 'Read-UpdateGroupSelection' })
+if ($selectionDefinition.Count -eq 0) {
+    Add-Failure -Message 'Orchestrator function not found: Read-UpdateGroupSelection'
+}
+else {
+    . ([scriptblock]::Create($selectionDefinition[0].Extent.Text))
+
+    $script:stubbedReadHostCalls = 0
+    function Read-Host { param([string]$Prompt) $script:stubbedReadHostCalls++; return '' }
+    function Write-Host { param([Parameter(ValueFromRemainingArguments = $true)]$Ignored) }
+
+    $selectionGroups = @(
+        [pscustomobject]@{ identityKey = 'aaa|1'; title = 'Cumulative'; selectedByDefault = $true },
+        [pscustomobject]@{ identityKey = 'bbb|2'; title = 'Driver'; selectedByDefault = $false }
+    )
+
+    $consoleSelection = Read-UpdateGroupSelection -UpdateGroups $selectionGroups
+    Assert-Equal -Actual $consoleSelection.Aborted -Expected $false -Message 'accepting at the console prompt is a selection, not an abort'
+    Assert-Equal -Actual (@($consoleSelection.Keys) -join ';') -Expected 'aaa|1' -Message 'the console fallback returns the default-policy selection'
+    Assert-Equal -Actual ($script:stubbedReadHostCalls -ge 1) -Expected $true -Message 'the console fallback actually reaches its prompt'
+
+    $script:stubbedReadHostCalls = 0
+    $providerAbort = Read-UpdateGroupSelection -UpdateGroups $selectionGroups -PromptProvider @{ SelectUpdateGroups = { param($promptArgs) New-UpdateSelectionResult -Aborted } }
+    Assert-Equal -Actual $providerAbort.Aborted -Expected $true -Message 'a provider abort reaches the caller unchanged'
+    Assert-Equal -Actual $script:stubbedReadHostCalls -Expected 0 -Message 'a matching provider key means the console prompt never runs'
+
+    $script:stubbedReadHostCalls = 0
+    $providerPick = Read-UpdateGroupSelection -UpdateGroups $selectionGroups -PromptProvider @{ SelectUpdateGroups = { param($promptArgs) New-UpdateSelectionResult -Keys @(@($promptArgs.UpdateGroups)[1].identityKey) } }
+    Assert-Equal -Actual (@($providerPick.Keys) -join ';') -Expected 'bbb|2' -Message 'the provider receives the groups and its own selection is returned'
+    Assert-Equal -Actual $script:stubbedReadHostCalls -Expected 0 -Message 'the provider path never falls through to the console'
+
+    Remove-Item Function:\Read-Host -ErrorAction SilentlyContinue
+    Remove-Item Function:\Write-Host -ErrorAction SilentlyContinue
+}
+
 if ($failures.Count -gt 0) {
     Write-Host 'Runtime checks failed:'
     foreach ($failure in $failures) {
