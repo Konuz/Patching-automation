@@ -34,6 +34,17 @@ function Assert-FileExists {
     return $path
 }
 
+function Get-OptionalFilePath {
+    param([string]$RelativePath)
+
+    $path = Resolve-ProjectPath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return $null
+    }
+
+    return $path
+}
+
 function Get-ScriptAst {
     param(
         [string]$RelativePath,
@@ -212,10 +223,22 @@ $modelPath = 'scripts\PatchPlanModel.ps1'
 $modelTestPath = 'tests\Invoke-ModelChecks.ps1'
 $runtimeTestPath = 'tests\Invoke-RuntimeChecks.ps1'
 $harnessTestPath = 'tests\Invoke-GuestOpsHarnessChecks.ps1'
+$settingsStorePath = 'scripts\SettingsStore.ps1'
+$guiPromptsPath = 'scripts\GuiPrompts.ps1'
+$guiLauncherPath = 'Start-PatchingGuestOpsGui.ps1'
 
 $existingScripts = @{}
 foreach ($relativePath in @($agentPath, $identityHelperPath, $bootTimeHelperPath, $orchestratorPath, $runtimeHelperPath, $guestOpsLibPath, $vmTargetLibPath, $launcherPath, $modelPath, $modelTestPath, $runtimeTestPath, $harnessTestPath)) {
     $path = Assert-FileExists -RelativePath $relativePath
+    if ($path) {
+        $existingScripts[$relativePath] = $path
+    }
+}
+
+# Pliki GUI są opcjonalne: narzędzie konsolowe musi dać się wdrożyć bez nich, a
+# Assert-FileExists zapisałoby porażkę zamiast pominąć.
+foreach ($relativePath in @($settingsStorePath, $guiPromptsPath, $guiLauncherPath)) {
+    $path = Get-OptionalFilePath -RelativePath $relativePath
     if ($path) {
         $existingScripts[$relativePath] = $path
     }
@@ -569,6 +592,29 @@ if ($existingScripts.ContainsKey($harnessTestPath)) {
     Assert-TextContains -RelativePath $harnessTestPath -Text $harnessTestText -Needle 'Start-VMAgentCycle'
     Assert-TextContains -RelativePath $harnessTestPath -Text $harnessTestText -Needle 'Test-VMAgentCycleComplete'
     Assert-TextContains -RelativePath $harnessTestPath -Text $harnessTestText -Needle 'Complete-VMAgentCycle'
+}
+
+foreach ($guiRelativePath in @($settingsStorePath, $guiPromptsPath, $guiLauncherPath)) {
+    if ($existingScripts.ContainsKey($guiRelativePath)) {
+        $guiAst = Get-ScriptAst -RelativePath $guiRelativePath -Path $existingScripts[$guiRelativePath]
+        $guiText = Get-ScriptText -Path $existingScripts[$guiRelativePath]
+
+        Assert-NoForbiddenCommand -Ast $guiAst -RelativePath $guiRelativePath -ForbiddenNames $forbiddenCommands
+        Assert-NoForbiddenCommandLiteral -RelativePath $guiRelativePath -Text $guiText -ForbiddenNames $forbiddenCommands
+        Assert-NoReservedVariableName -Ast $guiAst -RelativePath $guiRelativePath -ReservedNames $reservedVariableNames
+        Assert-NoOrphanedBranchKeyword -Ast $guiAst -RelativePath $guiRelativePath
+        Assert-TextDoesNotMatch -RelativePath $guiRelativePath -Text $guiText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
+    }
+}
+
+if ($existingScripts.ContainsKey($guiLauncherPath)) {
+    $guiLauncherText = Get-ScriptText -Path $existingScripts[$guiLauncherPath]
+
+    # Either one ends the patch-round loop after round one (OrchestratorRuntime.ps1:641 and
+    # :651), which would silently reduce a GUI run to a single round. The GUI's selection
+    # comes back through the prompt provider instead.
+    Assert-TextDoesNotMatch -RelativePath $guiLauncherPath -Text $guiLauncherText -Pattern 'SelectedUpdateKeys' -Reason 'the GUI returns its selection through the prompt provider, never as an explicit key list'
+    Assert-TextDoesNotMatch -RelativePath $guiLauncherPath -Text $guiLauncherText -Pattern 'SkipConfirmation' -Reason 'a GUI run is interactive; -SkipConfirmation would cap it at one round'
 }
 
 if ($failures.Count -gt 0) {
