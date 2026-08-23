@@ -44,8 +44,8 @@ function Show-CredentialDialog {
     $prompt = New-GuiLabel -Text $Message -Top 15
     $prompt.Width = 480
 
-    $userBox = New-GuiTextBox -Text $UserName -Top 55
-    $passwordBox = New-GuiTextBox -Text '' -Top 90
+    $userBox = New-GuiTextBox -Text $UserName -Top 55 -Width 260
+    $passwordBox = New-GuiTextBox -Text '' -Top 90 -Width 260
     $passwordBox.UseSystemPasswordChar = $true
 
     $remember = New-Object System.Windows.Forms.CheckBox
