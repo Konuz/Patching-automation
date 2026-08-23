@@ -1100,6 +1100,43 @@ Assert-Equal -Actual (@($localGroup.Members) -join ',') -Expected 'oldbox' -Mess
 $mixedCaseGroups = @(Get-GuestCredentialGroups -TargetNames @('A.Contoso.COM', 'b.contoso.com'))
 Assert-Equal -Actual $mixedCaseGroups.Count -Expected 1 -Message 'domain grouping is case-insensitive'
 
+# --- Credential store keys and expansion (scripts/SettingsStore.ps1) ---
+. (Join-Path $repoRoot 'scripts\SettingsStore.ps1')
+
+$guestKeys = @(Get-CredentialStoreKeys -Scope 'guest' -TargetNames @('vm1.contoso.com', 'vm2.contoso.com', 'oldbox'))
+Assert-Equal -Actual $guestKeys.Count -Expected 2 -Message 'one domain plus one local machine yield two store keys'
+$contosoKey = @($guestKeys | Where-Object { $_.StoreKey -eq 'guest:contoso.com' })
+Assert-Equal -Actual $contosoKey.Count -Expected 1 -Message 'domain store key is prefixed with the scope'
+Assert-Equal -Actual (@($contosoKey[0].Members) -join ',') -Expected 'vm1.contoso.com,vm2.contoso.com' -Message 'domain store key carries both member VMs'
+
+$vcenterKeys = @(Get-CredentialStoreKeys -Scope 'vcenter' -TargetNames @('vc1.corp.local', 'vc2.corp.local'))
+Assert-Equal -Actual $vcenterKeys.Count -Expected 1 -Message 'two vCenters sharing a DNS suffix share one store key'
+Assert-Equal -Actual $vcenterKeys[0].StoreKey -Expected 'vcenter:corp.local' -Message 'vCenter scope uses its own prefix'
+
+$store = @{
+    'guest:contoso.com' = (New-TestCredential 'CONTOSO\adm')
+    'guest:oldbox' = (New-TestCredential 'oldbox\adm')
+    'vcenter:corp.local' = (New-TestCredential 'CORP\svc')
+}
+
+$guestMap = Expand-CredentialStoreMap -Scope 'guest' -TargetNames @('vm1.contoso.com', 'vm2.contoso.com', 'oldbox') -Store $store
+Assert-Equal -Actual $guestMap.Count -Expected 3 -Message 'group credentials expand to one entry per VM name'
+Assert-Equal -Actual $guestMap['vm1.contoso.com'].UserName -Expected 'CONTOSO\adm' -Message 'domain member gets the domain credential'
+Assert-Equal -Actual $guestMap['vm2.contoso.com'].UserName -Expected 'CONTOSO\adm' -Message 'second domain member gets the same credential'
+Assert-Equal -Actual $guestMap['oldbox'].UserName -Expected 'oldbox\adm' -Message 'local machine gets its own credential'
+
+$vcenterMap = Expand-CredentialStoreMap -Scope 'vcenter' -TargetNames @('vc1.corp.local', 'vc2.corp.local') -Store $store
+Assert-Equal -Actual $vcenterMap.Count -Expected 2 -Message 'one vCenter credential expands to both full names'
+Assert-Equal -Actual $vcenterMap['vc2.corp.local'].UserName -Expected 'CORP\svc' -Message 'both vCenters resolve to the shared credential'
+
+$partialMap = Expand-CredentialStoreMap -Scope 'guest' -TargetNames @('vm1.contoso.com', 'vm9.fabrikam.com') -Store $store
+Assert-Equal -Actual $partialMap.Count -Expected 1 -Message 'a target with no stored credential is absent from the map, not null-valued'
+Assert-Equal -Actual $partialMap.ContainsKey('vm9.fabrikam.com') -Expected $false -Message 'unknown domain contributes no entry'
+
+$missing = @(Get-MissingCredentialStoreKeys -Scope 'guest' -TargetNames @('vm1.contoso.com', 'vm9.fabrikam.com') -Store $store)
+Assert-Equal -Actual $missing.Count -Expected 1 -Message 'exactly one store key is missing'
+Assert-Equal -Actual $missing[0].StoreKey -Expected 'guest:fabrikam.com' -Message 'the missing key is reported so the GUI can prompt for it'
+
 if ($failures.Count -gt 0) {
     Write-Host 'Runtime checks failed:'
     foreach ($failure in $failures) {
