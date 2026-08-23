@@ -1105,18 +1105,18 @@ Assert-Equal -Actual $mixedCaseGroups.Count -Expected 1 -Message 'domain groupin
 
 $guestKeys = @(Get-CredentialStoreKeys -Scope 'guest' -TargetNames @('vm1.contoso.com', 'vm2.contoso.com', 'oldbox'))
 Assert-Equal -Actual $guestKeys.Count -Expected 2 -Message 'one domain plus one local machine yield two store keys'
-$contosoKey = @($guestKeys | Where-Object { $_.StoreKey -eq 'guest:contoso.com' })
-Assert-Equal -Actual $contosoKey.Count -Expected 1 -Message 'domain store key is prefixed with the scope'
+$contosoKey = @($guestKeys | Where-Object { $_.StoreKey -eq 'guest:domain:contoso.com' })
+Assert-Equal -Actual $contosoKey.Count -Expected 1 -Message 'domain store key is prefixed with the scope and kind'
 Assert-Equal -Actual (@($contosoKey[0].Members) -join ',') -Expected 'vm1.contoso.com,vm2.contoso.com' -Message 'domain store key carries both member VMs'
 
 $vcenterKeys = @(Get-CredentialStoreKeys -Scope 'vcenter' -TargetNames @('vc1.corp.local', 'vc2.corp.local'))
 Assert-Equal -Actual $vcenterKeys.Count -Expected 1 -Message 'two vCenters sharing a DNS suffix share one store key'
-Assert-Equal -Actual $vcenterKeys[0].StoreKey -Expected 'vcenter:corp.local' -Message 'vCenter scope uses its own prefix'
+Assert-Equal -Actual $vcenterKeys[0].StoreKey -Expected 'vcenter:domain:corp.local' -Message 'vCenter scope uses its own prefix with kind'
 
 $store = @{
-    'guest:contoso.com' = (New-TestCredential 'CONTOSO\adm')
-    'guest:oldbox' = (New-TestCredential 'oldbox\adm')
-    'vcenter:corp.local' = (New-TestCredential 'CORP\svc')
+    'guest:domain:contoso.com' = (New-TestCredential 'CONTOSO\adm')
+    'guest:local:oldbox' = (New-TestCredential 'oldbox\adm')
+    'vcenter:domain:corp.local' = (New-TestCredential 'CORP\svc')
 }
 
 $guestMap = Expand-CredentialStoreMap -Scope 'guest' -TargetNames @('vm1.contoso.com', 'vm2.contoso.com', 'oldbox') -Store $store
@@ -1135,7 +1135,31 @@ Assert-Equal -Actual $partialMap.ContainsKey('vm9.fabrikam.com') -Expected $fals
 
 $missing = @(Get-MissingCredentialStoreKeys -Scope 'guest' -TargetNames @('vm1.contoso.com', 'vm9.fabrikam.com') -Store $store)
 Assert-Equal -Actual $missing.Count -Expected 1 -Message 'exactly one store key is missing'
-Assert-Equal -Actual $missing[0].StoreKey -Expected 'guest:fabrikam.com' -Message 'the missing key is reported so the GUI can prompt for it'
+Assert-Equal -Actual $missing[0].StoreKey -Expected 'guest:domain:fabrikam.com' -Message 'the missing key is reported so the GUI can prompt for it'
+
+$collisionKeys = @(Get-CredentialStoreKeys -Scope 'guest' -TargetNames @('oldbox', 'host.oldbox'))
+$distinctCollisionKeys = @($collisionKeys | Select-Object -ExpandProperty StoreKey -Unique)
+Assert-Equal -Actual $distinctCollisionKeys.Count -Expected 2 -Message 'a local machine and a domain suffix sharing a name stay separate store keys'
+$localCollision = @($collisionKeys | Where-Object { $_.Kind -eq 'Local' })
+Assert-Equal -Actual $localCollision[0].StoreKey -Expected 'guest:local:oldbox' -Message 'the local group keeps its own namespaced key'
+$domainCollision = @($collisionKeys | Where-Object { $_.Kind -eq 'Domain' })
+Assert-Equal -Actual $domainCollision[0].StoreKey -Expected 'guest:domain:oldbox' -Message 'the domain group keeps its own namespaced key'
+
+$collisionStore = @{ 'guest:local:oldbox' = (New-TestCredential 'oldbox\localadm') }
+$collisionMissing = @(Get-MissingCredentialStoreKeys -Scope 'guest' -TargetNames @('oldbox', 'host.oldbox') -Store $collisionStore)
+Assert-Equal -Actual $collisionMissing.Count -Expected 1 -Message 'storing the local password still leaves the domain group missing'
+$collisionMap = Expand-CredentialStoreMap -Scope 'guest' -TargetNames @('oldbox', 'host.oldbox') -Store $collisionStore
+Assert-Equal -Actual $collisionMap.ContainsKey('host.oldbox') -Expected $false -Message 'the domain member never receives the local machine credential'
+
+Assert-Equal -Actual (@(Get-CredentialStoreKeys -Scope 'guest' -TargetNames @('vm1.contoso.com'))[0].Kind) -Expected 'Domain' -Message 'the group kind is carried through for the GUI to label'
+
+$caseMap = Expand-CredentialStoreMap -Scope 'guest' -TargetNames @('OLDBOX') -Store @{ 'guest:local:oldbox' = (New-TestCredential 'oldbox\adm') }
+Assert-Equal -Actual $caseMap.Count -Expected 1 -Message 'store lookup is case-insensitive, so casing typed by the operator does not lose a credential'
+
+$nullStoreMissing = @(Get-MissingCredentialStoreKeys -Scope 'guest' -TargetNames @('vm1.contoso.com') -Store $null)
+Assert-Equal -Actual $nullStoreMissing.Count -Expected 1 -Message 'a null store means everything is missing, not a thrown error'
+$nullStoreMap = Expand-CredentialStoreMap -Scope 'guest' -TargetNames @('vm1.contoso.com') -Store $null
+Assert-Equal -Actual $nullStoreMap.Count -Expected 0 -Message 'a null store expands to an empty map rather than throwing'
 
 if ($failures.Count -gt 0) {
     Write-Host 'Runtime checks failed:'

@@ -1,9 +1,13 @@
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot 'VMTargetLib.ps1')
+
 # Credential grouping is shared with the console run. Never reproduce that logic here:
 # a domain key is everything after the FIRST dot, lowercased, while local keys keep
-# their original casing (scripts/VMTargetLib.ps1).
+# their original casing (scripts/VMTargetLib.ps1). The kind is part of the store key
+# because those two are separate namespaces: a standalone machine named "dmz" and a
+# domain suffix "dmz" would otherwise share one entry and silently share one password.
 function Get-CredentialStoreKeys {
     param(
         [string]$Scope,
@@ -13,7 +17,7 @@ function Get-CredentialStoreKeys {
     $keys = @()
     foreach ($group in @(Get-GuestCredentialGroups -TargetNames $TargetNames)) {
         $keys += [pscustomobject]@{
-            StoreKey = ('{0}:{1}' -f $Scope, $group.Key)
+            StoreKey = ('{0}:{1}:{2}' -f $Scope, ([string]$group.Kind).ToLowerInvariant(), $group.Key)
             Scope    = $Scope
             Kind     = $group.Kind
             Label    = $group.Key
@@ -32,6 +36,10 @@ function Expand-CredentialStoreMap {
         [string[]]$TargetNames,
         [hashtable]$Store
     )
+
+    if ($null -eq $Store) {
+        $Store = @{}
+    }
 
     $map = @{}
     foreach ($key in @(Get-CredentialStoreKeys -Scope $Scope -TargetNames $TargetNames)) {
@@ -53,6 +61,10 @@ function Get-MissingCredentialStoreKeys {
         [string[]]$TargetNames,
         [hashtable]$Store
     )
+
+    if ($null -eq $Store) {
+        $Store = @{}
+    }
 
     return @(@(Get-CredentialStoreKeys -Scope $Scope -TargetNames $TargetNames) | Where-Object { -not $Store.ContainsKey($_.StoreKey) })
 }
