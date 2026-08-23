@@ -1414,6 +1414,79 @@ else {
     Remove-Item Function:\Get-Credential -ErrorAction SilentlyContinue
 }
 
+# --- GUI provider scriptblocks (Start-PatchingGuestOpsGui.ps1, AST-extracted) ---
+# These 18 lines join four functions across three files and no other gate touches them.
+# The failure mode is a StrictMode property error raised hours into a run, at the exact
+# moment the operator is asked to choose updates.
+$guiLauncherFile = Join-Path $repoRoot 'Start-PatchingGuestOpsGui.ps1'
+if (-not (Test-Path -LiteralPath $guiLauncherFile -PathType Leaf)) {
+    Add-Failure -Message 'GUI entry point not found: Start-PatchingGuestOpsGui.ps1'
+}
+else {
+    $guiTokens = $null
+    $guiErrors = $null
+    $guiAst = [System.Management.Automation.Language.Parser]::ParseFile($guiLauncherFile, [ref]$guiTokens, [ref]$guiErrors)
+    $providerHashtables = @($guiAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.HashtableAst] }, $true) | Where-Object {
+        @($_.KeyValuePairs | ForEach-Object { [string]$_.Item1.Extent.Text }) -contains 'SelectUpdateGroups'
+    })
+
+    if ($providerHashtables.Count -eq 0) {
+        Add-Failure -Message 'GUI entry point does not build a prompt provider carrying SelectUpdateGroups'
+    }
+    else {
+        $providerPairs = @($providerHashtables[0].KeyValuePairs)
+        $selectPair = @($providerPairs | Where-Object { [string]$_.Item1.Extent.Text -eq 'SelectUpdateGroups' })
+        $credentialPair = @($providerPairs | Where-Object { [string]$_.Item1.Extent.Text -eq 'PromptCredential' })
+        Assert-Equal -Actual $credentialPair.Count -Expected 1 -Message 'the GUI provider also carries PromptCredential'
+
+        $selectBlock = $selectPair[0].Item2.GetPureExpression().ScriptBlock.GetScriptBlock()
+        $credentialBlock = $credentialPair[0].Item2.GetPureExpression().ScriptBlock.GetScriptBlock()
+
+        $script:dialogDefaults = $null
+        function Show-UpdateGroupDialog {
+            param($UpdateGroups, [int[]]$DefaultCheckedIndexes)
+            $script:dialogDefaults = @($DefaultCheckedIndexes)
+            return [pscustomobject]@{ Aborted = $false; CheckedIndexes = @(1) }
+        }
+        function Show-CredentialDialog {
+            param([string]$Title, [string]$Message, [string]$UserName = '')
+            return [pscustomobject]@{ Credential = (New-TestCredential 'GUI\adm'); Remember = $true }
+        }
+
+        $providerGroups = @(
+            [pscustomobject]@{ identityKey = 'aaa|1'; title = 'Cumulative'; kbText = 'KB1'; selectedByDefault = $true; appliesToVmCount = 2; patchableVmCount = 2 },
+            [pscustomobject]@{ identityKey = 'bbb|2'; title = 'Driver'; kbText = 'KB2'; selectedByDefault = $false; appliesToVmCount = 1; patchableVmCount = 1 }
+        )
+
+        $selectionOutcome = & $selectBlock @{ UpdateGroups = $providerGroups }
+        Assert-Equal -Actual $selectionOutcome.Aborted -Expected $false -Message 'the selection provider reports a completed selection'
+        Assert-Equal -Actual (@($selectionOutcome.Keys) -join ';') -Expected 'bbb|2' -Message 'the selection provider maps the dialog check state to identity keys'
+        Assert-Equal -Actual (@($script:dialogDefaults) -join ',') -Expected '0' -Message 'the selection provider pre-ticks the dialog from the default policy'
+
+        function Show-UpdateGroupDialog {
+            param($UpdateGroups, [int[]]$DefaultCheckedIndexes)
+            return [pscustomobject]@{ Aborted = $true; CheckedIndexes = @() }
+        }
+
+        $abortOutcome = & $selectBlock @{ UpdateGroups = $providerGroups }
+        Assert-Equal -Actual $abortOutcome.Aborted -Expected $true -Message 'a cancelled dialog becomes an aborted selection result'
+
+        $credentialOutcome = & $credentialBlock 'Credentials for vCenter vc1'
+        Assert-Equal -Actual $credentialOutcome.UserName -Expected 'GUI\adm' -Message 'the credential provider returns the credential itself, not the dialog wrapper'
+
+        function Show-CredentialDialog {
+            param([string]$Title, [string]$Message, [string]$UserName = '')
+            return $null
+        }
+
+        $cancelledCredential = & $credentialBlock 'Credentials for vCenter vc1'
+        Assert-Equal -Actual ($null -eq $cancelledCredential) -Expected $true -Message 'a cancelled credential dialog yields $null for the retry loop to reject'
+
+        Remove-Item Function:\Show-UpdateGroupDialog -ErrorAction SilentlyContinue
+        Remove-Item Function:\Show-CredentialDialog -ErrorAction SilentlyContinue
+    }
+}
+
 if ($failures.Count -gt 0) {
     Write-Host 'Runtime checks failed:'
     foreach ($failure in $failures) {

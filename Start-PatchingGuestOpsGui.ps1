@@ -12,6 +12,10 @@ if ($Host.Runspace.ApartmentState -ne 'STA') {
     throw 'This GUI requires an STA host. Start it with: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Start-PatchingGuestOpsGui.ps1'
 }
 
+if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    throw 'LOCALAPPDATA is not set, so there is nowhere to keep saved settings and credentials.'
+}
+
 . (Join-Path $root 'scripts\GuestOpsLib.ps1')
 . (Join-Path $root 'scripts\VMTargetLib.ps1')
 . (Join-Path $root 'scripts\SettingsStore.ps1')
@@ -37,7 +41,11 @@ if ($answer.Cancelled) {
 }
 
 $store = $credentialResult.Credentials
-$storeChanged = $false
+
+# $store aliases the loaded hashtable, so capture what was already on disk before the
+# gap-filling loop adds anything to it.
+$previouslyStoredKeys = @($store.Keys)
+$rememberedKeys = @()
 
 # Deduplicate before deriving credential groups. The console launcher dedupes
 # case-insensitively on its way in, but the GUI computes groups earlier, so without this
@@ -63,7 +71,7 @@ foreach ($missing in $missingKeys) {
 
     $store[$missing.StoreKey] = $entered.Credential
     if ($entered.Remember) {
-        $storeChanged = $true
+        $rememberedKeys += $missing.StoreKey
     }
 }
 
@@ -82,15 +90,36 @@ $settingsToSave.MaxPatchRounds = if ([int]::TryParse($answer.MaxPatchRounds, [re
 
 # Save BEFORE launching: the local gates take tens of seconds and can end the run with a
 # non-zero code, which would discard everything the operator just typed.
-Write-GuiSettings -Path $settingsPath -Settings $settingsToSave
-if ($storeChanged) {
-    Write-CredentialStore -Path $credentialsPath -Credentials $store
+try {
+    Write-GuiSettings -Path $settingsPath -Settings $settingsToSave
+}
+catch {
+    Write-Warning ('Settings could not be saved ({0}); continuing without persisting them.' -f $_.Exception.Message)
+}
+
+# Only what was already saved, plus what the operator explicitly agreed to remember. A
+# credential entered with Remember unticked stays in memory for this run and never
+# reaches the disk.
+if ($rememberedKeys.Count -gt 0) {
+    $credentialsToPersist = @{}
+    foreach ($storeKey in (@($previouslyStoredKeys) + @($rememberedKeys))) {
+        $credentialsToPersist[$storeKey] = $store[$storeKey]
+    }
+
+    try {
+        Write-CredentialStore -Path $credentialsPath -Credentials $credentialsToPersist
+    }
+    catch {
+        Write-Warning ('Credentials could not be saved ({0}); continuing without persisting them.' -f $_.Exception.Message)
+    }
 }
 
 $launcherParams = @{
     VIServer = (@($guiVIServers) -join ';')
     VMNames = @($guiVMNames)
     MaxPatchRounds = $settingsToSave.MaxPatchRounds
+    RebootTimeoutMinutes = $settingsToSave.RebootTimeoutMinutes
+    PollSeconds = $settingsToSave.PollSeconds
     StoredVIServerCredentials = (Expand-CredentialStoreMap -Scope 'vcenter' -TargetNames $guiVIServers -Store $store)
     StoredGuestCredentials = (Expand-CredentialStoreMap -Scope 'guest' -TargetNames $guiVMNames -Store $store)
     PromptProvider = @{
