@@ -52,7 +52,9 @@ param(
 
     [switch]$IgnoreVCenterCertificate,
 
-    [switch]$KeepConnected
+    [switch]$KeepConnected,
+
+    [hashtable]$PromptProvider
 )
 
 Set-StrictMode -Version 2.0
@@ -292,53 +294,89 @@ function Resolve-SelectedUpdateKeys {
     return @(@($UpdateGroups) | Where-Object { $_.selectedByDefault } | ForEach-Object { [string]$_.identityKey })
 }
 
+function New-UpdateSelectionResult {
+    param(
+        [string[]]$Keys = @(),
+        [switch]$Aborted
+    )
+
+    return [pscustomobject]@{
+        Aborted = [bool]$Aborted
+        Keys = @($Keys)
+    }
+}
+
+function Invoke-OperatorPrompt {
+    param(
+        [hashtable]$Provider,
+        [string]$Key,
+        [hashtable]$Arguments = @{},
+        [scriptblock]$FallbackScript
+    )
+
+    # Both conditions are required. An unbound [hashtable] parameter is $null, and
+    # $null.ContainsKey() throws; dot notation on a missing key throws
+    # PropertyNotFoundException under StrictMode 2.0. Measured, not assumed.
+    if ($null -ne $Provider -and $Provider.ContainsKey($Key)) {
+        return (& $Provider[$Key] $Arguments)
+    }
+
+    return (& $FallbackScript)
+}
+
 function Read-UpdateGroupSelection {
-    param($UpdateGroups)
+    param(
+        $UpdateGroups,
+        [hashtable]$PromptProvider
+    )
 
     $groups = @($UpdateGroups)
-    $selected = @{}
-    for ($i = 0; $i -lt $groups.Count; $i++) {
-        $selected[$i] = [bool]$groups[$i].selectedByDefault
-    }
 
-    while ($true) {
-        Write-Host ''
-        Write-Host 'Select update groups to install. Actions:'
-        Write-Host '  - Type a group number and press Enter to toggle it on ([x]) or off ([ ]).'
-        Write-Host '  - Press Enter on an empty line to accept the current selection and continue.'
+    return (Invoke-OperatorPrompt -Provider $PromptProvider -Key 'SelectUpdateGroups' -Arguments @{ UpdateGroups = $groups } -FallbackScript {
+        $selected = @{}
         for ($i = 0; $i -lt $groups.Count; $i++) {
-            $mark = if ($selected[$i]) { 'x' } else { ' ' }
-            Write-Host ('[{0}] {1}. {2}' -f $mark, ($i + 1), $groups[$i].title)
+            $selected[$i] = [bool]$groups[$i].selectedByDefault
         }
 
-        $inputText = Read-Host 'Group number to toggle (Enter to accept)'
-        if ([string]::IsNullOrWhiteSpace($inputText)) {
-            break
+        while ($true) {
+            Write-Host ''
+            Write-Host 'Select update groups to install. Actions:'
+            Write-Host '  - Type a group number and press Enter to toggle it on ([x]) or off ([ ]).'
+            Write-Host '  - Press Enter on an empty line to accept the current selection and continue.'
+            for ($i = 0; $i -lt $groups.Count; $i++) {
+                $mark = if ($selected[$i]) { 'x' } else { ' ' }
+                Write-Host ('[{0}] {1}. {2}' -f $mark, ($i + 1), $groups[$i].title)
+            }
+
+            $inputText = Read-Host 'Group number to toggle (Enter to accept)'
+            if ([string]::IsNullOrWhiteSpace($inputText)) {
+                break
+            }
+
+            $displayNumber = 0
+            if (-not [int]::TryParse($inputText, [ref]$displayNumber)) {
+                Write-Warning ('Invalid group number: {0}' -f $inputText)
+                continue
+            }
+
+            if ($displayNumber -lt 1 -or $displayNumber -gt $groups.Count) {
+                Write-Warning ('Group number {0} is outside the range 1..{1}.' -f $displayNumber, $groups.Count)
+                continue
+            }
+
+            $selectedIndex = $displayNumber - 1
+            $selected[$selectedIndex] = -not $selected[$selectedIndex]
         }
 
-        $displayNumber = 0
-        if (-not [int]::TryParse($inputText, [ref]$displayNumber)) {
-            Write-Warning ('Invalid group number: {0}' -f $inputText)
-            continue
+        $selectedKeys = @()
+        for ($i = 0; $i -lt $groups.Count; $i++) {
+            if ($selected[$i]) {
+                $selectedKeys += [string]$groups[$i].identityKey
+            }
         }
 
-        if ($displayNumber -lt 1 -or $displayNumber -gt $groups.Count) {
-            Write-Warning ('Group number {0} is outside the range 1..{1}.' -f $displayNumber, $groups.Count)
-            continue
-        }
-
-        $selectedIndex = $displayNumber - 1
-        $selected[$selectedIndex] = -not $selected[$selectedIndex]
-    }
-
-    $selectedKeys = @()
-    for ($i = 0; $i -lt $groups.Count; $i++) {
-        if ($selected[$i]) {
-            $selectedKeys += [string]$groups[$i].identityKey
-        }
-    }
-
-    return $selectedKeys
+        New-UpdateSelectionResult -Keys $selectedKeys
+    })
 }
 
 function Show-PatchPlan {
@@ -1257,20 +1295,30 @@ try {
                     $selectedKeysForPlan = Resolve-SelectedUpdateKeys -UpdateGroups $updateGroups -ExplicitSelectedUpdateKeys $SelectedUpdateKeys
                 }
                 elseif ($updateGroups.Count -gt 0) {
-                    $selectedKeysForPlan = Read-UpdateGroupSelection -UpdateGroups $updateGroups
+                    $planSelection = Read-UpdateGroupSelection -UpdateGroups $updateGroups -PromptProvider $PromptProvider
+                    if ($planSelection.Aborted) {
+                        Write-Warning 'Update group selection was cancelled; no patch plan was written.'
+                        $scriptExitCode = 1
+                        $selectedKeysForPlan = $null
+                    }
+                    else {
+                        $selectedKeysForPlan = @($planSelection.Keys)
+                    }
                 }
                 else {
                     $selectedKeysForPlan = @()
                 }
 
-                Write-Step -Message ('Selected update group key(s): {0}' -f @($selectedKeysForPlan).Count)
+                if ($null -ne $selectedKeysForPlan) {
+                    Write-Step -Message ('Selected update group key(s): {0}' -f @($selectedKeysForPlan).Count)
 
-                $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
-                $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
-                $patchPlanPath = Join-Path $roundOutputDirectory 'patch-plan.json'
-                $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
-                Show-PatchPlan -PatchPlanRecords $patchPlanRecords
-                $scriptExitCode = Get-PlanOnlyExitCode -PatchPlanRecords $patchPlanRecords
+                    $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
+                    $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
+                    $patchPlanPath = Join-Path $roundOutputDirectory 'patch-plan.json'
+                    $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
+                    Show-PatchPlan -PatchPlanRecords $patchPlanRecords
+                    $scriptExitCode = Get-PlanOnlyExitCode -PatchPlanRecords $patchPlanRecords
+                }
             }
 
             break
@@ -1296,7 +1344,14 @@ try {
             $selectedKeysForPlan = Resolve-SelectedUpdateKeys -UpdateGroups $updateGroups -ExplicitSelectedUpdateKeys $SelectedUpdateKeys
         }
         elseif ($updateGroups.Count -gt 0) {
-            $selectedKeysForPlan = Read-UpdateGroupSelection -UpdateGroups $updateGroups
+            $roundSelection = Read-UpdateGroupSelection -UpdateGroups $updateGroups -PromptProvider $PromptProvider
+            if ($roundSelection.Aborted) {
+                Write-Warning 'Update group selection was cancelled. Apply phase skipped.'
+                $sawApplyFailure = $true
+                break
+            }
+
+            $selectedKeysForPlan = @($roundSelection.Keys)
         }
         else {
             $selectedKeysForPlan = @()

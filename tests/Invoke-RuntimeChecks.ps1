@@ -1293,6 +1293,56 @@ Assert-Equal -Actual $noneKeys.Count -Expected 0 -Message 'unticking everything 
 $outOfRangeKeys = @(Get-SelectedIdentityKeys -UpdateGroups $sampleGroups -CheckedIndexes @(0, 99))
 Assert-Equal -Actual ($outOfRangeKeys -join ';') -Expected 'aaaaaaaa-0000-0000-0000-000000000001|100' -Message 'an index the control should never emit is ignored rather than throwing'
 
+
+# --- Operator prompt dispatch (scripts/Invoke-GuestOpsPatchValidation.ps1, AST-extracted) ---
+# The function lives in a script with top-level flow, so extract it through the AST, the
+# same way Resolve-VMTargetNames is pulled out of the launcher above.
+$orchestratorPath = Join-Path $repoRoot 'scripts\Invoke-GuestOpsPatchValidation.ps1'
+$orchestratorTokens = $null
+$orchestratorErrors = $null
+$orchestratorAst = [System.Management.Automation.Language.Parser]::ParseFile($orchestratorPath, [ref]$orchestratorTokens, [ref]$orchestratorErrors)
+$orchestratorFunctions = @($orchestratorAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+$promptDefinition = @($orchestratorFunctions | Where-Object { $_.Name -eq 'Invoke-OperatorPrompt' })
+if ($promptDefinition.Count -eq 0) {
+    Add-Failure -Message 'Orchestrator function not found: Invoke-OperatorPrompt'
+}
+else {
+    . ([scriptblock]::Create($promptDefinition[0].Extent.Text))
+
+    $noProvider = Invoke-OperatorPrompt -Provider $null -Key 'SelectUpdateGroups' -Arguments @{} -FallbackScript { 'console' }
+    Assert-Equal -Actual $noProvider -Expected 'console' -Message 'an unbound provider falls back to the console path'
+
+    $emptyProvider = Invoke-OperatorPrompt -Provider @{} -Key 'SelectUpdateGroups' -Arguments @{} -FallbackScript { 'console' }
+    Assert-Equal -Actual $emptyProvider -Expected 'console' -Message 'a provider without the key falls back rather than throwing'
+
+    $script:seenMarker = $null
+    $withProvider = Invoke-OperatorPrompt -Provider @{ SelectUpdateGroups = { param($a) $script:seenMarker = $a.Marker; 'gui' } } -Key 'SelectUpdateGroups' -Arguments @{ Marker = 'passed' } -FallbackScript { 'console' }
+    Assert-Equal -Actual $withProvider -Expected 'gui' -Message 'a matching provider key answers the prompt'
+    Assert-Equal -Actual $script:seenMarker -Expected 'passed' -Message 'the provider scriptblock receives the arguments hashtable'
+
+    $otherKey = Invoke-OperatorPrompt -Provider @{ SomethingElse = { 'gui' } } -Key 'SelectUpdateGroups' -Arguments @{} -FallbackScript { 'console' }
+    Assert-Equal -Actual $otherKey -Expected 'console' -Message 'a provider carrying a different key does not answer this prompt'
+}
+
+$selectionResultDefinition = @($orchestratorFunctions | Where-Object { $_.Name -eq 'New-UpdateSelectionResult' })
+if ($selectionResultDefinition.Count -eq 0) {
+    Add-Failure -Message 'Orchestrator function not found: New-UpdateSelectionResult'
+}
+else {
+    . ([scriptblock]::Create($selectionResultDefinition[0].Extent.Text))
+
+    $emptySelection = New-UpdateSelectionResult -Keys @()
+    Assert-Equal -Actual $emptySelection.Aborted -Expected $false -Message 'an empty selection is a selection, not an abort'
+    Assert-Equal -Actual (@($emptySelection.Keys).Count) -Expected 0 -Message 'an empty selection carries no keys'
+
+    $twoKeySelection = New-UpdateSelectionResult -Keys @('a|1', 'b|2')
+    Assert-Equal -Actual (@($twoKeySelection.Keys) -join ';') -Expected 'a|1;b|2' -Message 'selected keys survive the result object in order'
+
+    $abort = New-UpdateSelectionResult -Aborted
+    Assert-Equal -Actual $abort.Aborted -Expected $true -Message 'abort is representable and distinct from an empty selection'
+    Assert-Equal -Actual (@($abort.Keys).Count) -Expected 0 -Message 'an aborted result carries no keys'
+}
+
 if ($failures.Count -gt 0) {
     Write-Host 'Runtime checks failed:'
     foreach ($failure in $failures) {
