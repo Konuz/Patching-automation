@@ -235,8 +235,8 @@ foreach ($relativePath in @($agentPath, $identityHelperPath, $bootTimeHelperPath
     }
 }
 
-# Pliki GUI są opcjonalne: narzędzie konsolowe musi dać się wdrożyć bez nich, a
-# Assert-FileExists zapisałoby porażkę zamiast pominąć.
+# GUI files are optional: the console tool must stay deployable without them, and
+# Assert-FileExists would record a failure rather than skip.
 foreach ($relativePath in @($settingsStorePath, $guiPromptsPath, $guiLauncherPath)) {
     $path = Get-OptionalFilePath -RelativePath $relativePath
     if ($path) {
@@ -604,17 +604,14 @@ foreach ($guiRelativePath in @($settingsStorePath, $guiPromptsPath, $guiLauncher
         Assert-NoReservedVariableName -Ast $guiAst -RelativePath $guiRelativePath -ReservedNames $reservedVariableNames
         Assert-NoOrphanedBranchKeyword -Ast $guiAst -RelativePath $guiRelativePath
         Assert-TextDoesNotMatch -RelativePath $guiRelativePath -Text $guiText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
+
+        # Either parameter ends the patch-round loop after round one, in the
+        # ExplicitSelectionOnly and NonInteractive guards of Get-PatchRoundDecision. A GUI
+        # run that passed one would silently collapse to a single patch round, so the GUI
+        # returns its selection through the injected prompt provider instead.
+        Assert-TextDoesNotMatch -RelativePath $guiRelativePath -Text $guiText -Pattern '(?i)SelectedUpdateKeys' -Reason 'GUI code returns its selection through the prompt provider, never as an explicit key list'
+        Assert-TextDoesNotMatch -RelativePath $guiRelativePath -Text $guiText -Pattern '(?i)SkipConfirmation' -Reason 'a GUI run is interactive; -SkipConfirmation would cap it at one round'
     }
-}
-
-if ($existingScripts.ContainsKey($guiLauncherPath)) {
-    $guiLauncherText = Get-ScriptText -Path $existingScripts[$guiLauncherPath]
-
-    # Either one ends the patch-round loop after round one (OrchestratorRuntime.ps1:641 and
-    # :651), which would silently reduce a GUI run to a single round. The GUI's selection
-    # comes back through the prompt provider instead.
-    Assert-TextDoesNotMatch -RelativePath $guiLauncherPath -Text $guiLauncherText -Pattern 'SelectedUpdateKeys' -Reason 'the GUI returns its selection through the prompt provider, never as an explicit key list'
-    Assert-TextDoesNotMatch -RelativePath $guiLauncherPath -Text $guiLauncherText -Pattern 'SkipConfirmation' -Reason 'a GUI run is interactive; -SkipConfirmation would cap it at one round'
 }
 
 if ($failures.Count -gt 0) {
