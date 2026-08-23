@@ -1402,6 +1402,16 @@ else {
 
     $overrideMap = Resolve-GuestCredentialMap -TargetNames @('vm1.contoso.com') -OverrideCredential (New-TestCredential 'OVERRIDE\adm') -CredentialPromptScript { throw 'must not prompt' }
     Assert-Equal -Actual $overrideMap['vm1.contoso.com'].UserName -Expected 'OVERRIDE\adm' -Message 'an explicit credential still short-circuits the prompt'
+
+    $script:defaultPromptCalls = 0
+    function Get-Credential { param([string]$Message) $script:defaultPromptCalls++; New-TestCredential 'DEFAULT\adm' }
+
+    $defaultedMap = Resolve-GuestCredentialMap -TargetNames @('vm1.contoso.com', 'oldbox')
+    Assert-Equal -Actual $defaultedMap.Count -Expected 2 -Message 'omitting the prompt script falls back to the built-in prompt rather than throwing'
+    Assert-Equal -Actual $script:defaultPromptCalls -Expected 2 -Message 'the built-in prompt runs once per credential group'
+    Assert-Equal -Actual $defaultedMap['oldbox'].UserName -Expected 'DEFAULT\adm' -Message 'the built-in prompt result reaches the map'
+
+    Remove-Item Function:\Get-Credential -ErrorAction SilentlyContinue
 }
 
 if ($failures.Count -gt 0) {

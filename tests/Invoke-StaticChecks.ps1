@@ -454,8 +454,11 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern 'skipSingleVmValidationSummary' -Reason 'Single-VM validation flag removed by path unification'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$roundSelection.Aborted'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$planSelection.Aborted'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$null -ne $StoredVIServerCredentials'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$null -ne $StoredGuestCredentials'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$viserverCredentialMap = $StoredVIServerCredentials'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$guestCredentialMap = $StoredGuestCredentials'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$PromptProvider[''PromptCredential'']'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '-CredentialPromptScript $credentialPromptScript -RetryOnFailure'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '-OverrideCredential $GuestCredential -CredentialPromptScript $credentialPromptScript'
 }
 
 if ($existingScripts.ContainsKey($runtimeHelperPath)) {

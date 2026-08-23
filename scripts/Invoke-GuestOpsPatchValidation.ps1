@@ -1210,15 +1210,19 @@ if ($IgnoreVCenterCertificate) {
 
 $connections = @()
 $scriptExitCode = 1
-# The map is passed on WITHOUT copying. Connect-VIServersWithCredentialMap mutates it in
-# place on a login retry, and the corrected credential is consumed later by the reboot jobs,
-# which connect without -RetryOnFailure. A copy would leave apply working after a failed
-# first login while every reboot initiation died.
+# PromptCredential is the one provider entry that does NOT go through Invoke-OperatorPrompt.
+# It is handed straight to the credential seams, which have long called their prompt as
+# & $script $message with a bare string, so its scriptblock takes param([string]$Message)
+# and returns a pscredential - not the arguments hashtable SelectUpdateGroups receives.
 $credentialPromptScript = $null
 if ($null -ne $PromptProvider -and $PromptProvider.ContainsKey('PromptCredential')) {
     $credentialPromptScript = $PromptProvider['PromptCredential']
 }
 
+# The map is passed on WITHOUT copying. Connect-VIServersWithCredentialMap mutates it in
+# place on a login retry, and the corrected credential is consumed later by the reboot jobs,
+# which connect without -RetryOnFailure. A copy would leave apply working after a failed
+# first login while every reboot initiation died.
 if ($null -ne $StoredVIServerCredentials) {
     $viserverCredentialMap = $StoredVIServerCredentials
 }
@@ -1226,7 +1230,7 @@ else {
     $viserverCredentialMap = Resolve-VIServerCredentialMap -VIServers $resolvedVIServers -OverrideCredential $VIServerCredential -CredentialPromptScript $credentialPromptScript
 }
 
-$retryVIServerLogin = ($null -eq $VIServerCredential)
+$retryVIServerLogin = ($null -eq $VIServerCredential -or $null -ne $StoredVIServerCredentials)
 
 try {
     Write-Step -Message ('Connecting to vCenter(s) {0}.' -f ($resolvedVIServers -join ', '))
@@ -1256,7 +1260,12 @@ try {
             $scriptExitCode = 1
         }
         else {
-            $guestCredentialMap = Resolve-GuestCredentialMap -TargetNames @(@($patchPlanRecords) | ForEach-Object { [string]$_.vmName }) -OverrideCredential $GuestCredential
+            if ($null -ne $StoredGuestCredentials) {
+                $guestCredentialMap = $StoredGuestCredentials
+            }
+            else {
+                $guestCredentialMap = Resolve-GuestCredentialMap -TargetNames @(@($patchPlanRecords) | ForEach-Object { [string]$_.vmName }) -OverrideCredential $GuestCredential -CredentialPromptScript $credentialPromptScript
+            }
             # Resume stays a single round. There is no discovery to judge the starting state
             # from, the saved keys carry a RevisionNumber that will not match a later round's
             # groups, and resume is typically run non-interactively with -SkipConfirmation,
