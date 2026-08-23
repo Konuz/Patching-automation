@@ -116,7 +116,8 @@ function Read-GuiSettings {
         return [pscustomobject]@{ Settings = $settings; Warnings = @($warnings) }
     }
 
-    $settings.VIServers = @(Get-ObjectPropertyValue -InputObject $raw -Path @('VIServers'))
+    $storedVIServers = Get-ObjectPropertyValue -InputObject $raw -Path @('VIServers')
+    $settings.VIServers = @(@($storedVIServers) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
     $settings.ThrottleLimit = Get-ValidatedRangeValue -Raw (Get-ObjectPropertyValue -InputObject $raw -Path @('ThrottleLimit')) -Default $null -Name 'ThrottleLimit' -Warnings $warnings
     $settings.RebootBatchSize = Get-ValidatedRangeValue -Raw (Get-ObjectPropertyValue -InputObject $raw -Path @('RebootBatchSize')) -Default $null -Name 'RebootBatchSize' -Warnings $warnings
     $settings.MaxPatchRounds = Get-ValidatedRangeValue -Raw (Get-ObjectPropertyValue -InputObject $raw -Path @('MaxPatchRounds')) -Default 3 -Name 'MaxPatchRounds' -Warnings $warnings
@@ -182,6 +183,10 @@ function Write-CredentialStore {
         [hashtable]$Credentials
     )
 
+    if ($null -eq $Credentials) {
+        $Credentials = @{}
+    }
+
     $directory = Split-Path -Parent $Path
     if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
         [void](New-Item -ItemType Directory -Path $directory -Force)
@@ -215,6 +220,11 @@ function Read-CredentialStore {
     }
     catch {
         [void]$warnings.Add(('Credential file could not be read ({0}); no stored credentials are available.' -f $_.Exception.Message))
+        return [pscustomobject]@{ Credentials = $credentials; Warnings = @($warnings) }
+    }
+
+    if ($null -eq $raw) {
+        [void]$warnings.Add('Credential file held no readable content; no stored credentials are available.')
         return [pscustomobject]@{ Credentials = $credentials; Warnings = @($warnings) }
     }
 

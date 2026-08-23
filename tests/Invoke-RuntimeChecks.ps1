@@ -1194,7 +1194,17 @@ try {
     Assert-Equal -Actual (@($loaded.Settings.VIServers) -join ';') -Expected 'vc1.corp.local;vc2.corp.local' -Message 'vCenter list round-trips'
     Assert-Equal -Actual $loaded.Settings.ThrottleLimit -Expected 5 -Message 'numeric settings round-trip'
     Assert-Equal -Actual $loaded.Settings.IgnoreVCenterCertificate -Expected $true -Message 'switch settings round-trip'
+    Assert-Equal -Actual $loaded.Settings.RebootBatchSize -Expected 2 -Message 'RebootBatchSize round-trips'
+    Assert-Equal -Actual $loaded.Settings.MaxPatchRounds -Expected 4 -Message 'MaxPatchRounds round-trips'
+    Assert-Equal -Actual $loaded.Settings.RebootTimeoutMinutes -Expected 45 -Message 'RebootTimeoutMinutes round-trips'
+    Assert-Equal -Actual $loaded.Settings.PollSeconds -Expected 20 -Message 'PollSeconds round-trips'
+    Assert-Equal -Actual $loaded.Settings.LocalOutputDirectory -Expected 'D:\out' -Message 'the output directory round-trips'
+    Assert-Equal -Actual $loaded.Settings.KeepConnected -Expected $false -Message 'KeepConnected round-trips independently of IgnoreVCenterCertificate'
     Assert-Equal -Actual $loaded.Warnings.Count -Expected 0 -Message 'a clean file produces no warnings'
+
+    Set-Content -LiteralPath $settingsPath -Value '{ "PollSeconds": 15 }' -Encoding UTF8
+    $noServers = Read-GuiSettings -Path $settingsPath
+    Assert-Equal -Actual (@($noServers.Settings.VIServers).Count) -Expected 0 -Message 'an absent vCenter list reads back as empty, not as one blank entry'
 
     Set-Content -LiteralPath $settingsPath -Value '{ this is not json' -Encoding UTF8
     $corrupt = Read-GuiSettings -Path $settingsPath
@@ -1243,6 +1253,7 @@ try {
     Assert-Equal -Actual $roundTrip.Credentials.Count -Expected 2 -Message 'both credentials round-trip'
     Assert-Equal -Actual $roundTrip.Credentials['vcenter:domain:corp.local'].UserName -Expected 'CORP\svc' -Message 'username survives the round-trip'
     Assert-Equal -Actual $roundTrip.Credentials['vcenter:domain:corp.local'].GetNetworkCredential().Password -Expected $canaryPassword -Message 'password survives the round-trip'
+    Assert-Equal -Actual $roundTrip.Credentials.ContainsKey('VCENTER:DOMAIN:CORP.LOCAL') -Expected $true -Message 'the rebuilt store stays case-insensitive, so a differently-cased key still resolves'
 
     $damaged = (Get-Content -LiteralPath $credPath -Raw) -replace '("guest:domain:contoso\.com"\s*:\s*\{[^}]*"Password"\s*:\s*")[^"]+', '$1deadbeef'
     Set-Content -LiteralPath $credPath -Value $damaged -Encoding UTF8
