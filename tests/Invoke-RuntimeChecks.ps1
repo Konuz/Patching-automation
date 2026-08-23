@@ -1212,6 +1212,54 @@ finally {
     Remove-Item -LiteralPath $settingsDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# --- Credential file (scripts/SettingsStore.ps1) ---
+$credDir = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-creds-' + [guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $credDir)
+$credPath = Join-Path $credDir 'credentials.json'
+try {
+    $emptyStore = Read-CredentialStore -Path $credPath
+    Assert-Equal -Actual $emptyStore.Credentials.Count -Expected 0 -Message 'a missing credential file yields an empty store'
+    Assert-Equal -Actual $emptyStore.Warnings.Count -Expected 0 -Message 'a missing credential file is not a warning'
+
+    # A canary, not New-TestCredential's fixed 'password': the JSON carries a property
+    # NAMED "Password", and Assert-NotContains is case-insensitive, so needling 'password'
+    # would fail on the property name and never test what it claims to test.
+    $canaryPassword = 'Hunter2-PlainTextCanary'
+    $canaryCredential = New-Object System.Management.Automation.PSCredential(
+        'CORP\svc',
+        (ConvertTo-SecureString $canaryPassword -AsPlainText -Force)
+    )
+
+    Write-CredentialStore -Path $credPath -Credentials @{
+        'vcenter:domain:corp.local' = $canaryCredential
+        'guest:domain:contoso.com' = (New-TestCredential 'CONTOSO\adm')
+    }
+
+    $fileText = Get-Content -LiteralPath $credPath -Raw
+    Assert-NotContains -Text $fileText -Needle $canaryPassword -Message 'the plaintext password never reaches the file'
+    Assert-Contains -Text $fileText -Needle 'CORP\\svc' -Message 'the username is stored in cleartext, by accepted design'
+
+    $roundTrip = Read-CredentialStore -Path $credPath
+    Assert-Equal -Actual $roundTrip.Credentials.Count -Expected 2 -Message 'both credentials round-trip'
+    Assert-Equal -Actual $roundTrip.Credentials['vcenter:domain:corp.local'].UserName -Expected 'CORP\svc' -Message 'username survives the round-trip'
+    Assert-Equal -Actual $roundTrip.Credentials['vcenter:domain:corp.local'].GetNetworkCredential().Password -Expected $canaryPassword -Message 'password survives the round-trip'
+
+    $damaged = (Get-Content -LiteralPath $credPath -Raw) -replace '("guest:domain:contoso\.com"\s*:\s*\{[^}]*"Password"\s*:\s*")[^"]+', '$1deadbeef'
+    Set-Content -LiteralPath $credPath -Value $damaged -Encoding UTF8
+    $partial = Read-CredentialStore -Path $credPath
+    Assert-Equal -Actual $partial.Credentials.ContainsKey('vcenter:domain:corp.local') -Expected $true -Message 'an undecryptable entry does not destroy its neighbours'
+    Assert-Equal -Actual $partial.Credentials.ContainsKey('guest:domain:contoso.com') -Expected $false -Message 'the undecryptable entry is dropped, not returned broken'
+    Assert-Equal -Actual ($partial.Warnings.Count -ge 1) -Expected $true -Message 'an undecryptable entry warns so the GUI can re-prompt for that key'
+
+    Set-Content -LiteralPath $credPath -Value 'not json at all' -Encoding UTF8
+    $broken = Read-CredentialStore -Path $credPath
+    Assert-Equal -Actual $broken.Credentials.Count -Expected 0 -Message 'a corrupt credential file degrades to an empty store'
+    Assert-Equal -Actual ($broken.Warnings.Count -ge 1) -Expected $true -Message 'a corrupt credential file warns'
+}
+finally {
+    Remove-Item -LiteralPath $credDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 if ($failures.Count -gt 0) {
     Write-Host 'Runtime checks failed:'
     foreach ($failure in $failures) {
