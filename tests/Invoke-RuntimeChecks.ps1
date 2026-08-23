@@ -1383,6 +1383,27 @@ else {
     Remove-Item Function:\Write-Host -ErrorAction SilentlyContinue
 }
 
+# --- Guest credential prompt seam (scripts/Invoke-GuestOpsPatchValidation.ps1, AST-extracted) ---
+$guestMapDefinition = @($orchestratorFunctions | Where-Object { $_.Name -eq 'Resolve-GuestCredentialMap' })
+if ($guestMapDefinition.Count -eq 0) {
+    Add-Failure -Message 'Orchestrator function not found: Resolve-GuestCredentialMap'
+}
+else {
+    . ([scriptblock]::Create($guestMapDefinition[0].Extent.Text))
+
+    $script:guestPromptMessages = @()
+    $fakeGuestPrompt = { param([string]$Message) $script:guestPromptMessages += $Message; New-TestCredential 'PROMPTED\adm' }
+
+    $promptedMap = Resolve-GuestCredentialMap -TargetNames @('vm1.contoso.com', 'vm2.contoso.com', 'oldbox') -CredentialPromptScript $fakeGuestPrompt
+    Assert-Equal -Actual $promptedMap.Count -Expected 3 -Message 'the injected prompt fills every target name'
+    Assert-Equal -Actual $script:guestPromptMessages.Count -Expected 2 -Message 'one prompt per credential group, not per VM'
+    Assert-Equal -Actual $promptedMap['vm2.contoso.com'].UserName -Expected 'PROMPTED\adm' -Message 'both domain members share the prompted credential'
+    Assert-Equal -Actual $promptedMap['oldbox'].UserName -Expected 'PROMPTED\adm' -Message 'the standalone machine gets its own prompt result'
+
+    $overrideMap = Resolve-GuestCredentialMap -TargetNames @('vm1.contoso.com') -OverrideCredential (New-TestCredential 'OVERRIDE\adm') -CredentialPromptScript { throw 'must not prompt' }
+    Assert-Equal -Actual $overrideMap['vm1.contoso.com'].UserName -Expected 'OVERRIDE\adm' -Message 'an explicit credential still short-circuits the prompt'
+}
+
 if ($failures.Count -gt 0) {
     Write-Host 'Runtime checks failed:'
     foreach ($failure in $failures) {

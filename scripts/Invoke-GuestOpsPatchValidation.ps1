@@ -54,7 +54,13 @@ param(
 
     [switch]$KeepConnected,
 
-    [hashtable]$PromptProvider
+    [hashtable]$PromptProvider,
+
+    # The Stored prefix is required, not cosmetic: -VIServerCredentialMap would be THE SAME
+    # variable as $viserverCredentialMap below (PowerShell variable names are
+    # case-insensitive) and the supplied map would be silently overwritten.
+    [hashtable]$StoredVIServerCredentials,
+    [hashtable]$StoredGuestCredentials
 )
 
 Set-StrictMode -Version 2.0
@@ -1019,8 +1025,16 @@ function Invoke-ApplyAndOptionalReboot {
 function Resolve-GuestCredentialMap {
     param(
         [string[]]$TargetNames,
-        [pscredential]$OverrideCredential
+        [pscredential]$OverrideCredential,
+        [scriptblock]$CredentialPromptScript
     )
+
+    if ($null -eq $CredentialPromptScript) {
+        $CredentialPromptScript = {
+            param([string]$Message)
+            Get-Credential -Message $Message
+        }
+    }
 
     $map = @{}
 
@@ -1040,7 +1054,7 @@ function Resolve-GuestCredentialMap {
             $message = ('Local administrator credentials for {0}' -f $group.Key)
         }
 
-        $credential = Get-Credential -Message $message
+        $credential = & $CredentialPromptScript $message
         foreach ($member in @($group.Members)) {
             $map[$member] = $credential
         }
@@ -1196,7 +1210,22 @@ if ($IgnoreVCenterCertificate) {
 
 $connections = @()
 $scriptExitCode = 1
-$viserverCredentialMap = Resolve-VIServerCredentialMap -VIServers $resolvedVIServers -OverrideCredential $VIServerCredential
+# The map is passed on WITHOUT copying. Connect-VIServersWithCredentialMap mutates it in
+# place on a login retry, and the corrected credential is consumed later by the reboot jobs,
+# which connect without -RetryOnFailure. A copy would leave apply working after a failed
+# first login while every reboot initiation died.
+$credentialPromptScript = $null
+if ($null -ne $PromptProvider -and $PromptProvider.ContainsKey('PromptCredential')) {
+    $credentialPromptScript = $PromptProvider['PromptCredential']
+}
+
+if ($null -ne $StoredVIServerCredentials) {
+    $viserverCredentialMap = $StoredVIServerCredentials
+}
+else {
+    $viserverCredentialMap = Resolve-VIServerCredentialMap -VIServers $resolvedVIServers -OverrideCredential $VIServerCredential -CredentialPromptScript $credentialPromptScript
+}
+
 $retryVIServerLogin = ($null -eq $VIServerCredential)
 
 try {
@@ -1204,7 +1233,7 @@ try {
     # Only the sessions this run opened go into $connections: the finally block disconnects
     # them, and a session the operator already had (-KeepConnected from an earlier run) must
     # survive this one.
-    $connectResult = Connect-VIServersWithCredentialMap -VIServers $resolvedVIServers -CredentialMap $viserverCredentialMap -RetryOnFailure:$retryVIServerLogin -ReuseExisting
+    $connectResult = Connect-VIServersWithCredentialMap -VIServers $resolvedVIServers -CredentialMap $viserverCredentialMap -CredentialPromptScript $credentialPromptScript -RetryOnFailure:$retryVIServerLogin -ReuseExisting
     $connections = @($connectResult.OpenedConnections)
 
     $managers = if ($resolvedVIServers.Count -eq 1) { Get-GuestOpsManagers } else { $null }
@@ -1242,7 +1271,12 @@ try {
     $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $runOutputDirectory = New-UniqueOutputDirectory -BasePath (Join-Path $LocalOutputDirectory $timestamp)
 
-    $guestCredentialMap = Resolve-GuestCredentialMap -TargetNames $targetVMNames -OverrideCredential $GuestCredential
+    if ($null -ne $StoredGuestCredentials) {
+        $guestCredentialMap = $StoredGuestCredentials
+    }
+    else {
+        $guestCredentialMap = Resolve-GuestCredentialMap -TargetNames $targetVMNames -OverrideCredential $GuestCredential -CredentialPromptScript $credentialPromptScript
+    }
 
     $roundTargetVMNames = @($targetVMNames)
     $roundNumber = 0
