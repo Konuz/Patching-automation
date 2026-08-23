@@ -32,7 +32,7 @@ jednoelementowa.
 
 Na maszynie sterującej (stepping stone):
 
-- **Windows PowerShell 5.1** (domyślny w Windows; PS7 nie jest potrzebny).
+- **Windows PowerShell 5.1** (domyślny w Windows; PS7 nie jest potrzebny). Launcher GUI wymaga standardowego wątku STA (domyślny w `powershell.exe`).
 - Moduł **VMware.PowerCLI** (`Install-Module VMware.PowerCLI`). Faktycznie wymagany jest tylko **VMware.VimAutomation.Core** — tylko on jest importowany i tylko o niego pyta kontrola wymagań, więc lekka instalacja samego tego modułu też wystarczy.
 - **`curl.exe`** — standardowy składnik Windows (używany do transferu plików; nic nie instalujesz).
 - Sieciowy dostęp do **vCenter (:443)** i do hostów **ESXi (:443)**.
@@ -52,8 +52,15 @@ Potrzebne poświadczenia (skrypt o nie zapyta, jeśli ich nie podasz):
 
 ## Szybki start
 
+Dostępne są dwa punkty wejścia:
+- **`Start-PatchingGuestOpsGui.ps1`** — tryb graficzny (okna dialogowe WinForms do wprowadzenia parametrów, wyboru maszyn, bezpiecznego wprowadzania i zapamiętywania poświadczeń DPAPI oraz wyboru grup poprawek).
+- **`Start-PatchingGuestOps.ps1`** — tradycyjny launcher konsolowy do uruchomień w terminalu lub automatyzacji skryptowej.
+
 ```powershell
-# Pełny przebieg (zapyta o vCenter / VM / poświadczenia; najpierw odpala lokalne testy):
+# Uruchomienie przez GUI (okna WinForms, pamięć parametrów i poświadczeń DPAPI):
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Start-PatchingGuestOpsGui.ps1
+
+# Pełny przebieg w konsoli (zapyta o vCenter / VM / poświadczenia; najpierw odpala lokalne testy):
 .\Start-PatchingGuestOps.ps1
 
 # Tylko rozpoznanie (skan WUA), bez pobierania i instalacji:
@@ -257,6 +264,14 @@ konkretnej maszynie.
 > maszynę sterującą do `out\<znacznik-czasu>\NNN-<vm>\`, więc raporty zbierasz w jednym
 > miejscu — lokalnie.
 
+### Magazyn ustawień i poświadczeń GUI (opcjonalny)
+
+Gdy korzystasz z launchera GUI (`Start-PatchingGuestOpsGui.ps1`), w profilu użytkownika maszyny sterującej wykorzystywany jest katalog:
+`%LOCALAPPDATA%\PatchingGuestOps\`
+
+- **`settings.json`** — zapamiętane domyślne parametry formularza (ostatnio używane vCenter, limity, katalog wyjściowy, flagi). Lista maszyn VM celowo **nie** jest w nim zapisywana.
+- **`credentials.json`** — zaszyfrowane poświadczenia vCenter i gości (szyfrowanie DPAPI per-klucz, powiązane z kontem zalogowanego użytkownika Windows). Poświadczenia trafiają tu tylko wtedy, gdy w oknie dialogowym zaznaczysz *Remember on this machine*.
+
 ---
 
 ## Jak to działa pod spodem
@@ -290,13 +305,16 @@ Wewnątrz gościa działa **agent** (`guest\Run-LocalPatch.ps1`), który używa 
 ## Struktura repozytorium
 
 ```
-Start-PatchingGuestOps.ps1          # Launcher — jedyny punkt wejścia dla administratora
+Start-PatchingGuestOps.ps1          # Launcher konsolowy — główny punkt wejścia CLI
+Start-PatchingGuestOpsGui.ps1       # Launcher GUI — okna dialogowe WinForms i magazyn ustawień
 scripts\
   Invoke-GuestOpsPatchValidation.ps1  # Orchestrator: discovery → plan → apply → reboot
   PatchPlanModel.ps1                  # Model offline: logika planowania i raportów (bez I/O)
   GuestOpsLib.ps1                     # Helpery PowerCLI/GuestOps (transfer plików, uruchamianie procesów)
   OrchestratorRuntime.ps1             # Throttling, semantyka apply/reboot, artefakty restartu
   VMTargetLib.ps1                     # Wspólne rozwiązywanie nazw VM (launcher + orchestrator)
+  GuiPrompts.ps1                      # Okna dialogowe WinForms (parametry, poświadczenia, grupy)
+  SettingsStore.ps1                   # Zarządzanie ustawieniami i magazynem poświadczeń DPAPI
 guest\
   Run-LocalPatch.ps1                  # Agent działający w gościu (WUA COM)
   Read-BootTime.ps1                   # Odczyt Win32_OperatingSystem.LastBootUpTime w gościu
@@ -305,6 +323,7 @@ tests\
   Invoke-StaticChecks.ps1             # Bramka statyczna (AST + tekst)
   Invoke-ModelChecks.ps1              # Bramka modelu (zachowanie offline)
   Invoke-RuntimeChecks.ps1            # Bramka runtime (helpery, throttling, resolver)
+  Invoke-GuestOpsHarnessChecks.ps1    # Bramka harness (cykl agenta w symulowanym vSphere)
 out\                                  # Artefakty przebiegów (generowane; w .gitignore)
 CLAUDE.md                             # Instrukcje dla asystenta / kontekst projektu
 ```
