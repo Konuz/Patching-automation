@@ -1260,6 +1260,28 @@ finally {
     Remove-Item -LiteralPath $credDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# --- Checkbox state to identity keys (scripts/SettingsStore.ps1) ---
+$sampleGroups = @(
+    [pscustomobject]@{ identityKey = 'aaaaaaaa-0000-0000-0000-000000000001|100'; title = 'Cumulative Update'; selectedByDefault = $true },
+    [pscustomobject]@{ identityKey = 'bbbbbbbb-0000-0000-0000-000000000002|200'; title = 'Driver'; selectedByDefault = $false },
+    [pscustomobject]@{ identityKey = 'cccccccc-0000-0000-0000-000000000003|300'; title = 'Security Update'; selectedByDefault = $true }
+)
+
+$defaultIndexes = @(Get-DefaultCheckedIndexes -UpdateGroups $sampleGroups)
+Assert-Equal -Actual ($defaultIndexes -join ',') -Expected '0,2' -Message 'the dialog opens pre-ticked on the default policy'
+
+$allKeys = @(Get-SelectedIdentityKeys -UpdateGroups $sampleGroups -CheckedIndexes @(0, 2))
+Assert-Equal -Actual ($allKeys -join ';') -Expected 'aaaaaaaa-0000-0000-0000-000000000001|100;cccccccc-0000-0000-0000-000000000003|300' -Message 'checked indexes map to identity keys in group order'
+
+$reorderedKeys = @(Get-SelectedIdentityKeys -UpdateGroups $sampleGroups -CheckedIndexes @(2, 0))
+Assert-Equal -Actual ($reorderedKeys -join ';') -Expected 'aaaaaaaa-0000-0000-0000-000000000001|100;cccccccc-0000-0000-0000-000000000003|300' -Message 'group order wins over the order the control reports checks in'
+
+$noneKeys = @(Get-SelectedIdentityKeys -UpdateGroups $sampleGroups -CheckedIndexes @())
+Assert-Equal -Actual $noneKeys.Count -Expected 0 -Message 'unticking everything is a legal, empty selection'
+
+$outOfRangeKeys = @(Get-SelectedIdentityKeys -UpdateGroups $sampleGroups -CheckedIndexes @(0, 99))
+Assert-Equal -Actual ($outOfRangeKeys -join ';') -Expected 'aaaaaaaa-0000-0000-0000-000000000001|100' -Message 'an index the control should never emit is ignored rather than throwing'
+
 if ($failures.Count -gt 0) {
     Write-Host 'Runtime checks failed:'
     foreach ($failure in $failures) {

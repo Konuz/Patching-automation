@@ -243,3 +243,41 @@ function Read-CredentialStore {
     return [pscustomobject]@{ Credentials = $credentials; Warnings = @($warnings) }
 }
 
+function Get-DefaultCheckedIndexes {
+    param($UpdateGroups)
+
+    $groups = @($UpdateGroups)
+    $indexes = @()
+    for ($i = 0; $i -lt $groups.Count; $i++) {
+        if ([bool]$groups[$i].selectedByDefault) {
+            $indexes += $i
+        }
+    }
+
+    return @($indexes)
+}
+
+function Get-SelectedIdentityKeys {
+    param(
+        $UpdateGroups,
+        [int[]]$CheckedIndexes
+    )
+
+    $groups = @($UpdateGroups)
+    $checked = @{}
+    foreach ($index in @($CheckedIndexes)) {
+        $checked[[int]$index] = $true
+    }
+
+    # Iterate over the groups, not over the checks: key order must follow group order,
+    # whatever order the control happens to report its checked indices in.
+    $keys = @()
+    for ($i = 0; $i -lt $groups.Count; $i++) {
+        if ($checked.ContainsKey($i)) {
+            $keys += [string]$groups[$i].identityKey
+        }
+    }
+
+    return @($keys)
+}
+
