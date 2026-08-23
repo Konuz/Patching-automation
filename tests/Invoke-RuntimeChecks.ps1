@@ -1161,6 +1161,57 @@ Assert-Equal -Actual $nullStoreMissing.Count -Expected 1 -Message 'a null store 
 $nullStoreMap = Expand-CredentialStoreMap -Scope 'guest' -TargetNames @('vm1.contoso.com') -Store $null
 Assert-Equal -Actual $nullStoreMap.Count -Expected 0 -Message 'a null store expands to an empty map rather than throwing'
 
+# --- Settings file (scripts/SettingsStore.ps1) ---
+$settingsDir = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-settings-' + [guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $settingsDir)
+$settingsPath = Join-Path $settingsDir 'settings.json'
+try {
+    $defaults = Read-GuiSettings -Path $settingsPath
+    Assert-Equal -Actual $defaults.Warnings.Count -Expected 0 -Message 'a missing settings file is not a warning, it is a first run'
+    Assert-Equal -Actual $defaults.Settings.MaxPatchRounds -Expected 3 -Message 'missing settings file yields documented defaults'
+    Assert-Equal -Actual (@($defaults.Settings.VIServers).Count) -Expected 0 -Message 'no vCenters are assumed on a first run'
+
+    Write-GuiSettings -Path $settingsPath -Settings ([pscustomobject]@{
+        VIServers = @('vc1.corp.local', 'vc2.corp.local')
+        ThrottleLimit = 5
+        RebootBatchSize = 2
+        MaxPatchRounds = 4
+        RebootTimeoutMinutes = 45
+        PollSeconds = 20
+        LocalOutputDirectory = 'D:\out'
+        IgnoreVCenterCertificate = $true
+        KeepConnected = $false
+    })
+
+    # Assert this while the file still holds what Write-GuiSettings produced. The
+    # out-of-range case below overwrites it by hand, and asserting there would check the
+    # test's own JSON rather than the writer's.
+    $writtenText = Get-Content -LiteralPath $settingsPath -Raw
+    Assert-NotContains -Text $writtenText -Needle 'SkipStaticChecks' -Message 'SkipStaticChecks is never persisted'
+    Assert-NotContains -Text $writtenText -Needle 'VMNames' -Message 'the VM list is never persisted'
+
+    $loaded = Read-GuiSettings -Path $settingsPath
+    Assert-Equal -Actual (@($loaded.Settings.VIServers) -join ';') -Expected 'vc1.corp.local;vc2.corp.local' -Message 'vCenter list round-trips'
+    Assert-Equal -Actual $loaded.Settings.ThrottleLimit -Expected 5 -Message 'numeric settings round-trip'
+    Assert-Equal -Actual $loaded.Settings.IgnoreVCenterCertificate -Expected $true -Message 'switch settings round-trip'
+    Assert-Equal -Actual $loaded.Warnings.Count -Expected 0 -Message 'a clean file produces no warnings'
+
+    Set-Content -LiteralPath $settingsPath -Value '{ this is not json' -Encoding UTF8
+    $corrupt = Read-GuiSettings -Path $settingsPath
+    Assert-Equal -Actual $corrupt.Settings.MaxPatchRounds -Expected 3 -Message 'a corrupt settings file degrades to defaults instead of throwing'
+    Assert-Equal -Actual ($corrupt.Warnings.Count -ge 1) -Expected $true -Message 'a corrupt settings file warns'
+
+    Set-Content -LiteralPath $settingsPath -Value '{ "ThrottleLimit": 0, "MaxPatchRounds": -2, "PollSeconds": 15 }' -Encoding UTF8
+    $outOfRange = Read-GuiSettings -Path $settingsPath
+    Assert-Equal -Actual $outOfRange.Settings.ThrottleLimit -Expected $null -Message 'a below-range ThrottleLimit falls back to "not supplied"'
+    Assert-Equal -Actual $outOfRange.Settings.MaxPatchRounds -Expected 3 -Message 'a below-range MaxPatchRounds falls back to its default'
+    Assert-Equal -Actual $outOfRange.Settings.PollSeconds -Expected 15 -Message 'an in-range value survives alongside invalid neighbours'
+    Assert-Equal -Actual ($outOfRange.Warnings.Count -ge 2) -Expected $true -Message 'each out-of-range value warns so the form can show it'
+}
+finally {
+    Remove-Item -LiteralPath $settingsDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 if ($failures.Count -gt 0) {
     Write-Host 'Runtime checks failed:'
     foreach ($failure in $failures) {
