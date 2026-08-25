@@ -1592,14 +1592,25 @@ function Get-ItemProperty {
     $emptyRenameReboot = & $pendingRebootProbe $false $false @() $false
     Assert-Equal -Actual ([bool]$emptyRenameReboot.isPending) -Expected $false -Message 'an empty PendingFileRenameOperations array is not a pending reboot'
 
-    # A real queued rename must still count, including the single-string form the registry
-    # returns when only one operation is queued.
+    # A real queued rename is detected and reported, but it does not gate the prompt: any
+    # installer can queue one, and on its own it says nothing about whether patching left work
+    # outstanding. This is the case that offered a reboot on a guest with zero applicable
+    # updates and neither servicing flag set.
     $realRenameReboot = & $pendingRebootProbe $false $false @('\??\C:\Windows\file.dll', '') $false
-    Assert-Equal -Actual ([bool]$realRenameReboot.isPending) -Expected $true -Message 'a queued file rename is a pending reboot'
-    Assert-Equal -Actual (@($realRenameReboot.pendingReasons) -join ',') -Expected 'pendingFileRename' -Message 'a queued file rename names itself as the reason'
+    Assert-Equal -Actual ([bool]$realRenameReboot.checks.pendingFileRename) -Expected $true -Message 'a queued file rename is still detected'
+    Assert-Equal -Actual ([bool]$realRenameReboot.isPending) -Expected $false -Message 'a queued file rename alone does not require a reboot'
+    Assert-Equal -Actual (@($realRenameReboot.pendingReasons).Count) -Expected 0 -Message 'a queued file rename is not a gating reason'
+    Assert-Equal -Actual (@($realRenameReboot.advisoryReasons) -join ',') -Expected 'pendingFileRename' -Message 'a queued file rename is reported as advisory'
 
     $scalarRenameReboot = & $pendingRebootProbe $false $false '\??\C:\Windows\file.dll' $false
-    Assert-Equal -Actual ([bool]$scalarRenameReboot.isPending) -Expected $true -Message 'a single queued rename returned as a scalar is a pending reboot'
+    Assert-Equal -Actual ([bool]$scalarRenameReboot.checks.pendingFileRename) -Expected $true -Message 'a single queued rename returned as a scalar is still detected'
+    Assert-Equal -Actual ([bool]$scalarRenameReboot.isPending) -Expected $false -Message 'a scalar queued rename alone does not require a reboot'
+
+    # A servicing flag alongside an advisory one must still gate, and must not swallow it.
+    $mixedReboot = & $pendingRebootProbe $true $false @('\??\C:\Windows\file.dll', '') $false
+    Assert-Equal -Actual ([bool]$mixedReboot.isPending) -Expected $true -Message 'a servicing flag still requires a reboot when a rename is queued too'
+    Assert-Equal -Actual (@($mixedReboot.pendingReasons) -join ',') -Expected 'componentBasedServicing' -Message 'only the servicing flag is a gating reason'
+    Assert-Equal -Actual (@($mixedReboot.advisoryReasons) -join ',') -Expected 'pendingFileRename' -Message 'the advisory flag survives alongside a gating one'
 
     $cbsReboot = & $pendingRebootProbe $true $false $null $true
     Assert-Equal -Actual ([bool]$cbsReboot.isPending) -Expected $true -Message 'component based servicing still reports a pending reboot'
@@ -1608,6 +1619,7 @@ function Get-ItemProperty {
     $wuReboot = & $pendingRebootProbe $false $true @('') $false
     Assert-Equal -Actual ([bool]$wuReboot.isPending) -Expected $true -Message 'the Windows Update flag still reports a pending reboot'
     Assert-Equal -Actual (@($wuReboot.pendingReasons) -join ',') -Expected 'windowsUpdate' -Message 'the Windows Update flag names itself as the reason'
+    Assert-Equal -Actual (@($wuReboot.advisoryReasons).Count) -Expected 0 -Message 'a blank rename value is not even advisory'
 }
 
 if ($failures.Count -gt 0) {

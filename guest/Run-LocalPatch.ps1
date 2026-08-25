@@ -237,12 +237,10 @@ function Test-PendingReboot {
     $sessionManagerPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
     try {
         $sessionManager = Get-ItemProperty -LiteralPath $sessionManagerPath -Name PendingFileRenameOperations -ErrorAction Stop
-        # Presence of the value is not a pending rename. The rename format pads every source
-        # path with an empty destination entry, and Windows leaves the value behind as a blank
-        # multi-string once it has processed the queue, so a server that has nothing to rename
-        # still carries the property. Treating that as pending made a run that installed
-        # nothing but a Defender definition update report a reboot as required. Only a
-        # non-blank entry counts.
+        # Presence of the value is not a pending rename. It is a REG_MULTI_SZ of source and
+        # destination pairs, a queued delete is encoded as a source path with an empty
+        # destination, and the value can survive as blank entries alone. Only a non-blank
+        # entry is a real queued operation, so filter before judging.
         $renameEntries = @($sessionManager.PendingFileRenameOperations)
         $checks.pendingFileRename = (@($renameEntries | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count -gt 0)
     }
@@ -250,13 +248,22 @@ function Test-PendingReboot {
         $checks.pendingFileRename = $false
     }
 
-    # Name the checks that fired. isPending alone cannot tell an operator why a VM that took a
-    # single definition update is being offered a reboot, and status.json is the only record.
-    $pendingReasons = @($checks.Keys | Where-Object { [bool]$checks[$_] })
+    # Only the two servicing flags gate the reboot prompt. Windows Update sets one of them
+    # whenever a patch it installed still needs a restart to complete, so between them they
+    # answer the question this tool actually asks: did patching leave work outstanding?
+    # PendingFileRenameOperations does not. Any installer can queue a rename, the entry
+    # survives until the next boot whatever put it there, and it was observed as the only
+    # flag set on a fully patched guest with zero applicable updates -- offering a reboot
+    # that no update had asked for. It stays recorded and reported, but it no longer forces
+    # the prompt on its own.
+    $gatingCheckNames = @('componentBasedServicing', 'windowsUpdate')
+    $pendingReasons = @($gatingCheckNames | Where-Object { [bool]$checks[$_] })
+    $advisoryReasons = @($checks.Keys | Where-Object { $_ -notin $gatingCheckNames -and [bool]$checks[$_] })
 
     return [ordered]@{
         isPending = ($pendingReasons.Count -gt 0)
         pendingReasons = $pendingReasons
+        advisoryReasons = $advisoryReasons
         checks = $checks
     }
 }

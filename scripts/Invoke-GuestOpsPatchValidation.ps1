@@ -1152,6 +1152,13 @@ function Invoke-DiscoveryPhase {
         }
         $pendingRebootBefore = Get-ObjectPropertyValue -InputObject $record -Path @('pendingRebootBefore', 'isPending')
         $rebootText = if ($null -eq $pendingRebootBefore) { '?' } elseif ([bool]$pendingRebootBefore) { 'yes' } else { 'no' }
+        # Flags that were seen but deliberately do not gate the reboot prompt still belong on
+        # screen. Dropping them entirely would replace one confusing prompt with a silent
+        # omission, and this line is where an operator looks first.
+        $advisoryReboot = @(Get-ObjectPropertyValue -InputObject $record -Path @('pendingRebootBefore', 'advisoryReasons') -DefaultValue @())
+        if ($advisoryReboot.Count -gt 0) {
+            $rebootText = '{0} (advisory: {1})' -f $rebootText, ($advisoryReboot -join ', ')
+        }
         Write-Host ('{0}: outcome={1}; updates={2}; reboot={3}; roles={4}' -f $record.vmName, $record.outcome, $record.availableUpdateCount, $rebootText, (Get-RoleFlagText -RoleFlags $record.roleFlags)) -ForegroundColor $summaryColor
         Write-Host ''
     }
