@@ -1383,6 +1383,60 @@ else {
     Assert-Equal -Actual $otherKey -Expected 'console' -Message 'a provider carrying a different key does not answer this prompt'
 }
 
+# Write-FinalReport counts six groups of VMs, and the reboot group is the one that can legally
+# be empty. An if-expression assigns its branch's pipeline output and an empty collection emits
+# nothing, so @() inside a branch assigned $null and the count threw under StrictMode. That state
+# was unreachable while a stale PendingFileRenameOperations kept every guest on the reboot list;
+# it is the normal case now, so it gets a test.
+$finalReportDefinition = @($orchestratorFunctions | Where-Object { $_.Name -eq 'Write-FinalReport' })
+if ($finalReportDefinition.Count -eq 0) {
+    Add-Failure -Message 'Orchestrator function not found: Write-FinalReport'
+}
+else {
+    $finalReportDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('final-report-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $finalReportDirectory | Out-Null
+    try {
+        # ConvertTo-PatchSummaryRows belongs to the offline model and has its own gate; stubbing
+        # it inside this scope keeps the dependency out of the runtime checks and never shadows
+        # anything for the rest of this file.
+        $finalReportProbe = [scriptblock]::Create(@'
+param($PlanRecords, $ApplyResults, [string]$OutputDirectory, $RebootTargets)
+
+function ConvertTo-PatchSummaryRows {
+    param($PatchPlanRecords)
+    return @(@($PatchPlanRecords) | ForEach-Object { [pscustomobject]@{ VMName = $_.vmName; Action = $_.action } })
+}
+
+'@ + $finalReportDefinition[0].Extent.Text + [Environment]::NewLine + 'Write-FinalReport -PatchPlanRecords $PlanRecords -ApplyResults $ApplyResults -CycleOutputDirectory $OutputDirectory -RebootTargets $RebootTargets')
+
+        $quietPlanRecords = @([pscustomobject]@{ vmName = 'VM01'; action = 'NoSelectedUpdates'; reason = 'No selected updates apply.' })
+        $quietApplyResults = @([pscustomobject]@{ vmName = 'VM01'; action = 'NoSelectedUpdates'; outcome = 'Skipped'; installResult = $null; reason = 'No selected updates apply.'; rebootRequired = $false; errors = @() })
+
+        $emptyRebootThrew = $false
+        try { & $finalReportProbe $quietPlanRecords $quietApplyResults $finalReportDirectory @() 6>$null | Out-Null }
+        catch { $emptyRebootThrew = $true; Add-Failure -Message ('Write-FinalReport threw on an empty reboot target list: {0}' -f $_.Exception.Message) }
+        Assert-Equal -Actual $emptyRebootThrew -Expected $false -Message 'a fleet with no reboot targets still produces a final report'
+
+        $emptySummaryText = Get-Content -LiteralPath (Join-Path $finalReportDirectory 'summary.md') -Raw
+        Assert-Contains -Text $emptySummaryText -Needle '- VMs requiring reboot: 0' -Message 'an empty reboot target list is counted as zero, not skipped'
+
+        # $null means "work it out from the apply results" and must survive the same way.
+        $nullRebootThrew = $false
+        try { & $finalReportProbe $quietPlanRecords $quietApplyResults $finalReportDirectory $null 6>$null | Out-Null }
+        catch { $nullRebootThrew = $true; Add-Failure -Message ('Write-FinalReport threw when deriving reboot targets: {0}' -f $_.Exception.Message) }
+        Assert-Equal -Actual $nullRebootThrew -Expected $false -Message 'deriving reboot targets from apply results survives an empty result'
+
+        # A populated list must still be counted and listed.
+        & $finalReportProbe $quietPlanRecords $quietApplyResults $finalReportDirectory @([pscustomobject]@{ vmName = 'VM01'; rebootRequired = $true; rebootReason = 'Reported after apply' }) 6>$null | Out-Null
+        $populatedSummaryText = Get-Content -LiteralPath (Join-Path $finalReportDirectory 'summary.md') -Raw
+        Assert-Contains -Text $populatedSummaryText -Needle '- VMs requiring reboot: 1' -Message 'a populated reboot target list is still counted'
+        Assert-Contains -Text $populatedSummaryText -Needle 'VM01 (Reported after apply)' -Message 'a populated reboot target list is still listed with its reason'
+    }
+    finally {
+        Remove-Item -LiteralPath $finalReportDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $selectionResultDefinition = @($orchestratorFunctions | Where-Object { $_.Name -eq 'New-UpdateSelectionResult' })
 if ($selectionResultDefinition.Count -eq 0) {
     Add-Failure -Message 'Orchestrator function not found: New-UpdateSelectionResult'
