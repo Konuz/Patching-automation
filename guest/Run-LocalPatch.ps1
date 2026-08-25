@@ -237,14 +237,26 @@ function Test-PendingReboot {
     $sessionManagerPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
     try {
         $sessionManager = Get-ItemProperty -LiteralPath $sessionManagerPath -Name PendingFileRenameOperations -ErrorAction Stop
-        $checks.pendingFileRename = ($null -ne $sessionManager.PendingFileRenameOperations)
+        # Presence of the value is not a pending rename. The rename format pads every source
+        # path with an empty destination entry, and Windows leaves the value behind as a blank
+        # multi-string once it has processed the queue, so a server that has nothing to rename
+        # still carries the property. Treating that as pending made a run that installed
+        # nothing but a Defender definition update report a reboot as required. Only a
+        # non-blank entry counts.
+        $renameEntries = @($sessionManager.PendingFileRenameOperations)
+        $checks.pendingFileRename = (@($renameEntries | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count -gt 0)
     }
     catch {
         $checks.pendingFileRename = $false
     }
 
+    # Name the checks that fired. isPending alone cannot tell an operator why a VM that took a
+    # single definition update is being offered a reboot, and status.json is the only record.
+    $pendingReasons = @($checks.Keys | Where-Object { [bool]$checks[$_] })
+
     return [ordered]@{
-        isPending = ($checks.componentBasedServicing -or $checks.windowsUpdate -or $checks.pendingFileRename)
+        isPending = ($pendingReasons.Count -gt 0)
+        pendingReasons = $pendingReasons
         checks = $checks
     }
 }
