@@ -288,13 +288,24 @@ Assert-Contains -Text ([string]$timeoutResults[0].Error) -Needle 'timed out' -Me
 Assert-Equal -Actual $timeoutCompleted -Expected $true -Message 'a timeout still tries to download the guest artifacts'
 Assert-Equal -Actual $timeoutResults[0].Payload.Harvested -Expected $true -Message 'a timed out item carries the harvested payload alongside its error'
 
-# Harvesting must not be able to hide the timeout.
-$timeoutThrowResults = @(Invoke-InProcessAgentFleet -Items @($fleetItems[0]) -MaxInFlight 1 -PollSeconds 1 -ItemTimeoutSeconds 0 `
-    -StartScript { param($Item) return [pscustomobject]@{ VMName = $Item.VMName } } `
-    -PollScript { param($Handle) return $false } `
-    -CompleteScript { param($Handle) throw 'status.json was not downloaded' } `
-    -SleepScript { param([int]$Seconds) })
+# Harvesting must not be able to hide the timeout. The failed harvest is expected to warn, so the
+# warning stream is redirected into the output and asserted here: an expected warning printed during
+# a passing run reads like a real problem, and silencing it outright would drop the proof that a
+# timed out VM still explains why its artifacts are missing.
+$timeoutThrowStream = @(& {
+    Invoke-InProcessAgentFleet -Items @($fleetItems[0]) -MaxInFlight 1 -PollSeconds 1 -ItemTimeoutSeconds 0 `
+        -StartScript { param($Item) return [pscustomobject]@{ VMName = $Item.VMName } } `
+        -PollScript { param($Handle) return $false } `
+        -CompleteScript { param($Handle) throw 'status.json was not downloaded' } `
+        -SleepScript { param([int]$Seconds) }
+} 3>&1)
+$harvestWarnings = @($timeoutThrowStream | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })
+$timeoutThrowResults = @($timeoutThrowStream | Where-Object { $_ -isnot [System.Management.Automation.WarningRecord] })
 
+Assert-Equal -Actual $harvestWarnings.Count -Expected 1 -Message 'a failed harvest warns exactly once'
+Assert-Contains -Text ([string]$harvestWarnings[0]) -Needle 'VM01' -Message 'the harvest warning names the VM it could not collect'
+Assert-Contains -Text ([string]$harvestWarnings[0]) -Needle 'status.json was not downloaded' -Message 'the harvest warning carries the underlying error'
+Assert-Equal -Actual $timeoutThrowResults.Count -Expected 1 -Message 'a failed harvest still yields exactly one result'
 Assert-Contains -Text ([string]$timeoutThrowResults[0].Error) -Needle 'timed out' -Message 'a failed harvest still reports the original timeout'
 Assert-Equal -Actual $timeoutThrowResults[0].Payload -Expected $null -Message 'a failed harvest leaves no payload'
 
