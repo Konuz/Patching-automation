@@ -41,6 +41,10 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+if ($SearchOnly -and -not [string]::IsNullOrWhiteSpace($PatchPlanPath)) {
+    throw 'SearchOnly cannot be combined with PatchPlanPath. Use PlanOnly to inspect a saved plan.'
+}
+
 function Resolve-RequiredFile {
     param(
         [string]$Root,

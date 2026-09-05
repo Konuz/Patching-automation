@@ -338,6 +338,10 @@ function Test-IsApplyResultError {
         return $true
     }
 
+    if (@(Get-ObjectPropertyValue -InputObject $ApplyResult -Path @('errors') -DefaultValue @()).Count -gt 0) {
+        return $true
+    }
+
     if ($ApplyResult.action -eq 'Install' -and $ApplyResult.outcome -ne 'InstallSucceeded') {
         return $true
     }
@@ -425,10 +429,15 @@ function Select-RebootRequiredApplyResults {
     )
 
     $pendingBeforeByVmName = @{}
+    $excludedByVmName = @{}
     foreach ($record in @($DiscoveryRecords)) {
         $vmName = [string](Get-RuntimePropertyValue -InputObject $record -Name 'vmName')
         if ([string]::IsNullOrWhiteSpace($vmName)) {
             continue
+        }
+
+        if ([bool](Get-ObjectPropertyValue -InputObject $record -Path @('roleFlags', 'failoverCluster') -DefaultValue $false)) {
+            $excludedByVmName[$vmName] = $true
         }
 
         $pendingRebootBefore = Get-RuntimePropertyValue -InputObject $record -Name 'pendingRebootBefore'
@@ -442,6 +451,11 @@ function Select-RebootRequiredApplyResults {
     foreach ($result in @($ApplyResults)) {
         $vmName = [string](Get-RuntimePropertyValue -InputObject $result -Name 'vmName')
         if ([string]::IsNullOrWhiteSpace($vmName)) {
+            continue
+        }
+
+        # Saved plans have no discovery records; skipped apply results retain roleFlags.
+        if ($excludedByVmName.ContainsKey($vmName) -or [bool](Get-ObjectPropertyValue -InputObject $result -Path @('roleFlags', 'failoverCluster') -DefaultValue $false)) {
             continue
         }
 

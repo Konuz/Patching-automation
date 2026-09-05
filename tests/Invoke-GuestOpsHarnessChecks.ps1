@@ -87,6 +87,9 @@ function New-FakeGuest {
         MkdirProcessIds = @{}
         ListProcessCallCount = 0
         StartProgramCallCount = 0
+        RunId = ''
+        AgentSpec = $null
+        UploadedPaths = @()
     }
 }
 
@@ -104,6 +107,13 @@ function New-FakeManagers {
         # cmd.exe is the mkdir call; it always finishes at once so the cycle can get past setup.
         if ([string]$Spec.ProgramPath -like '*cmd.exe') {
             $this.State.MkdirProcessIds[[string]$this.State.NextProcessId] = $true
+        }
+        else {
+            $this.State.AgentSpec = $Spec
+            $runIdMatch = [regex]::Match([string]$Spec.Arguments, '-RunId "([^"]+)"')
+            if ($runIdMatch.Success) {
+                $this.State.RunId = $runIdMatch.Groups[1].Value
+            }
         }
         return [long]$this.State.NextProcessId
     }
@@ -133,8 +143,10 @@ function New-FakeManagers {
     }
 
     $fileManager = New-Object psobject
+    $fileManager | Add-Member -MemberType NoteProperty -Name State -Value $state
     $fileManager | Add-Member -MemberType ScriptMethod -Name InitiateFileTransferToGuest -Value {
         param($MoRef, $Auth, $GuestPath, $Attributes, $FileSize, $Overwrite)
+        $this.State.UploadedPaths += [string]$GuestPath
         return 'https://*/guestFile?id=1&token=upload'
     }
     $fileManager | Add-Member -MemberType ScriptMethod -Name InitiateFileTransferFromGuest -Value {
@@ -198,6 +210,13 @@ function Invoke-Curl {
         $ownerName = Split-Path -Leaf (Split-Path -Parent $localPath)
         $state = $script:guestState[$ownerName]
         $content = if ($null -eq $state) { '{}' } else { [string]$state.StatusJson }
+        if ($null -ne $state -and (Split-Path -Leaf $localPath) -eq 'status.json') {
+            $payload = $content | ConvertFrom-Json
+            if ($null -eq $payload.PSObject.Properties['runId']) {
+                $payload | Add-Member -MemberType NoteProperty -Name runId -Value $state.RunId
+            }
+            $content = $payload | ConvertTo-Json -Depth 12
+        }
         Set-Content -LiteralPath $localPath -Value $content -Encoding UTF8
     }
 }
@@ -365,6 +384,41 @@ try {
     Assert-Equal -Actual $results.Count -Expected 3 -Message 'harness: a failing guest still produces a result row'
     Assert-Contains -Text ([string]@($results | Where-Object { $_.VMName -eq 'VM31' })[0].Error) -Needle 'More than one VM matched' -Message 'harness: the guest error is carried through'
     Assert-Equal -Actual (@($results | Where-Object { $_.VMName -ne 'VM31' -and $_.Error }).Count) -Expected 0 -Message 'harness: one unresolvable guest does not poison the rest of the fleet'
+}
+finally {
+    Remove-Item -LiteralPath $workspace -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Two cycles on the same guest must not share scripts, selection or status paths.
+$workspace = New-HarnessWorkspace
+try {
+    New-FakeGuest -VMName 'VM40'
+    $item = New-HarnessItem -Sequence 1 -VMName 'VM40'
+    $selectionPath = Join-Path $workspace 'selection.json'
+    '{"schemaVersion":"selection-v1","selectedUpdateKeys":["11111111-1111-1111-1111-111111111111|1"]}' | Set-Content -LiteralPath $selectionPath
+    $cycleParams = @{
+        VMName = 'VM40'; Managers = (New-FakeManagers -VMName 'VM40'); GuestAuth = (New-GuestAuthentication -Credential $item.Credential)
+        CurlPath = 'curl.exe'; AgentPath = $agentPath; IdentityHelperPath = $identityHelperPath
+        GuestWorkingDirectory = $guestWorkingDirectory; VMOutputDirectory = (Join-Path $workspace 'VM40'); MaxUpdates = 1
+        LocalSelectionPath = $selectionPath; SelectionPath = (Join-Path $guestWorkingDirectory 'selection.json')
+    }
+    $first = Start-VMAgentCycle @cycleParams
+    $second = Start-VMAgentCycle @cycleParams
+    Assert-Equal ($first.GuestStatusPath -ne $second.GuestStatusPath) $true 'harness: consecutive cycles have distinct artifact paths'
+    Assert-Equal ($first.RunId -ne $second.RunId) $true 'harness: consecutive cycles have distinct identities'
+    Assert-Equal $script:guestState['VM40'].RunId $second.RunId 'harness: current identity reaches the guest process arguments'
+    $cycleDirectory = Split-Path -Parent $second.GuestStatusPath
+    Assert-Equal $script:guestState['VM40'].AgentSpec.WorkingDirectory $cycleDirectory 'harness: agent runs in its cycle directory'
+    Assert-Contains $script:guestState['VM40'].AgentSpec.Arguments ('-SelectionPath "{0}"' -f (Join-Path $cycleDirectory 'selection.json')) 'harness: agent reads selection from its cycle directory'
+    Assert-Equal (@($script:guestState['VM40'].UploadedPaths | Where-Object { $_ -eq (Join-Path $cycleDirectory 'selection.json') }).Count) 1 'harness: selection is uploaded to the path the current agent reads'
+    $payload = Complete-VMAgentCycle -Handle $second -AgentResult $null
+    Assert-Equal $payload.Status.runId $second.RunId 'harness: the current cycle artifact is accepted even without a process result'
+
+    $script:guestState['VM40'].StatusJson = '{"runId":"old-cycle","outcome":"InstallSucceeded","finishedAt":"2020-01-01T00:00:00Z"}'
+    $rejected = $false
+    try { $null = Complete-VMAgentCycle -Handle $second -AgentResult $null }
+    catch { $rejected = ($_.Exception.Message -like '*runId*') }
+    Assert-Equal $rejected $true 'harness: transferred stale success cannot become the current cycle result'
 }
 finally {
     Remove-Item -LiteralPath $workspace -Recurse -Force -ErrorAction SilentlyContinue

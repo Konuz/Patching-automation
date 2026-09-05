@@ -1495,5 +1495,8 @@ if ($failures.Count -gt 0) {
     exit 1
 }
 
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Invoke-RegressionChecks.ps1')
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 Write-Host 'Runtime checks passed.'
 exit 0

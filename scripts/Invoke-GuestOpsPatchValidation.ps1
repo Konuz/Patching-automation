@@ -644,6 +644,7 @@ function Invoke-ApplyPhase {
                     outcome = 'Skipped'
                     installResult = $null
                     reason = $record.reason
+                    roleFlags = Get-ObjectPropertyValue -InputObject $record -Path @('roleFlags')
                     rebootRequired = $false
                     errors = @()
                 }
@@ -1159,6 +1160,10 @@ function Invoke-DiscoveryPhase {
     return @($records)
 }
 
+if ($SearchOnly -and -not [string]::IsNullOrWhiteSpace($PatchPlanPath)) {
+    throw 'SearchOnly cannot be combined with PatchPlanPath. Use PlanOnly to inspect a saved plan.'
+}
+
 $targetVMNames = @(Resolve-VMTargetNames -SingleVMName $VMName -ManyVMNames $VMNames -ListPath $VMListPath)
 $resolvedVIServers = @(Split-VIServerInput -InputText $VIServer)
 $hasExplicitSelectedUpdateKeys = $PSBoundParameters.ContainsKey('SelectedUpdateKeys')
@@ -1430,6 +1435,11 @@ try {
             $sawApplyFailure = $true
             break
         }
+
+        # VMs with no selected updates do not enter the next discovery. Record the
+        # approved operator choice now so their pre-selection Pending state cannot linger.
+        $completionStates = @(Get-VMPatchCompletionStates -DiscoveryRecords $discoveryRecords -UpdateGroups $updateGroups -DeselectedUpdateKeys $deselectedUpdateKeys)
+        Merge-PatchRunStates -StateMap $finalStateMap -CompletionStates $completionStates
 
         $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -DiscoveryRecords $discoveryRecords
         if ($applyOutcome.ExitCode -ne 0) {

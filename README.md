@@ -221,6 +221,8 @@ Krok po kroku:
 | `-IgnoreVCenterCertificate` | Zignoruj błąd certyfikatu vCenter. |
 | `-KeepConnected` | Nie rozłączaj się z vCenter po zakończeniu. |
 
+`-SearchOnly` nie można łączyć z `-PatchPlanPath`. Do sprawdzenia zapisanego planu bez instalacji służy `-PlanOnly -PatchPlanPath <plik>`.
+
 Pełna lista parametrów znajduje się w nagłówku `Start-PatchingGuestOps.ps1`.
 
 ---
@@ -259,8 +261,8 @@ Zawartość katalogu przebiegu:
 `status.json` i `agent.log` to podstawowe źródło do diagnostyki, jeśli coś pójdzie nie tak na
 konkretnej maszynie.
 
-> Na samym gościu narzędzie używa tylko katalogu roboczego `C:\ProgramData\PatchingGuestOps`
-> (tam agent zapisuje `status.json` i `agent.log`). Te pliki są automatycznie ściągane na
+> Na samym gościu każdy cykl używa osobnego podkatalogu `C:\ProgramData\PatchingGuestOps\<runId>`
+> (tam agent zapisuje `status.json` i `agent.log`). Identyfikator w wyniku musi pasować do bieżącego cyklu; stary wynik jest odrzucany. Te pliki są automatycznie ściągane na
 > maszynę sterującą do `out\<znacznik-czasu>\NNN-<vm>\`, więc raporty zbierasz w jednym
 > miejscu — lokalnie.
 
@@ -323,6 +325,7 @@ tests\
   Invoke-StaticChecks.ps1             # Bramka statyczna (AST + tekst)
   Invoke-ModelChecks.ps1              # Bramka modelu (zachowanie offline)
   Invoke-RuntimeChecks.ps1            # Bramka runtime (helpery, throttling, resolver)
+  Invoke-RegressionChecks.ps1         # Regresje instalacji, restartów i stanów; wywoływane przez RuntimeChecks
   Invoke-GuestOpsHarnessChecks.ps1    # Bramka harness (cykl agenta w symulowanym vSphere)
 out\                                  # Artefakty przebiegów (generowane; w .gitignore)
 CLAUDE.md                             # Instrukcje dla asystenta / kontekst projektu

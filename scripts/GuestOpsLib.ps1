@@ -422,6 +422,7 @@ function New-GuestAgentArguments {
         [int]$MaxUpdates,
         [string[]]$SelectedUpdateKeys = @(),
         [string]$SelectionPath,
+        [string]$RunId,
         [switch]$SearchOnly
     )
 
@@ -439,6 +440,11 @@ function New-GuestAgentArguments {
 
     if ($SearchOnly) {
         $arguments += '-SearchOnly'
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($RunId)) {
+        $arguments += '-RunId'
+        $arguments += ('"{0}"' -f $RunId)
     }
 
     if (-not [string]::IsNullOrWhiteSpace($SelectionPath)) {
@@ -487,12 +493,13 @@ function Start-GuestAgent {
         [int]$MaxUpdates,
         [string[]]$SelectedUpdateKeys = @(),
         [string]$SelectionPath,
+        [string]$RunId,
         [switch]$SearchOnly
     )
 
     $programSpec = New-Object VMware.Vim.GuestProgramSpec
     $programSpec.ProgramPath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
-    $programSpec.Arguments = New-GuestAgentArguments -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -SearchOnly:$SearchOnly
+    $programSpec.Arguments = New-GuestAgentArguments -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -RunId $RunId -SearchOnly:$SearchOnly
     $programSpec.WorkingDirectory = $GuestWorkingDirectory
 
     return $ProcessManager.StartProgramInGuest($VMView.MoRef, $GuestAuth, $programSpec)
@@ -525,6 +532,7 @@ function Get-ObjectPropertyValue {
 function New-VMAgentCycleHandle {
     param(
         [string]$VMName,
+        [string]$RunId,
         $Managers,
         $VMView,
         $GuestAuth,
@@ -540,6 +548,7 @@ function New-VMAgentCycleHandle {
 
     return [pscustomobject]@{
         VMName = $VMName
+        RunId = $RunId
         Managers = $Managers
         VMView = $VMView
         GuestAuth = $GuestAuth
@@ -586,6 +595,12 @@ function Start-VMAgentCycle {
 
     New-Item -ItemType Directory -Force -Path $VMOutputDirectory | Out-Null
 
+    $runId = [guid]::NewGuid().ToString('N')
+    $GuestWorkingDirectory = Join-Path $GuestWorkingDirectory $runId
+    if (-not [string]::IsNullOrWhiteSpace($LocalSelectionPath)) {
+        $SelectionPath = Join-Path $GuestWorkingDirectory 'selection.json'
+    }
+
     $guestAgentPath = Join-Path $GuestWorkingDirectory 'Run-LocalPatch.ps1'
     $guestStatusPath = Join-Path $GuestWorkingDirectory 'status.json'
     $guestLogPath = Join-Path $GuestWorkingDirectory 'agent.log'
@@ -609,9 +624,9 @@ function Start-VMAgentCycle {
         Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $LocalSelectionPath -GuestPath $SelectionPath -TimeoutSeconds $TransferTimeoutSeconds
     }
 
-    $agentProcessId = Start-GuestAgent -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -GuestAgentPath $guestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -SearchOnly:$SearchOnly
+    $agentProcessId = Start-GuestAgent -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -GuestAgentPath $guestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -RunId $runId -SearchOnly:$SearchOnly
 
-    return New-VMAgentCycleHandle -VMName $VMName -Managers $Managers -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -ProcessId $agentProcessId -GuestStatusPath $guestStatusPath -GuestLogPath $guestLogPath -LocalStatusPath $localStatusPath -LocalLogPath $localLogPath -TransferTimeoutSeconds $TransferTimeoutSeconds
+    return New-VMAgentCycleHandle -VMName $VMName -RunId $runId -Managers $Managers -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -ProcessId $agentProcessId -GuestStatusPath $guestStatusPath -GuestLogPath $guestLogPath -LocalStatusPath $localStatusPath -LocalLogPath $localLogPath -TransferTimeoutSeconds $TransferTimeoutSeconds
 }
 
 function Test-VMAgentCycleComplete {
@@ -669,9 +684,15 @@ function Complete-VMAgentCycle {
         throw ('status.json was not downloaded. Output directory: {0}' -f (Split-Path -Parent $Handle.LocalStatusPath))
     }
 
+    $status = Get-Content -LiteralPath $Handle.LocalStatusPath -Raw | ConvertFrom-Json
+    $statusRunId = [string](Get-ObjectPropertyValue -InputObject $status -Path @('runId'))
+    if ([string]::IsNullOrWhiteSpace([string]$Handle.RunId) -or $statusRunId -cne [string]$Handle.RunId) {
+        throw 'status.json runId does not match the current agent run.'
+    }
+
     return [pscustomobject]@{
         AgentResult = $AgentResult
-        Status = Get-Content -LiteralPath $Handle.LocalStatusPath -Raw | ConvertFrom-Json
+        Status = $status
     }
 }
 

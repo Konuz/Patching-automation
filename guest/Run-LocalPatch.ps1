@@ -4,6 +4,7 @@ param(
     [int]$MaxUpdates = 1,
     [string[]]$SelectedUpdateKeys = @(),
     [string]$SelectionPath,
+    [string]$RunId,
     [switch]$SearchOnly,
     [string]$SearchCriteria = "IsInstalled=0 and IsHidden=0 and Type='Software'"
 )
@@ -389,6 +390,7 @@ function Save-Status {
 
 $status = [ordered]@{
     schemaVersion = 'phase0b-1'
+    runId = $RunId
     computerName = $env:COMPUTERNAME
     startedAt = (Get-Date).ToString('o')
     finishedAt = $null
@@ -610,6 +612,12 @@ try {
                 if ([int]$installResult.ResultCode -eq 2) {
                     $status.outcome = 'InstallSucceeded'
                     $scriptExitCode = 0
+                    # WUA reports on the collection it received, which excludes updates
+                    # whose EULA/selection failed. Those failures still belong to this run.
+                    if (@($status.errors).Count -gt 0 -or @($status.updates | Where-Object { @($_.errors).Count -gt 0 }).Count -gt 0) {
+                        $status.outcome = 'InstallSucceededWithErrors'
+                        $scriptExitCode = 1
+                    }
                 }
                 elseif ([int]$installResult.ResultCode -eq 3) {
                     $status.outcome = 'InstallSucceededWithErrors'
