@@ -440,6 +440,10 @@ try {
         throw 'The agent process is not elevated. WUA install validation requires an elevated local admin token.'
     }
 
+    if (-not $SearchOnly -and $status.roleFlags.failoverCluster) {
+        throw 'Failover Cluster detected. Automatic installation is blocked; update manually one by one.'
+    }
+
     Write-AgentLog -Message 'Creating Microsoft.Update.Session.'
     $updateSession = New-Object -ComObject Microsoft.Update.Session
     $updateSession.ClientApplicationID = 'PatchingGuestOpsPhase0b'
@@ -454,6 +458,22 @@ try {
         resultCode = [int]$searchResult.ResultCode
         result = Convert-ResultCode -ResultCode $searchResult.ResultCode
         hResult = Format-HResult -HResult (Get-OptionalPropertyValue -InputObject $searchResult -Name 'HResult')
+        warnings = @()
+    }
+
+    $searchWarnings = Get-OptionalPropertyValue -InputObject $searchResult -Name 'Warnings'
+    if ($null -ne $searchWarnings) {
+        for ($i = 0; $i -lt $searchWarnings.Count; $i++) {
+            $searchWarning = $searchWarnings.Item($i)
+            $status.searchResult.warnings += [ordered]@{
+                message = Get-OptionalStringPropertyValue -InputObject $searchWarning -Name 'Message'
+                hResult = Format-HResult -HResult (Get-OptionalPropertyValue -InputObject $searchWarning -Name 'HResult')
+                context = Get-OptionalPropertyValue -InputObject $searchWarning -Name 'Context'
+            }
+        }
+    }
+    if ([int]$searchResult.ResultCode -ne 2) {
+        throw ('WUA search did not complete successfully (ResultCode={0}). Results may be incomplete; download and installation are blocked.' -f [int]$searchResult.ResultCode)
     }
 
     if ($searchResult.Updates.Count -eq 0) {

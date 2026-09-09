@@ -24,7 +24,7 @@ function Get-VMLookupCandidates {
         return @($Name)
     }
 
-    return @($shortName, $Name)
+    return @($Name, $shortName)
 }
 
 function Get-ExactVM {
@@ -37,6 +37,14 @@ function Get-ExactVM {
         }
 
         if ($exactMatches.Count -eq 1) {
+            # Inventory short names do not identify a domain. Only use that fallback
+            # when VMware Tools confirms the FQDN requested by the operator.
+            if ($candidate -ne $Name) {
+                $guestHostName = [string](Get-ObjectPropertyValue -InputObject $exactMatches[0] -Path @('ExtensionData', 'Guest', 'HostName'))
+                if ([string]::IsNullOrWhiteSpace($guestHostName) -or $guestHostName.Trim().TrimEnd('.') -ine $Name.Trim().TrimEnd('.')) {
+                    throw ('VM {0} does not have a confirmed guest FQDN matching {1}. VMware Tools reported: {2}' -f $candidate, $Name, $guestHostName)
+                }
+            }
             return $exactMatches[0]
         }
     }

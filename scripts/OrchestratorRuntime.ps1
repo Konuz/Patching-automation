@@ -298,6 +298,7 @@ function New-ApplyResultFromCycle {
                 outcome = 'Failed'
                 installResult = $installResult
                 reason = $reason
+                roleFlags = Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')
                 rebootRequired = $rebootRequired
                 errors = @($errors)
             }
@@ -315,6 +316,7 @@ function New-ApplyResultFromCycle {
             outcome = 'Failed'
             installResult = $installResult
             reason = $reason
+            roleFlags = Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')
             rebootRequired = $rebootRequired
             errors = @($errors)
         }
@@ -326,6 +328,7 @@ function New-ApplyResultFromCycle {
         outcome = $outcome
         installResult = $installResult
         reason = ''
+        roleFlags = Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')
         rebootRequired = $rebootRequired
         errors = @($errors)
     }

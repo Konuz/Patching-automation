@@ -1084,9 +1084,9 @@ Assert-Equal -Actual $script:fallbackPrompts.Count -Expected 2 -Message 'blank f
 Assert-Equal -Actual $script:fallbackPrompts[0] -Expected 'VM name(s), separated by ";"' -Message 'fallback prompt asks for semicolon separated names'
 
 # --- VM lookup candidates (scripts/GuestOpsLib.ps1) ---
-Assert-Equal -Actual ((Get-VMLookupCandidates -Name 'vm1.contoso.com') -join '|') -Expected 'vm1|vm1.contoso.com' -Message 'FQDN yields short name then full fallback'
+Assert-Equal -Actual ((Get-VMLookupCandidates -Name 'vm1.contoso.com') -join '|') -Expected 'vm1.contoso.com|vm1' -Message 'FQDN yields full name before short fallback'
 Assert-Equal -Actual ((Get-VMLookupCandidates -Name 'oldbox') -join '|') -Expected 'oldbox' -Message 'bare hostname yields a single candidate'
-Assert-Equal -Actual ((Get-VMLookupCandidates -Name 'host.sub.contoso.com') -join '|') -Expected 'host|host.sub.contoso.com' -Message 'multi-level FQDN splits at the first dot only'
+Assert-Equal -Actual ((Get-VMLookupCandidates -Name 'host.sub.contoso.com') -join '|') -Expected 'host.sub.contoso.com|host' -Message 'multi-level FQDN splits at the first dot only'
 
 # --- Guest credential grouping (scripts/VMTargetLib.ps1) ---
 $credGroups = @(Get-GuestCredentialGroups -TargetNames @('vm2.contoso.com', 'vm1.contoso.com', 'app.fabrikam.local', 'oldbox'))
@@ -1496,6 +1496,9 @@ if ($failures.Count -gt 0) {
 }
 
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Invoke-RegressionChecks.ps1')
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Invoke-SafetyRegressionChecks.ps1')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host 'Runtime checks passed.'
