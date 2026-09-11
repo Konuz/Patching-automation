@@ -112,6 +112,48 @@ finally {
 
 . (Join-Path $repoRoot 'scripts\OrchestratorRuntime.ps1')
 
+# --- agent completion contract ---------------------------------------------------
+
+$unfinished = [pscustomobject]@{ runId = 'cycle-a'; outcome = 'Started'; finishedAt = $null }
+Assert-Equal -Actual (Test-AgentCycleCompletion -Status $unfinished -RunId 'cycle-a' -Mode Apply) -Expected $false -Message 'Started is not completion'
+$failed = [pscustomobject]@{ runId = 'cycle-a'; outcome = 'InstallFailed'; finishedAt = '2026-09-11T10:00:00Z' }
+Assert-Equal -Actual (Test-AgentCycleCompletion -Status $failed -RunId 'cycle-a' -Mode Apply) -Expected $true -Message 'Failure can be terminal'
+Assert-Equal -Actual (Test-AgentCycleCompletion -Status $failed -RunId 'cycle-b' -Mode Apply) -Expected $false -Message 'Another run is not evidence'
+
+$completionCases = @(
+    [pscustomobject]@{ Name = 'missing runId'; Status = [pscustomobject]@{ outcome = 'InstallSucceeded'; finishedAt = '2026-09-11T10:00:00Z' }; RunId = 'cycle-a'; Mode = 'Apply'; Expected = $false },
+    [pscustomobject]@{ Name = 'invalid finishedAt'; Status = [pscustomobject]@{ runId = 'cycle-a'; outcome = 'InstallSucceeded'; finishedAt = 'not-a-date' }; RunId = 'cycle-a'; Mode = 'Apply'; Expected = $false },
+    [pscustomobject]@{ Name = 'empty finishedAt'; Status = [pscustomobject]@{ runId = 'cycle-a'; outcome = 'InstallSucceeded'; finishedAt = '' }; RunId = 'cycle-a'; Mode = 'Apply'; Expected = $false },
+    [pscustomobject]@{ Name = 'SearchOnly on apply'; Status = [pscustomobject]@{ runId = 'cycle-a'; outcome = 'SearchOnly'; finishedAt = '2026-09-11T10:00:00Z' }; RunId = 'cycle-a'; Mode = 'Apply'; Expected = $false },
+    [pscustomobject]@{ Name = 'InstallFailed on apply'; Status = $failed; RunId = 'cycle-a'; Mode = 'Apply'; Expected = $true },
+    [pscustomobject]@{ Name = 'Failed on apply'; Status = [pscustomobject]@{ runId = 'cycle-a'; outcome = 'Failed'; finishedAt = '2026-09-11T10:00:00Z' }; RunId = 'cycle-a'; Mode = 'Apply'; Expected = $true },
+    [pscustomobject]@{ Name = 'SearchOnly on discovery'; Status = [pscustomobject]@{ runId = 'cycle-a'; outcome = 'SearchOnly'; finishedAt = '2026-09-11T10:00:00Z' }; RunId = 'cycle-a'; Mode = 'SearchOnly'; Expected = $true },
+    [pscustomobject]@{ Name = 'NoApplicableUpdates on discovery'; Status = [pscustomobject]@{ runId = 'cycle-a'; outcome = 'NoApplicableUpdates'; finishedAt = '2026-09-11T10:00:00Z' }; RunId = 'cycle-a'; Mode = 'SearchOnly'; Expected = $true },
+    [pscustomobject]@{ Name = 'Failed on discovery'; Status = [pscustomobject]@{ runId = 'cycle-a'; outcome = 'Failed'; finishedAt = '2026-09-11T10:00:00Z' }; RunId = 'cycle-a'; Mode = 'SearchOnly'; Expected = $true },
+    [pscustomobject]@{ Name = 'InstallSucceeded on discovery'; Status = [pscustomobject]@{ runId = 'cycle-a'; outcome = 'InstallSucceeded'; finishedAt = '2026-09-11T10:00:00Z' }; RunId = 'cycle-a'; Mode = 'SearchOnly'; Expected = $false }
+)
+foreach ($completionCase in $completionCases) {
+    Assert-Equal -Actual (Test-AgentCycleCompletion -Status $completionCase.Status -RunId $completionCase.RunId -Mode $completionCase.Mode) -Expected $completionCase.Expected -Message ('completion matrix: ' + $completionCase.Name)
+}
+
+$invalidModeRejected = $false
+try {
+    New-VMAgentCycleHandle -VMName 'VM-invalid-mode' -RunId 'cycle-invalid' -Managers $null -VMView $null -GuestAuth $null -HostName '' -CurlPath '' -ProcessId 1 -GuestStatusPath 'status.json' -GuestLogPath 'agent.log' -LocalStatusPath 'status.json' -LocalLogPath 'agent.log' -Mode 'InvalidMode' | Out-Null
+}
+catch {
+    $invalidModeRejected = $true
+}
+Assert-Equal -Actual $invalidModeRejected -Expected $true -Message 'cycle handle rejects modes outside SearchOnly and Apply'
+
+$lowercaseModeRejected = $false
+try {
+    New-VMAgentCycleHandle -VMName 'VM-lowercase-mode' -RunId 'cycle-lowercase' -Managers $null -VMView $null -GuestAuth $null -HostName '' -CurlPath '' -ProcessId 1 -GuestStatusPath 'status.json' -GuestLogPath 'agent.log' -LocalStatusPath 'status.json' -LocalLogPath 'agent.log' -Mode 'apply' | Out-Null
+}
+catch {
+    $lowercaseModeRejected = $true
+}
+Assert-Equal -Actual $lowercaseModeRejected -Expected $true -Message 'cycle handle preserves canonical mode casing'
+
 $items = @(
     [pscustomobject]@{ Sequence = 1; VMName = 'VM01' },
     [pscustomobject]@{ Sequence = 2; VMName = 'VM02' },
@@ -156,6 +198,7 @@ Assert-Equal -Actual (Get-ApplySummaryStatus -ApplyResult ([pscustomobject]@{ ac
 # come back with no process result at all. status.json is the primary apply result, and
 # discovery already treats it that way; apply must not call that a total failure.
 $lateStatus = [pscustomobject]@{
+    runId = 'cycle-late'
     outcome = 'InstallSucceeded'
     finishedAt = '2026-08-22T10:00:00.0000000Z'
     installResult = [pscustomobject]@{ result = 'Succeeded'; rebootRequired = $true }
@@ -163,11 +206,21 @@ $lateStatus = [pscustomobject]@{
     errors = @()
 }
 
-$lateResult = New-ApplyResultFromCycle -VMName 'VM01' -Cycle ([pscustomobject]@{ AgentResult = $null; Status = $lateStatus }) 3>$null
+$lateCycle = [pscustomobject]@{
+    RunId = 'cycle-late'
+    Mode = 'Apply'
+    AgentCompletionConfirmed = $true
+    AgentCompletionReason = 'synthetic terminal status'
+    AgentResult = $null
+    Status = $lateStatus
+}
+$lateResult = New-ApplyResultFromCycle -VMName 'VM01' -Cycle $lateCycle 3>$null
 Assert-Equal -Actual $lateResult.outcome -Expected 'InstallSucceeded' -Message 'a terminal status.json outweighs a missing GuestOps process result'
 Assert-Equal -Actual $lateResult.rebootRequired -Expected $true -Message 'reboot requirement survives a lost process result'
+Assert-Equal -Actual $lateResult.agentCompletionConfirmed -Expected $true -Message 'apply result carries terminal completion confirmation'
+Assert-Equal -Actual $lateResult.agentCompletionReason -Expected 'synthetic terminal status' -Message 'apply result carries terminal completion reason'
 
-$notCompletedResult = New-ApplyResultFromCycle -VMName 'VM01' -Cycle ([pscustomobject]@{ AgentResult = [pscustomobject]@{ Completed = $false; ExitCode = $null; EndTime = $null }; Status = $lateStatus }) 3>$null
+$notCompletedResult = New-ApplyResultFromCycle -VMName 'VM01' -Cycle ([pscustomobject]@{ RunId = 'cycle-late'; Mode = 'Apply'; AgentCompletionConfirmed = $true; AgentCompletionReason = 'synthetic terminal status'; AgentResult = [pscustomobject]@{ Completed = $false; ExitCode = $null; EndTime = $null }; Status = $lateStatus }) 3>$null
 Assert-Equal -Actual $notCompletedResult.outcome -Expected 'InstallSucceeded' -Message 'an explicit not-completed result is treated the same as a missing one'
 
 $trulyIncompleteCycle = [pscustomobject]@{
@@ -197,16 +250,32 @@ Assert-Equal -Actual (New-ApplyResultFromCycle -VMName 'VM03' -Cycle $noFinished
 
 # A real non-zero exit code still fails, and a partial install still survives it.
 $exitCodeCycle = [pscustomobject]@{
+    RunId = 'cycle-exit'
+    Mode = 'Apply'
+    AgentCompletionConfirmed = $true
+    AgentCompletionReason = 'synthetic terminal status'
     AgentResult = [pscustomobject]@{ Completed = $true; ExitCode = 1; EndTime = (Get-Date) }
-    Status = [pscustomobject]@{ outcome = 'InstallFailed'; finishedAt = '2026-08-22T10:00:00.0000000Z'; installResult = $null; pendingRebootAfter = $null; errors = @() }
+    Status = [pscustomobject]@{ runId = 'cycle-exit'; outcome = 'InstallFailed'; finishedAt = '2026-08-22T10:00:00.0000000Z'; installResult = $null; pendingRebootAfter = $null; errors = @() }
 }
 Assert-Contains -Text ([string](New-ApplyResultFromCycle -VMName 'VM04' -Cycle $exitCodeCycle).reason) -Needle 'exited with code' -Message 'a non-zero exit code with a failed outcome is still a failure'
 
 $partialCycle = [pscustomobject]@{
+    RunId = 'cycle-partial'
+    Mode = 'Apply'
+    AgentCompletionConfirmed = $true
+    AgentCompletionReason = 'synthetic terminal status'
     AgentResult = [pscustomobject]@{ Completed = $true; ExitCode = 3; EndTime = (Get-Date) }
-    Status = [pscustomobject]@{ outcome = 'InstallSucceededWithErrors'; finishedAt = '2026-08-22T10:00:00.0000000Z'; installResult = $null; pendingRebootAfter = $null; errors = @() }
+    Status = [pscustomobject]@{ runId = 'cycle-partial'; outcome = 'InstallSucceededWithErrors'; finishedAt = '2026-08-22T10:00:00.0000000Z'; installResult = $null; pendingRebootAfter = $null; errors = @() }
 }
 Assert-Equal -Actual (New-ApplyResultFromCycle -VMName 'VM05' -Cycle $partialCycle).outcome -Expected 'InstallSucceededWithErrors' -Message 'a partial install keeps its outcome despite the non-zero exit'
+
+$exitCodeOnlyCycle = [pscustomobject]@{
+    AgentResult = [pscustomobject]@{ Completed = $true; ExitCode = 0; EndTime = (Get-Date) }
+    Status = [pscustomobject]@{ runId = 'cycle-exit-only'; outcome = 'InstallSucceeded'; finishedAt = '2026-08-22T10:00:00.0000000Z'; installResult = $null; pendingRebootAfter = $null; errors = @() }
+}
+$exitCodeOnlyResult = New-ApplyResultFromCycle -VMName 'VM07' -Cycle $exitCodeOnlyCycle
+Assert-Equal -Actual $exitCodeOnlyResult.agentCompletionConfirmed -Expected $false -Message 'ExitCode 0 alone does not confirm agent completion'
+Assert-Equal -Actual $exitCodeOnlyResult.outcome -Expected 'Failed' -Message 'ExitCode 0 without completion evidence is an apply failure'
 
 $throttleGuardThrew = $false
 try { Invoke-ThrottledJobs -Items @() -ThrottleLimit 0 -JobTimeoutSeconds 30 -ScriptBlock { param($i) $i } | Out-Null }
@@ -304,14 +373,28 @@ catch { $fleetInFlightGuardThrew = $true }
 Assert-Equal -Actual $fleetInFlightGuardThrew -Expected $true -Message 'Invoke-InProcessAgentFleet throws on MaxInFlight below 1'
 
 $mixedApplyResults = @(
-    [pscustomobject]@{ vmName = 'VM01'; action = 'Install'; outcome = 'InstallSucceeded'; rebootRequired = $true },
-    [pscustomobject]@{ vmName = 'VM02'; action = 'Install'; outcome = 'InstallSucceeded'; rebootRequired = $false },
-    [pscustomobject]@{ vmName = 'VM03'; action = 'Skip'; outcome = 'Skipped'; rebootRequired = $false }
+    [pscustomobject]@{ vmName = 'VM01'; action = 'Install'; outcome = 'InstallSucceeded'; rebootRequired = $true; agentCompletionConfirmed = $true; agentCompletionReason = 'synthetic terminal status' },
+    [pscustomobject]@{ vmName = 'VM02'; action = 'Install'; outcome = 'InstallSucceeded'; rebootRequired = $false; agentCompletionConfirmed = $true; agentCompletionReason = 'synthetic terminal status' },
+    [pscustomobject]@{ vmName = 'VM03'; action = 'Skip'; outcome = 'Skipped'; rebootRequired = $false; agentCompletionConfirmed = $false; agentCompletionReason = '' }
 )
 
 $rebootTargets = @(Select-RebootRequiredApplyResults -ApplyResults $mixedApplyResults)
 Assert-Equal -Actual $rebootTargets.Count -Expected 1 -Message 'only rebootRequired apply results become reboot targets'
 Assert-Equal -Actual $rebootTargets[0].vmName -Expected 'VM01' -Message 'reboot target preserves VM name'
+
+$confirmedFailedReboot = [pscustomobject]@{ vmName = 'VM05'; action = 'Install'; outcome = 'InstallFailed'; rebootRequired = $true; agentCompletionConfirmed = $true; agentCompletionReason = 'terminal failure' }
+$confirmedFailedTargets = @(Select-RebootRequiredApplyResults -ApplyResults @($confirmedFailedReboot))
+Assert-Equal -Actual $confirmedFailedTargets.Count -Expected 1 -Message 'a confirmed failed install may still be rebooted when it requests one'
+
+$confirmedGenericFailureReboot = [pscustomobject]@{ vmName = 'VM05b'; action = 'Install'; outcome = 'Failed'; rebootRequired = $true; agentCompletionConfirmed = $true; agentCompletionReason = 'terminal failure' }
+Assert-Equal -Actual (@(Select-RebootRequiredApplyResults -ApplyResults @($confirmedGenericFailureReboot)).Count) -Expected 1 -Message 'a confirmed Failed outcome may still be rebooted when it requests one'
+Assert-Equal -Actual (Test-ApplyResultsSuccessful -ApplyResults @($confirmedGenericFailureReboot)) -Expected $false -Message 'a confirmed Failed outcome never reports apply success'
+
+$unconfirmedReboot = [pscustomobject]@{ vmName = 'VM06'; action = 'Install'; outcome = 'Failed'; rebootRequired = $true; agentCompletionConfirmed = $false; agentCompletionReason = 'agent completion not confirmed' }
+Assert-Equal -Actual (@(Select-RebootRequiredApplyResults -ApplyResults @($unconfirmedReboot)).Count) -Expected 0 -Message 'an unconfirmed apply result cannot become a reboot target'
+
+$missingConfirmationReboot = [pscustomobject]@{ vmName = 'VM07'; action = 'Install'; outcome = 'InstallSucceeded'; rebootRequired = $true }
+Assert-Equal -Actual (@(Select-RebootRequiredApplyResults -ApplyResults @($missingConfirmationReboot)).Count) -Expected 0 -Message 'a missing completion field cannot become a reboot target'
 
 $pendingBeforeDiscovery = @(
     [pscustomobject]@{ vmName = 'VM01'; pendingRebootBefore = [pscustomobject]@{ isPending = $true } },

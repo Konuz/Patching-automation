@@ -279,9 +279,9 @@ $script:guestState = @{}
 $script:curlCalls = @()
 $workspace = New-HarnessWorkspace
 try {
-    New-FakeGuest -VMName 'VM01' -PollsBeforeFinish 2
-    New-FakeGuest -VMName 'VM02' -PollsBeforeFinish 1
-    New-FakeGuest -VMName 'VM03' -PollsBeforeFinish 3
+    New-FakeGuest -VMName 'VM01' -PollsBeforeFinish 2 -StatusJson '{"outcome":"SearchOnly","finishedAt":"2026-08-22T10:00:00.0000000Z"}'
+    New-FakeGuest -VMName 'VM02' -PollsBeforeFinish 1 -StatusJson '{"outcome":"SearchOnly","finishedAt":"2026-08-22T10:00:00.0000000Z"}'
+    New-FakeGuest -VMName 'VM03' -PollsBeforeFinish 3 -StatusJson '{"outcome":"SearchOnly","finishedAt":"2026-08-22T10:00:00.0000000Z"}'
 
     $scripts = New-HarnessFleetScripts -Workspace $workspace
     $items = @(
@@ -294,8 +294,11 @@ try {
 
     Assert-Equal -Actual $results.Count -Expected 3 -Message 'harness: fleet returns one result per guest'
     Assert-Equal -Actual (@($results | Where-Object { $_.Error }).Count) -Expected 0 -Message 'harness: a healthy fleet reports no errors'
-    Assert-Equal -Actual ([string]@($results | Where-Object { $_.VMName -eq 'VM01' })[0].Payload.Status.outcome) -Expected 'InstallSucceeded' -Message 'harness: status.json is downloaded and parsed'
+    Assert-Equal -Actual ([string]@($results | Where-Object { $_.VMName -eq 'VM01' })[0].Payload.Status.outcome) -Expected 'SearchOnly' -Message 'harness: status.json is downloaded and parsed'
     Assert-Equal -Actual ([bool]@($results | Where-Object { $_.VMName -eq 'VM01' })[0].Payload.AgentResult.Completed) -Expected $true -Message 'harness: a finished guest reports a completed process result'
+    Assert-Equal -Actual ([string]@($results | Where-Object { $_.VMName -eq 'VM01' })[0].Payload.Mode) -Expected 'SearchOnly' -Message 'harness: search-only cycles carry their mode'
+    Assert-Equal -Actual ([bool]@($results | Where-Object { $_.VMName -eq 'VM01' })[0].Payload.AgentCompletionConfirmed) -Expected $true -Message 'harness: terminal search status confirms completion'
+    Assert-Equal -Actual ([string]::IsNullOrWhiteSpace([string]@($results | Where-Object { $_.VMName -eq 'VM01' })[0].Payload.AgentCompletionReason)) -Expected $false -Message 'harness: completion confirmation carries a reason'
     Assert-Equal -Actual (Test-Path -LiteralPath (Join-Path (Join-Path $workspace 'VM01') 'status.json')) -Expected $true -Message 'harness: status.json lands in the per-VM output directory'
 
     # Every VM must have been started before the first guest was polled for its agent.
@@ -336,6 +339,7 @@ try {
     $applyResult = New-ApplyResultFromCycle -VMName 'VM10' -Cycle $results[0].Payload 3>$null
     Assert-Equal -Actual $applyResult.outcome -Expected 'InstallSucceeded' -Message 'harness: a harvested terminal status.json outweighs the lost process result'
     Assert-Equal -Actual $applyResult.rebootRequired -Expected $true -Message 'harness: reboot requirement survives the lost process result'
+    Assert-Equal -Actual $applyResult.agentCompletionConfirmed -Expected $true -Message 'harness: apply result retains terminal completion confirmation'
 }
 finally {
     Remove-Item -LiteralPath $workspace -Recurse -Force -ErrorAction SilentlyContinue
@@ -358,6 +362,8 @@ try {
     Assert-Equal -Actual ([string]$results[0].Error) -Expected '' -Message 'harness: a vanished process is not an error, it is a finished run with no exit code'
     Assert-Equal -Actual ([bool]$results[0].Payload.AgentResult.Completed) -Expected $false -Message 'harness: a vanished process reports an unknown completion'
     Assert-Equal -Actual ([string]$results[0].Payload.Status.outcome) -Expected 'InstallSucceeded' -Message 'harness: the artifacts still decide the outcome'
+    Assert-Equal -Actual ([string]$results[0].Payload.Mode) -Expected 'Apply' -Message 'harness: apply cycles carry their mode'
+    Assert-Equal -Actual ([bool]$results[0].Payload.AgentCompletionConfirmed) -Expected $true -Message 'harness: terminal apply status confirms completion despite a vanished process'
 }
 finally {
     Remove-Item -LiteralPath $workspace -Recurse -Force -ErrorAction SilentlyContinue
@@ -413,6 +419,8 @@ try {
     Assert-Equal (@($script:guestState['VM40'].UploadedPaths | Where-Object { $_ -eq (Join-Path $cycleDirectory 'selection.json') }).Count) 1 'harness: selection is uploaded to the path the current agent reads'
     $payload = Complete-VMAgentCycle -Handle $second -AgentResult $null
     Assert-Equal $payload.Status.runId $second.RunId 'harness: the current cycle artifact is accepted even without a process result'
+    Assert-Equal $second.Mode 'Apply' 'harness: a non-search cycle carries apply mode'
+    Assert-Equal $payload.AgentCompletionConfirmed $true 'harness: apply status confirms completion'
 
     $script:guestState['VM40'].StatusJson = '{"runId":"old-cycle","outcome":"InstallSucceeded","finishedAt":"2020-01-01T00:00:00Z"}'
     $rejected = $false

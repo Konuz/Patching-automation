@@ -537,6 +537,42 @@ function Get-ObjectPropertyValue {
     return $current
 }
 
+function Test-AgentCycleCompletion {
+    param(
+        $Status,
+        [string]$RunId,
+        [string]$Mode
+    )
+
+    $statusRunId = [string](Get-ObjectPropertyValue -InputObject $Status -Path @('runId'))
+    if ([string]::IsNullOrWhiteSpace($RunId) -or [string]::IsNullOrWhiteSpace($statusRunId) -or -not [string]::Equals($statusRunId, $RunId, [System.StringComparison]::Ordinal)) {
+        return $false
+    }
+
+    $finishedAt = [string](Get-ObjectPropertyValue -InputObject $Status -Path @('finishedAt'))
+    if ([string]::IsNullOrWhiteSpace($finishedAt)) {
+        return $false
+    }
+
+    try {
+        $null = [datetime]::Parse($finishedAt, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
+    }
+    catch {
+        return $false
+    }
+
+    $outcome = [string](Get-ObjectPropertyValue -InputObject $Status -Path @('outcome'))
+    if ([string]::Equals($Mode, 'Apply', [System.StringComparison]::Ordinal)) {
+        return ($outcome -in @('InstallSucceeded', 'InstallSucceededWithErrors', 'InstallFailed', 'DownloadFailed', 'NoSelectedUpdates', 'NoApplicableUpdates', 'Failed'))
+    }
+
+    if ([string]::Equals($Mode, 'SearchOnly', [System.StringComparison]::Ordinal)) {
+        return ($outcome -in @('SearchOnly', 'NoApplicableUpdates', 'Failed'))
+    }
+
+    return $false
+}
+
 function New-VMAgentCycleHandle {
     param(
         [string]$VMName,
@@ -551,12 +587,15 @@ function New-VMAgentCycleHandle {
         [string]$GuestLogPath,
         [string]$LocalStatusPath,
         [string]$LocalLogPath,
-        [int]$TransferTimeoutSeconds = 300
+        [int]$TransferTimeoutSeconds = 300,
+        [ValidateSet('SearchOnly', 'Apply', IgnoreCase = $false)]
+        [string]$Mode = 'Apply'
     )
 
     return [pscustomobject]@{
         VMName = $VMName
         RunId = $RunId
+        Mode = $Mode
         Managers = $Managers
         VMView = $VMView
         GuestAuth = $GuestAuth
@@ -634,7 +673,8 @@ function Start-VMAgentCycle {
 
     $agentProcessId = Start-GuestAgent -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -GuestAgentPath $guestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -RunId $runId -SearchOnly:$SearchOnly
 
-    return New-VMAgentCycleHandle -VMName $VMName -RunId $runId -Managers $Managers -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -ProcessId $agentProcessId -GuestStatusPath $guestStatusPath -GuestLogPath $guestLogPath -LocalStatusPath $localStatusPath -LocalLogPath $localLogPath -TransferTimeoutSeconds $TransferTimeoutSeconds
+    $mode = if ($SearchOnly) { 'SearchOnly' } else { 'Apply' }
+    return New-VMAgentCycleHandle -VMName $VMName -RunId $runId -Mode $mode -Managers $Managers -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -ProcessId $agentProcessId -GuestStatusPath $guestStatusPath -GuestLogPath $guestLogPath -LocalStatusPath $localStatusPath -LocalLogPath $localLogPath -TransferTimeoutSeconds $TransferTimeoutSeconds
 }
 
 function Test-VMAgentCycleComplete {
@@ -698,7 +738,20 @@ function Complete-VMAgentCycle {
         throw 'status.json runId does not match the current agent run.'
     }
 
+    $mode = [string](Get-ObjectPropertyValue -InputObject $Handle -Path @('Mode') -DefaultValue 'Apply')
+    $agentCompletionConfirmed = Test-AgentCycleCompletion -Status $status -RunId ([string]$Handle.RunId) -Mode $mode
+    $agentCompletionReason = if ($agentCompletionConfirmed) {
+        'Agent status confirms terminal completion for the current run.'
+    }
+    else {
+        'Agent status does not confirm terminal completion for the current run.'
+    }
+
     return [pscustomobject]@{
+        RunId = $Handle.RunId
+        Mode = $mode
+        AgentCompletionConfirmed = [bool]$agentCompletionConfirmed
+        AgentCompletionReason = $agentCompletionReason
         AgentResult = $AgentResult
         Status = $status
     }

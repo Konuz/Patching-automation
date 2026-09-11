@@ -154,6 +154,83 @@ Assert-Equal $clusterScan.ExitCode 0 'cluster search-only remains available for 
 Assert-Equal $clusterScan.State 'Excluded' 'cluster discovery still drives the planning exclusion'
 Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs'
 
+# F2: a lost process result plus an unfinished status must not qualify the VM for reboot.
+# These doubles stay in this test so the regression has no dependency on ignored out/ files.
+& {
+    $cycleDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-f2-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $cycleDirectory | Out-Null
+    $localStatusPath = Join-Path $cycleDirectory 'status.json'
+    $localLogPath = Join-Path $cycleDirectory 'agent.log'
+    $processManager = New-Object psobject
+    $processManager | Add-Member -MemberType ScriptMethod -Name ListProcessesInGuest -Value {
+        param($MoRef, $Auth, $ProcessIds)
+        return @()
+    }
+    $handle = New-VMAgentCycleHandle -VMName 'fixture-vm' -RunId 'fixture-run' -Managers ([pscustomobject]@{ ProcessManager = $processManager; FileManager = $null }) -VMView ([pscustomobject]@{ MoRef = 'fake' }) -GuestAuth $null -HostName 'unused' -CurlPath 'unused' -ProcessId 123 -GuestStatusPath 'status.json' -GuestLogPath 'agent.log' -LocalStatusPath $localStatusPath -LocalLogPath $localLogPath
+
+    function Receive-GuestFile {
+        param($FileManager, $VMView, $GuestAuth, $HostName, $CurlPath, $GuestPath, $LocalPath, $TimeoutSeconds)
+        if ($GuestPath -eq 'status.json') {
+            '{"runId":"fixture-run","outcome":"Started","finishedAt":null,"errors":[]}' | Set-Content -LiteralPath $LocalPath -Encoding UTF8
+        }
+        else {
+            'synthetic agent log' | Set-Content -LiteralPath $LocalPath -Encoding UTF8
+        }
+    }
+
+    try {
+        $processResult = Test-VMAgentCycleComplete -Handle $handle
+        $cycle = Complete-VMAgentCycle -Handle $handle -AgentResult $processResult
+        $applyResult = New-ApplyResultFromCycle -VMName 'fixture-vm' -Cycle $cycle
+        $discovery = @([pscustomobject]@{ vmName = 'fixture-vm'; outcome = 'SearchOnly'; pendingRebootBefore = [pscustomobject]@{ isPending = $true } })
+        $targets = @(Select-RebootRequiredApplyResults -ApplyResults @($applyResult) -DiscoveryRecords $discovery)
+        Assert-Equal ($null -ne $processResult -and -not $processResult.Completed) $true 'F2: an empty process list ends polling with an unknown process result'
+        Assert-Equal $applyResult.outcome 'Failed' 'F2: Started status becomes an apply failure'
+        Assert-Equal $targets.Count 0 'F2: an unfinished apply is not a reboot target even with pending reboot before apply'
+
+        function Invoke-GuestAgentFleet { $script:failedFleet }
+        function Write-PatchingSummary { param($ApplyResults) }
+        function Write-FinalReport { param($PatchPlanRecords, $ApplyResults, $CycleOutputDirectory, $RebootTargets) }
+        function Confirm-GuestReboot { param($RebootTargets) $true }
+        function Write-RebootActionArtifacts { param($CycleOutputDirectory, $RebootActions) }
+        $script:rebootDispatchCount = 0
+        function Invoke-GuestRebootPhase {
+            param(
+                $RebootTargets,
+                $GuestCredentialMap,
+                [string[]]$VIServers,
+                $VIServerCredentialMap,
+                [switch]$IgnoreVCenterCertificate,
+                [string]$GuestOpsLibPath,
+                [string]$CurlPath,
+                [string]$GuestWorkingDirectory,
+                [int]$RebootTimeoutSeconds,
+                [int]$PollSeconds,
+                [int]$RebootBatchSize
+            )
+            $script:rebootDispatchCount += @($RebootTargets).Count
+            return @()
+        }
+        $script:failedFleet = @([pscustomobject]@{ Sequence = 1; VMName = 'fixture-vm'; Payload = $null; Error = 'simulated poll error' })
+        $plan = @([pscustomobject]@{ vmName = 'fixture-vm'; action = 'Install'; selectedUpdates = @([pscustomobject]@{ identityKey = '11111111-1111-1111-1111-111111111111|1' }) })
+        $phaseDirectory = Join-Path $cycleDirectory 'apply'
+        New-Item -ItemType Directory -Force -Path $phaseDirectory | Out-Null
+        $phaseResult = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $plan -Managers $null -GuestCredentialMap @{} -VIServers @() -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\unused' -TimeoutSeconds 1 -RebootTimeoutSeconds 1 -PollSeconds 1 -CycleOutputDirectory $phaseDirectory -ThrottleLimit 1 -RebootBatchSize 1 -DiscoveryRecords $discovery
+        Assert-Equal $script:rebootDispatchCount 0 'F2: a poll error never dispatches a reboot after operator approval'
+        Assert-Equal $phaseResult.ExitCode 1 'F2: the poll error remains an unsuccessful apply run'
+    }
+    finally {
+        Remove-Item Function:\Receive-GuestFile -ErrorAction SilentlyContinue
+        Remove-Item Function:\Invoke-GuestAgentFleet -ErrorAction SilentlyContinue
+        Remove-Item Function:\Write-PatchingSummary -ErrorAction SilentlyContinue
+        Remove-Item Function:\Write-FinalReport -ErrorAction SilentlyContinue
+        Remove-Item Function:\Confirm-GuestReboot -ErrorAction SilentlyContinue
+        Remove-Item Function:\Write-RebootActionArtifacts -ErrorAction SilentlyContinue
+        Remove-Item Function:\Invoke-GuestRebootPhase -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $cycleDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 if ($failures.Count -gt 0) {
     foreach ($failure in $failures) { Write-Host ('FAIL: ' + $failure) }
     exit 1

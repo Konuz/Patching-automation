@@ -278,6 +278,28 @@ function New-ApplyResultFromCycle {
     $rebootFromInstall = [bool](Get-ObjectPropertyValue -InputObject $status -Path @('installResult', 'rebootRequired') -DefaultValue $false)
     $rebootRequired = ($pendingAfter -or $rebootFromInstall)
     $errors = @(Get-ObjectPropertyValue -InputObject $status -Path @('errors') -DefaultValue @())
+    $agentCompletionConfirmed = [bool](Get-RuntimePropertyValue -InputObject $Cycle -Name 'AgentCompletionConfirmed' -DefaultValue $false)
+    $agentCompletionReason = [string](Get-RuntimePropertyValue -InputObject $Cycle -Name 'AgentCompletionReason' -DefaultValue '')
+
+    if (-not $agentCompletionConfirmed) {
+        $reason = 'Agent completion was not confirmed; apply guest process did not complete.'
+        if (-not [string]::IsNullOrWhiteSpace($agentCompletionReason)) {
+            $reason = '{0} {1}' -f $reason, $agentCompletionReason
+        }
+        $errors += $reason
+        return [pscustomobject]@{
+            vmName = $VMName
+            action = 'Install'
+            outcome = 'Failed'
+            installResult = $installResult
+            reason = $reason
+            roleFlags = Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')
+            rebootRequired = $rebootRequired
+            agentCompletionConfirmed = $false
+            agentCompletionReason = $agentCompletionReason
+            errors = @($errors)
+        }
+    }
 
     if ($null -eq $agentResult -or -not $agentResult.Completed) {
         # vSphere keeps finished process info only briefly, and the fleet starts its guests
@@ -300,6 +322,8 @@ function New-ApplyResultFromCycle {
                 reason = $reason
                 roleFlags = Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')
                 rebootRequired = $rebootRequired
+                agentCompletionConfirmed = $agentCompletionConfirmed
+                agentCompletionReason = $agentCompletionReason
                 errors = @($errors)
             }
         }
@@ -318,6 +342,8 @@ function New-ApplyResultFromCycle {
             reason = $reason
             roleFlags = Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')
             rebootRequired = $rebootRequired
+            agentCompletionConfirmed = $agentCompletionConfirmed
+            agentCompletionReason = $agentCompletionReason
             errors = @($errors)
         }
     }
@@ -330,6 +356,8 @@ function New-ApplyResultFromCycle {
         reason = ''
         roleFlags = Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')
         rebootRequired = $rebootRequired
+        agentCompletionConfirmed = $agentCompletionConfirmed
+        agentCompletionReason = $agentCompletionReason
         errors = @($errors)
     }
 }
@@ -459,6 +487,11 @@ function Select-RebootRequiredApplyResults {
 
         # Saved plans have no discovery records; skipped apply results retain roleFlags.
         if ($excludedByVmName.ContainsKey($vmName) -or [bool](Get-ObjectPropertyValue -InputObject $result -Path @('roleFlags', 'failoverCluster') -DefaultValue $false)) {
+            continue
+        }
+
+        if ((Get-RuntimePropertyValue -InputObject $result -Name 'action') -eq 'Install' -and
+            -not [bool](Get-RuntimePropertyValue -InputObject $result -Name 'agentCompletionConfirmed' -DefaultValue $false)) {
             continue
         }
 

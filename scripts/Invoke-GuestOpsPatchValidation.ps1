@@ -646,6 +646,8 @@ function Invoke-ApplyPhase {
                     reason = $record.reason
                     roleFlags = Get-ObjectPropertyValue -InputObject $record -Path @('roleFlags')
                     rebootRequired = $false
+                    agentCompletionConfirmed = $false
+                    agentCompletionReason = ''
                     errors = @()
                 }
             }
@@ -671,6 +673,8 @@ function Invoke-ApplyPhase {
                     installResult = $null
                     reason = $reason
                     rebootRequired = $false
+                    agentCompletionConfirmed = $false
+                    agentCompletionReason = 'No agent cycle was started.'
                     errors = @($reason)
                 }
             }
@@ -708,6 +712,8 @@ function Invoke-ApplyPhase {
                         installResult = $null
                         reason = $fleetResult.Error
                         rebootRequired = $false
+                        agentCompletionConfirmed = $false
+                        agentCompletionReason = 'Agent cycle did not return a completion record.'
                         errors = @($fleetResult.Error)
                     }
                 }
@@ -1446,6 +1452,36 @@ try {
             $sawApplyFailure = $true
         }
 
+        # A missing terminal agent record is a failed VM, not a reason to let it disappear
+        # from the final state when the next round is selected from apply results.
+        $applyResults = @(Get-RuntimePropertyValue -InputObject $applyOutcome -Name 'ApplyResults' -DefaultValue @())
+        foreach ($applyResult in $applyResults) {
+            if ((Get-RuntimePropertyValue -InputObject $applyResult -Name 'action') -ne 'Install' -or
+                [bool](Get-RuntimePropertyValue -InputObject $applyResult -Name 'agentCompletionConfirmed' -DefaultValue $false)) {
+                continue
+            }
+
+            $failedVmName = [string](Get-RuntimePropertyValue -InputObject $applyResult -Name 'vmName')
+            if ([string]::IsNullOrWhiteSpace($failedVmName)) {
+                continue
+            }
+
+            $completionReason = [string](Get-RuntimePropertyValue -InputObject $applyResult -Name 'agentCompletionReason' -DefaultValue '')
+            $failureReason = 'Agent completion was not confirmed before reboot or the next patch round.'
+            if (-not [string]::IsNullOrWhiteSpace($completionReason)) {
+                $failureReason = '{0} {1}' -f $failureReason, $completionReason
+            }
+            $finalStateMap[$failedVmName] = [pscustomobject]@{
+                vmName = $failedVmName
+                state = 'Failed'
+                reason = $failureReason
+                outcome = Get-RuntimePropertyValue -InputObject $applyResult -Name 'outcome'
+                pendingSelectableCount = 0
+                deselectedSelectableCount = 0
+                errors = @(Get-RuntimePropertyValue -InputObject $applyResult -Name 'errors' -DefaultValue @())
+            }
+        }
+
         # A machine that was told to restart and has not provably come back must not be
         # re-discovered: the read would either fail or describe a half-booted guest.
         if ($applyOutcome.RebootRan -and -not (Test-RebootActionsAllConfirmed -RebootActions $applyOutcome.RebootActions)) {
@@ -1453,7 +1489,10 @@ try {
             break
         }
 
-        $nextTargets = @(@($patchPlanRecords) | Where-Object { $_.action -eq 'Install' } | ForEach-Object { [string]$_.vmName })
+        $nextTargets = @($applyResults | Where-Object {
+                (Get-RuntimePropertyValue -InputObject $_ -Name 'action') -eq 'Install' -and
+                [bool](Get-RuntimePropertyValue -InputObject $_ -Name 'agentCompletionConfirmed' -DefaultValue $false)
+            } | ForEach-Object { [string](Get-RuntimePropertyValue -InputObject $_ -Name 'vmName') })
         if ($nextTargets.Count -eq 0) {
             Write-Step -Message 'No VM was patched in this round; nothing left to verify.'
             break
