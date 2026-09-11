@@ -225,6 +225,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
     $localLogPath = Join-Path $cycleDirectory 'agent.log'
     $script:f2StatusJson = '{"runId":"fixture-run","outcome":"Started","finishedAt":null,"errors":[]}'
     $script:f2StatusReads = 0
+    $script:f2ThrowWrappedMissing = $false
     $processManager = New-Object psobject
     $processManager | Add-Member -MemberType ScriptMethod -Name ListProcessesInGuest -Value {
         param($MoRef, $Auth, $ProcessIds)
@@ -236,6 +237,11 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         param($FileManager, $VMView, $GuestAuth, $HostName, $CurlPath, $GuestPath, $LocalPath, $TimeoutSeconds)
         if ($GuestPath -eq 'status.json') {
             $script:f2StatusReads++
+            if ($script:f2ThrowWrappedMissing) {
+                $fileNotFound = New-Object System.IO.FileNotFoundException -ArgumentList 'status.json is not ready'
+                $runtimeWrapper = New-Object System.Management.Automation.RuntimeException -ArgumentList @('runtime wrapper', $fileNotFound)
+                throw (New-Object System.Management.Automation.MethodInvocationException -ArgumentList @('method wrapper', $runtimeWrapper))
+            }
             if ($null -ne $script:f2StatusJson) {
                 $script:f2StatusJson | Set-Content -LiteralPath $LocalPath -Encoding UTF8
             }
@@ -254,6 +260,25 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         Assert-Equal ($null -eq $processResult) $true 'F2: an empty process list with Started status keeps polling'
         Assert-Equal $applyResult.outcome 'Failed' 'F2: Started status becomes an apply failure'
         Assert-Equal $targets.Count 0 'F2: an unfinished apply is not a reboot target even with pending reboot before apply'
+
+        $wrappedMissingDirectory = Join-Path $cycleDirectory 'wrapped-missing'
+        New-Item -ItemType Directory -Force -Path $wrappedMissingDirectory | Out-Null
+        $wrappedProcessManager = New-Object psobject
+        $wrappedProcessManager | Add-Member -MemberType ScriptMethod -Name ListProcessesInGuest -Value {
+            param($MoRef, $Auth, $ProcessIds)
+            return @()
+        }
+        $wrappedHandle = New-VMAgentCycleHandle -VMName 'fixture-vm' -RunId 'fixture-run' -Managers ([pscustomobject]@{ ProcessManager = $wrappedProcessManager; FileManager = $null }) -VMView ([pscustomobject]@{ MoRef = 'fake' }) -GuestAuth $null -HostName 'unused' -CurlPath 'unused' -ProcessId 123 -GuestStatusPath 'status.json' -GuestLogPath 'agent.log' -LocalStatusPath (Join-Path $wrappedMissingDirectory 'status.json') -LocalLogPath (Join-Path $wrappedMissingDirectory 'agent.log')
+        $script:f2StatusReads = 0
+        $script:f2ThrowWrappedMissing = $true
+        $wrappedMissingResult = $null
+        $wrappedMissingThrew = $false
+        try { $wrappedMissingResult = Test-VMAgentCycleComplete -Handle $wrappedHandle } catch { $wrappedMissingThrew = $true }
+        Assert-Equal $wrappedMissingThrew $false 'F2: wrapped missing status is treated as an in-progress cycle'
+        Assert-Equal ($null -eq $wrappedMissingResult) $true 'F2: wrapped missing status returns no terminal process result'
+        Assert-Equal $script:f2StatusReads 1 'F2: wrapped missing status performs one status read'
+        $script:f2ThrowWrappedMissing = $false
+        Remove-Item -LiteralPath $wrappedMissingDirectory -Recurse -Force -ErrorAction SilentlyContinue
 
         $f2StatusCases = @(
             [pscustomobject]@{ Name = 'terminal'; Json = '{"runId":"fixture-run","outcome":"InstallSucceeded","finishedAt":"2026-09-11T10:00:00Z","errors":[]}'; Expected = $true },
@@ -309,13 +334,111 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
             $script:rebootDispatchCount += @($RebootTargets).Count
             return @()
         }
-        $script:failedFleet = @([pscustomobject]@{ Sequence = 1; VMName = 'fixture-vm'; Payload = $null; Error = 'simulated poll error' })
+        $script:failedFleet = @([pscustomobject]@{ Sequence = 1; VMName = 'fixture-vm'; Payload = $null; Error = 'simulated poll error'; ResultKind = 'Timeout' })
         $plan = @([pscustomobject]@{ vmName = 'fixture-vm'; action = 'Install'; selectedUpdates = @([pscustomobject]@{ identityKey = '11111111-1111-1111-1111-111111111111|1' }) })
         $phaseDirectory = Join-Path $cycleDirectory 'apply'
         New-Item -ItemType Directory -Force -Path $phaseDirectory | Out-Null
         $phaseResult = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $plan -Managers $null -GuestCredentialMap @{} -VIServers @() -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\unused' -TimeoutSeconds 1 -RebootTimeoutSeconds 1 -PollSeconds 1 -CycleOutputDirectory $phaseDirectory -ThrottleLimit 1 -RebootBatchSize 1 -DiscoveryRecords $discovery
         Assert-Equal $script:rebootDispatchCount 0 'F2: a poll error never dispatches a reboot after operator approval'
         Assert-Equal $phaseResult.ExitCode 1 'F2: the poll error remains an unsuccessful apply run'
+        Assert-Equal $phaseResult.ApplyResults[0].reason 'simulated poll error' 'F2: a timeout without payload preserves its original error'
+
+        $permanentPollCycle = [pscustomobject]@{
+            RunId = 'permanent-poll-run'
+            Mode = 'Apply'
+            AgentCompletionConfirmed = $true
+            AgentCompletionReason = 'synthetic terminal status'
+            AgentResult = [pscustomobject]@{ Completed = $true; ExitCode = 0 }
+            Status = [pscustomobject]@{
+                runId = 'permanent-poll-run'
+                outcome = 'InstallSucceeded'
+                finishedAt = '2026-09-11T10:00:00Z'
+                installResult = [pscustomobject]@{ rebootRequired = $true }
+                pendingRebootAfter = [pscustomobject]@{ isPending = $false }
+                roleFlags = [pscustomobject]@{ failoverCluster = $false }
+                errors = @()
+            }
+        }
+        $script:failedFleet = @([pscustomobject]@{
+            Sequence = 1
+            VMName = 'fixture-vm'
+            Payload = $permanentPollCycle
+            Error = 'permanent process-list failure'
+            ResultKind = 'PermanentPoll'
+        })
+        $script:rebootDispatchCount = 0
+        $permanentPhaseDirectory = Join-Path $cycleDirectory 'permanent-poll'
+        New-Item -ItemType Directory -Force -Path $permanentPhaseDirectory | Out-Null
+        $permanentPhaseResult = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $plan -Managers $null -GuestCredentialMap @{} -VIServers @() -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\unused' -TimeoutSeconds 1 -RebootTimeoutSeconds 1 -PollSeconds 1 -CycleOutputDirectory $permanentPhaseDirectory -ThrottleLimit 1 -RebootBatchSize 1 -DiscoveryRecords @()
+        $permanentApplyResult = @($permanentPhaseResult.ApplyResults)[0]
+        Assert-Equal $permanentPhaseResult.ExitCode 1 'F2: permanent poll error with a payload keeps the apply run unsuccessful'
+        Assert-Equal $permanentApplyResult.outcome 'Failed' 'F2: permanent poll error cannot inherit InstallSucceeded from the payload'
+        Assert-Equal (@($permanentApplyResult.errors).Count -gt 0) $true 'F2: permanent poll error remains in the final apply record'
+        Assert-Equal $permanentApplyResult.reason 'permanent process-list failure' 'F2: permanent poll error remains the final apply reason'
+        Assert-Equal $permanentApplyResult.rebootRequired $false 'F2: permanent poll error clears the payload reboot signal'
+        Assert-Equal $permanentApplyResult.agentCompletionConfirmed $false 'F2: permanent poll error removes completion eligibility'
+        Assert-Equal $script:rebootDispatchCount 0 'F2: permanent poll error never dispatches a reboot after operator approval'
+        Assert-Equal $permanentPhaseResult.RebootRan $false 'F2: permanent poll error does not mark the reboot phase as run'
+
+        $permanentDiscoveryCycle = [pscustomobject]@{
+            Status = [pscustomobject]@{
+                runId = 'permanent-discovery-run'
+                outcome = 'SearchOnly'
+                computerName = 'fixture-vm'
+                availableUpdateCount = 0
+                roleFlags = [pscustomobject]@{ failoverCluster = $false }
+                pendingRebootBefore = [pscustomobject]@{ isPending = $true }
+                updates = @()
+                errors = @()
+            }
+            AgentResult = [pscustomobject]@{ Completed = $true; ExitCode = 0 }
+        }
+        $script:failedFleet = @([pscustomobject]@{
+            Sequence = 1
+            VMName = 'fixture-vm'
+            Payload = $permanentDiscoveryCycle
+            Error = 'permanent discovery process-list failure'
+            ResultKind = 'PermanentPoll'
+        })
+        $permanentDiscoveryDirectory = Join-Path $cycleDirectory 'permanent-discovery'
+        New-Item -ItemType Directory -Force -Path $permanentDiscoveryDirectory | Out-Null
+        $permanentDiscoveryRecords = @(Invoke-DiscoveryPhase -TargetVMNames @('fixture-vm') -Managers $null -GuestCredentialMap @{} -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\unused' -MaxUpdates 1 -TimeoutSeconds 1 -PollSeconds 1 -CycleOutputDirectory $permanentDiscoveryDirectory -MaxInFlight 1)
+        $permanentDiscoveryRecord = @($permanentDiscoveryRecords)[0]
+        Assert-Equal $permanentDiscoveryRecord.outcome 'DiscoveryFailed' 'F2: permanent discovery poll error cannot inherit SearchOnly from the payload'
+        Assert-Equal (@($permanentDiscoveryRecord.errors).Count -gt 0) $true 'F2: permanent discovery poll error remains in the final discovery record'
+        Assert-Equal $permanentDiscoveryRecord.errors[0] 'permanent discovery process-list failure' 'F2: permanent discovery poll error remains the final discovery error'
+        Assert-Equal $permanentDiscoveryRecord.pendingRebootBefore $null 'F2: permanent discovery poll error removes the payload reboot signal'
+        $discoveryApplyResult = [pscustomobject]@{
+            vmName = 'fixture-vm'
+            action = 'Install'
+            outcome = 'InstallSucceeded'
+            rebootRequired = $true
+            agentCompletionConfirmed = $true
+            roleFlags = [pscustomobject]@{ failoverCluster = $false }
+            errors = @()
+        }
+        Assert-Equal (@(Select-RebootRequiredApplyResults -ApplyResults @($discoveryApplyResult) -DiscoveryRecords @($permanentDiscoveryRecord)).Count) 0 'F2: permanent discovery poll error never makes the VM a reboot target'
+
+        $script:failedFleet = @([pscustomobject]@{
+            Sequence = 1
+            VMName = 'fixture-vm'
+            Payload = $null
+            Error = 'simulated discovery timeout'
+            ResultKind = 'Timeout'
+        })
+        $timeoutDiscoveryDirectory = Join-Path $cycleDirectory 'timeout-discovery'
+        New-Item -ItemType Directory -Force -Path $timeoutDiscoveryDirectory | Out-Null
+        $timeoutDiscoveryRecords = $null
+        $timeoutDiscoveryThrew = $false
+        try {
+            $timeoutDiscoveryRecords = @(Invoke-DiscoveryPhase -TargetVMNames @('fixture-vm') -Managers $null -GuestCredentialMap @{} -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\unused' -MaxUpdates 1 -TimeoutSeconds 1 -PollSeconds 1 -CycleOutputDirectory $timeoutDiscoveryDirectory -MaxInFlight 1)
+        }
+        catch { $timeoutDiscoveryThrew = $true }
+        Assert-Equal $timeoutDiscoveryThrew $false 'F2: timeout discovery without payload still returns a failure record'
+        if (-not $timeoutDiscoveryThrew) {
+            $timeoutDiscoveryRecord = @($timeoutDiscoveryRecords)[0]
+            Assert-Equal $timeoutDiscoveryRecord.errors[0] 'simulated discovery timeout' 'F2: timeout discovery without payload preserves its original error'
+        }
 
         # F2: exercise the real apply adapter and round loop with two VMs. One missing
         # completion record must remain failed, while the confirmed peer may reboot and

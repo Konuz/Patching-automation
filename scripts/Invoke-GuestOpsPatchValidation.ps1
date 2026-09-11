@@ -705,6 +705,7 @@ function Invoke-ApplyPhase {
 
             $hasError = -not [string]::IsNullOrWhiteSpace([string]$fleetResult.Error)
             $payload = Get-ObjectPropertyValue -InputObject $fleetResult -Path @('Payload')
+            $resultKind = [string](Get-ObjectPropertyValue -InputObject $fleetResult -Path @('ResultKind'))
 
             if ($hasError -and $null -eq $payload) {
                 $resultEntries += [pscustomobject]@{
@@ -724,8 +725,23 @@ function Invoke-ApplyPhase {
                 continue
             }
 
+            if ($hasError -and $resultKind -ne 'Timeout') {
+                $failedResult = New-ApplyResultFromCycle -VMName $fleetResult.VMName -Cycle $payload
+                $failedResult.outcome = 'Failed'
+                $failedResult.reason = [string]$fleetResult.Error
+                $failedResult.rebootRequired = $false
+                $failedResult.agentCompletionConfirmed = $false
+                $failedResult.agentCompletionReason = 'Permanent GuestOps poll error prevented confirmed agent completion.'
+                $failedResult.errors = @($fleetResult.Error) + @($failedResult.errors)
+                $resultEntries += [pscustomobject]@{
+                    Sequence = $fleetResult.Sequence
+                    Result = $failedResult
+                }
+                continue
+            }
+
             if ($hasError) {
-                # Timed out, but the artifacts still came down. status.json decides.
+                # Only the explicitly typed timeout path may fall back to the downloaded status.json.
                 Write-Warning ('Apply process result timed out for {0}; falling back to the downloaded status.json.' -f $fleetResult.VMName)
             }
 
@@ -1118,6 +1134,7 @@ function Invoke-DiscoveryPhase {
             $vmOutputDirectory = $outputDirectoryBySequence[[int]$fleetResult.Sequence]
             $hasError = -not [string]::IsNullOrWhiteSpace([string]$fleetResult.Error)
             $payload = Get-ObjectPropertyValue -InputObject $fleetResult -Path @('Payload')
+            $resultKind = [string](Get-ObjectPropertyValue -InputObject $fleetResult -Path @('ResultKind'))
 
             if ($hasError -and $null -eq $payload) {
                 Write-Warning ('Discovery failed for {0}: {1}' -f $fleetResult.VMName, $fleetResult.Error)
@@ -1128,8 +1145,21 @@ function Invoke-DiscoveryPhase {
                 continue
             }
 
+            if ($hasError -and $resultKind -ne 'Timeout') {
+                $failedRecord = New-DiscoveryRecordFromAgentRun -VMName $fleetResult.VMName -AgentRun $payload -OutputDirectory $vmOutputDirectory
+                $failedRecord.outcome = 'DiscoveryFailed'
+                $failedRecord.pendingRebootBefore = $null
+                $failedRecord.errors = @($fleetResult.Error) + @($failedRecord.errors)
+                $recordEntries += [pscustomobject]@{
+                    Sequence = $fleetResult.Sequence
+                    Record = $failedRecord
+                }
+                continue
+            }
+
             if ($hasError) {
-                # Timed out, but the artifacts still came down. Hand them to the normal record
+                # Only the explicitly typed timeout path may fall back to the downloaded status
+                # and hand it to the normal record
                 # builder, which decides on the outcome plus finishedAt in status.json.
                 Write-Warning ('Discovery process result timed out for {0}; falling back to the downloaded status.json.' -f $fleetResult.VMName)
             }

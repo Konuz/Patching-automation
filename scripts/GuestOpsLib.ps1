@@ -786,6 +786,63 @@ function Start-VMAgentCycle {
     return New-VMAgentCycleHandle -VMName $VMName -RunId $runId -Mode $mode -Managers $Managers -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -ProcessId $agentProcessId -GuestStatusPath $guestStatusPath -GuestLogPath $guestLogPath -LocalStatusPath $localStatusPath -LocalLogPath $localLogPath -TransferTimeoutSeconds $TransferTimeoutSeconds
 }
 
+function Test-GuestOperationFileNotFound {
+    param($ErrorRecord)
+
+    $queue = New-Object System.Collections.Queue
+    $queue.Enqueue($ErrorRecord)
+    $seen = New-Object System.Collections.ArrayList
+    $fileNotFoundTypes = @('FileNotFoundException', 'GuestFileNotFound', 'FileNotFound')
+
+    while ($queue.Count -gt 0 -and $seen.Count -lt 128) {
+        $candidate = $queue.Dequeue()
+        if ($null -eq $candidate) {
+            continue
+        }
+
+        $alreadySeen = $false
+        foreach ($seenCandidate in @($seen)) {
+            if ([object]::ReferenceEquals($seenCandidate, $candidate)) {
+                $alreadySeen = $true
+                break
+            }
+        }
+        if ($alreadySeen) {
+            continue
+        }
+        $null = $seen.Add($candidate)
+
+        $typeNames = @()
+        try {
+            $typeNames += [string]$candidate.GetType().FullName
+            $typeNames += [string]$candidate.GetType().Name
+        }
+        catch { }
+        try {
+            $typeNames += @($candidate.PSTypeNames | ForEach-Object { [string]$_ })
+        }
+        catch { }
+
+        foreach ($typeName in @($typeNames)) {
+            if ([string]::IsNullOrWhiteSpace($typeName)) {
+                continue
+            }
+            if ($fileNotFoundTypes -contains (([string]$typeName -split '\.')[-1])) {
+                return $true
+            }
+        }
+
+        foreach ($propertyName in @('Exception', 'InnerException', 'Fault')) {
+            $property = $candidate.PSObject.Properties[$propertyName]
+            if ($null -ne $property -and $null -ne $property.Value -and -not [object]::ReferenceEquals($property.Value, $candidate)) {
+                $queue.Enqueue($property.Value)
+            }
+        }
+    }
+
+    return $false
+}
+
 function Read-VMAgentCycleStatus {
     param($Handle)
 
@@ -796,8 +853,7 @@ function Read-VMAgentCycleStatus {
         # A status file that has not been created yet is still an in-progress cycle. Keep
         # other GuestOps/transfer failures visible to the fleet so its classifier can decide
         # whether the poll is retryable.
-        $errorTypeName = [string]$_.Exception.GetType().Name
-        if ($errorTypeName -in @('FileNotFoundException', 'GuestFileNotFound', 'FileNotFound')) {
+        if (Test-GuestOperationFileNotFound -ErrorRecord $_) {
             return $null
         }
         throw

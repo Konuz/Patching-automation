@@ -140,7 +140,8 @@ function New-FleetErrorResult {
     param(
         $InputObject,
         [string]$ErrorMessage,
-        $Payload = $null
+        $Payload = $null,
+        [string]$ResultKind = $null
     )
 
     return [pscustomobject]@{
@@ -148,6 +149,7 @@ function New-FleetErrorResult {
         VMName = Get-RuntimePropertyValue -InputObject $InputObject -Name 'VMName'
         Payload = $Payload
         Error = $ErrorMessage
+        ResultKind = $ResultKind
     }
 }
 
@@ -211,7 +213,7 @@ function Invoke-InProcessAgentFleet {
             catch {
                 # There is no job boundary around a start, so a throwing guest would end the
                 # whole phase. Every failure has to become this VM's error instead.
-                $results += New-FleetErrorResult -InputObject $item -ErrorMessage ('Agent start failed: {0}' -f $_.Exception.Message)
+                $results += New-FleetErrorResult -InputObject $item -ErrorMessage ('Agent start failed: {0}' -f $_.Exception.Message) -ResultKind 'StartError'
             }
         }
 
@@ -226,7 +228,7 @@ function Invoke-InProcessAgentFleet {
                 # diagnostics. The timeout error stands regardless of what the harvest finds.
                 $timeoutPayload = & $collectEntry $entry
 
-                $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage ('Agent run timed out after {0} seconds.' -f $ItemTimeoutSeconds) -Payload $timeoutPayload
+                $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage ('Agent run timed out after {0} seconds.' -f $ItemTimeoutSeconds) -Payload $timeoutPayload -ResultKind 'Timeout'
                 continue
             }
 
@@ -255,7 +257,7 @@ function Invoke-InProcessAgentFleet {
                 # available evidence. The collection helper deliberately cannot replace the
                 # original poll error in the result.
                 $errorPayload = & $collectEntry $entry
-                $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage $pollError.Exception.Message -Payload $errorPayload
+                $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage $pollError.Exception.Message -Payload $errorPayload -ResultKind 'PermanentPoll'
                 continue
             }
 
@@ -269,7 +271,7 @@ function Invoke-InProcessAgentFleet {
                     }
                 }
                 catch {
-                    $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage $_.Exception.Message
+                    $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage $_.Exception.Message -ResultKind 'CompletionError'
                 }
                 continue
             }
@@ -496,10 +498,16 @@ function Select-RebootRequiredApplyResults {
 
     $pendingBeforeByVmName = @{}
     $excludedByVmName = @{}
+    $discoveryErrorByVmName = @{}
     foreach ($record in @($DiscoveryRecords)) {
         $vmName = [string](Get-RuntimePropertyValue -InputObject $record -Name 'vmName')
         if ([string]::IsNullOrWhiteSpace($vmName)) {
             continue
+        }
+
+        $recordErrors = @(Get-ObjectPropertyValue -InputObject $record -Path @('errors') -DefaultValue @() | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+        if ($recordErrors.Count -gt 0) {
+            $discoveryErrorByVmName[$vmName] = $true
         }
 
         if ([bool](Get-ObjectPropertyValue -InputObject $record -Path @('roleFlags', 'failoverCluster') -DefaultValue $false)) {
@@ -517,6 +525,10 @@ function Select-RebootRequiredApplyResults {
     foreach ($result in @($ApplyResults)) {
         $vmName = [string](Get-RuntimePropertyValue -InputObject $result -Name 'vmName')
         if ([string]::IsNullOrWhiteSpace($vmName)) {
+            continue
+        }
+
+        if ($discoveryErrorByVmName.ContainsKey($vmName)) {
             continue
         }
 

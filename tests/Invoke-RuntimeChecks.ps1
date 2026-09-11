@@ -378,6 +378,7 @@ Assert-Equal -Actual $timeoutResults.Count -Expected 1 -Message 'timed out item 
 Assert-Contains -Text ([string]$timeoutResults[0].Error) -Needle 'timed out' -Message 'timed out item reports a timeout error'
 Assert-Equal -Actual $timeoutCompleted -Expected $true -Message 'a timeout still tries to download the guest artifacts'
 Assert-Equal -Actual $timeoutResults[0].Payload.Harvested -Expected $true -Message 'a timed out item carries the harvested payload alongside its error'
+Assert-Equal -Actual $timeoutResults[0].ResultKind -Expected 'Timeout' -Message 'a timeout has a structural result kind'
 
 # Harvesting must not be able to hide the timeout.
 $timeoutThrowResults = @(Invoke-InProcessAgentFleet -Items @($fleetItems[0]) -MaxInFlight 1 -PollSeconds 1 -ItemTimeoutSeconds 0 `
@@ -388,6 +389,7 @@ $timeoutThrowResults = @(Invoke-InProcessAgentFleet -Items @($fleetItems[0]) -Ma
 
 Assert-Contains -Text ([string]$timeoutThrowResults[0].Error) -Needle 'timed out' -Message 'a failed harvest still reports the original timeout'
 Assert-Equal -Actual $timeoutThrowResults[0].Payload -Expected $null -Message 'a failed harvest leaves no payload'
+Assert-Equal -Actual $timeoutThrowResults[0].ResultKind -Expected 'Timeout' -Message 'a failed timeout keeps the timeout result kind'
 
 # TDD RED: before transient polling recovery, the first exception ended the item
 # immediately instead of retaining the same in-flight agent until the next poll.
@@ -450,6 +452,7 @@ Assert-Equal -Actual $script:permanentPollCalls -Expected 1 -Message 'Permanent 
 Assert-Equal -Actual $script:permanentCollectCalls -Expected 1 -Message 'Permanent poll error collects artifacts once'
 Assert-Contains -Text ([string]$permanentResults[0].Error) -Needle 'permanent polling failure' -Message 'Original permanent poll error is retained'
 Assert-Equal -Actual $permanentResults[0].Payload -Expected $null -Message 'Failed permanent-error collection leaves no payload'
+Assert-Equal -Actual $permanentResults[0].ResultKind -Expected 'PermanentPoll' -Message 'a permanent poll error has a structural result kind'
 
 # Repeated transient errors use the original deadline rather than resetting it on each
 # retry. The injected sleep advances the test clock without waiting in real time.
@@ -482,6 +485,7 @@ Assert-Equal -Actual $script:deadlinePollCalls -Expected 2 -Message 'Transient t
 Assert-Equal -Actual $script:deadlineCollectCalls -Expected 1 -Message 'Transient timeout collects artifacts once'
 Assert-Contains -Text ([string]$deadlineResults[0].Error) -Needle 'timed out' -Message 'Transient errors eventually report the original timeout'
 Assert-Equal -Actual $deadlineResults[0].Payload.Harvested -Expected $true -Message 'Transient timeout retains its harvested payload'
+Assert-Equal -Actual $deadlineResults[0].ResultKind -Expected 'Timeout' -Message 'deadline expiry has a structural timeout result kind'
 
 # One VM recovering must not delay or poison a peer that completes in the same fleet.
 $script:peerStartCalls = @{}
