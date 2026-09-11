@@ -172,6 +172,10 @@ function Invoke-GuestAgentFleet {
             # whatever the last poll saw - possibly still $null. Both callers treat that as
             # "no process result, trust status.json".
             return Complete-VMAgentCycle -Handle $Handle -AgentResult $Handle.AgentResult
+        } `
+        -IsTransientErrorScript {
+            param($ErrorRecord)
+            return ((Get-GuestOperationErrorKind -ErrorRecord $ErrorRecord) -eq 'Transient')
         })
 }
 

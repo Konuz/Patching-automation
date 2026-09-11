@@ -389,6 +389,138 @@ $timeoutThrowResults = @(Invoke-InProcessAgentFleet -Items @($fleetItems[0]) -Ma
 Assert-Contains -Text ([string]$timeoutThrowResults[0].Error) -Needle 'timed out' -Message 'a failed harvest still reports the original timeout'
 Assert-Equal -Actual $timeoutThrowResults[0].Payload -Expected $null -Message 'a failed harvest leaves no payload'
 
+# TDD RED: before transient polling recovery, the first exception ended the item
+# immediately instead of retaining the same in-flight agent until the next poll.
+$script:startCalls = 0
+$script:pollCalls = 0
+$script:collectCalls = 0
+$script:fleetNow = [datetime]'2026-09-11T10:00:00Z'
+$fleetResults = @(Invoke-InProcessAgentFleet -Items @([pscustomobject]@{ Sequence = 1; VMName = 'VM-retry' }) -MaxInFlight 1 -PollSeconds 1 -ItemTimeoutSeconds 60 `
+    -StartScript {
+        param($Item)
+        $script:startCalls++
+        return [pscustomobject]@{ VMName = $Item.VMName; ProcessId = 17 }
+    } `
+    -PollScript {
+        param($Handle)
+        $script:pollCalls++
+        if ($script:pollCalls -eq 1) { throw 'transient polling failure' }
+        return $true
+    } `
+    -CompleteScript {
+        param($Handle)
+        $script:collectCalls++
+        return [pscustomobject]@{ Completed = $true }
+    } `
+    -NowScript { $script:fleetNow } `
+    -IsTransientErrorScript { param($ErrorRecord) $true } `
+    -SleepScript { param([int]$Seconds) $script:fleetNow = $script:fleetNow.AddSeconds($Seconds) })
+
+Assert-Equal -Actual $script:startCalls -Expected 1 -Message 'Recovery never launches a second agent'
+Assert-Equal -Actual $script:pollCalls -Expected 2 -Message 'Transient poll failure is retried'
+Assert-Equal -Actual $script:collectCalls -Expected 1 -Message 'Recovered cycle is collected'
+Assert-Equal -Actual $fleetResults[0].Error -Expected $null -Message 'Recovered transient error does not poison success'
+
+# Permanent poll errors still harvest once, but the original poll error remains primary
+# when artifact collection itself fails.
+$script:permanentStartCalls = 0
+$script:permanentPollCalls = 0
+$script:permanentCollectCalls = 0
+$permanentResults = @(Invoke-InProcessAgentFleet -Items @([pscustomobject]@{ Sequence = 1; VMName = 'VM-permanent' }) -MaxInFlight 1 -PollSeconds 1 -ItemTimeoutSeconds 60 `
+    -StartScript {
+        param($Item)
+        $script:permanentStartCalls++
+        return [pscustomobject]@{ VMName = $Item.VMName; ProcessId = 23 }
+    } `
+    -PollScript {
+        param($Handle)
+        $script:permanentPollCalls++
+        throw 'permanent polling failure'
+    } `
+    -CompleteScript {
+        param($Handle)
+        $script:permanentCollectCalls++
+        throw 'collection failure must not replace poll error'
+    } `
+    -IsTransientErrorScript { param($ErrorRecord) $false } `
+    -SleepScript { param([int]$Seconds) })
+
+Assert-Equal -Actual $script:permanentStartCalls -Expected 1 -Message 'Permanent poll error never restarts the agent'
+Assert-Equal -Actual $script:permanentPollCalls -Expected 1 -Message 'Permanent poll error ends polling once'
+Assert-Equal -Actual $script:permanentCollectCalls -Expected 1 -Message 'Permanent poll error collects artifacts once'
+Assert-Contains -Text ([string]$permanentResults[0].Error) -Needle 'permanent polling failure' -Message 'Original permanent poll error is retained'
+Assert-Equal -Actual $permanentResults[0].Payload -Expected $null -Message 'Failed permanent-error collection leaves no payload'
+
+# Repeated transient errors use the original deadline rather than resetting it on each
+# retry. The injected sleep advances the test clock without waiting in real time.
+$script:deadlineNow = [datetime]'2026-09-11T10:00:00Z'
+$script:deadlineStartCalls = 0
+$script:deadlinePollCalls = 0
+$script:deadlineCollectCalls = 0
+$deadlineResults = @(Invoke-InProcessAgentFleet -Items @([pscustomobject]@{ Sequence = 1; VMName = 'VM-deadline' }) -MaxInFlight 1 -PollSeconds 1 -ItemTimeoutSeconds 2 `
+    -StartScript {
+        param($Item)
+        $script:deadlineStartCalls++
+        return [pscustomobject]@{ VMName = $Item.VMName; ProcessId = 29 }
+    } `
+    -PollScript {
+        param($Handle)
+        $script:deadlinePollCalls++
+        throw 'transient until deadline'
+    } `
+    -CompleteScript {
+        param($Handle)
+        $script:deadlineCollectCalls++
+        return [pscustomobject]@{ Harvested = $true }
+    } `
+    -NowScript { $script:deadlineNow } `
+    -IsTransientErrorScript { param($ErrorRecord) $true } `
+    -SleepScript { param([int]$Seconds) $script:deadlineNow = $script:deadlineNow.AddSeconds($Seconds) })
+
+Assert-Equal -Actual $script:deadlineStartCalls -Expected 1 -Message 'Transient timeout never restarts the agent'
+Assert-Equal -Actual $script:deadlinePollCalls -Expected 2 -Message 'Transient timeout polls only before the original deadline'
+Assert-Equal -Actual $script:deadlineCollectCalls -Expected 1 -Message 'Transient timeout collects artifacts once'
+Assert-Contains -Text ([string]$deadlineResults[0].Error) -Needle 'timed out' -Message 'Transient errors eventually report the original timeout'
+Assert-Equal -Actual $deadlineResults[0].Payload.Harvested -Expected $true -Message 'Transient timeout retains its harvested payload'
+
+# One VM recovering must not delay or poison a peer that completes in the same fleet.
+$script:peerStartCalls = @{}
+$script:peerPollCalls = @{}
+$script:peerCollectCalls = @{}
+$peerResults = @(Invoke-InProcessAgentFleet -Items @(
+        [pscustomobject]@{ Sequence = 1; VMName = 'VM-recovering' },
+        [pscustomobject]@{ Sequence = 2; VMName = 'VM-peer' }
+    ) -MaxInFlight 2 -PollSeconds 1 -ItemTimeoutSeconds 60 `
+    -StartScript {
+        param($Item)
+        if ($script:peerStartCalls.ContainsKey($Item.VMName)) { $script:peerStartCalls[$Item.VMName]++ } else { $script:peerStartCalls[$Item.VMName] = 1 }
+        return [pscustomobject]@{ VMName = $Item.VMName; ProcessId = 31 }
+    } `
+    -PollScript {
+        param($Handle)
+        $name = [string]$Handle.VMName
+        if ($script:peerPollCalls.ContainsKey($name)) { $script:peerPollCalls[$name]++ } else { $script:peerPollCalls[$name] = 1 }
+        if ($name -eq 'VM-recovering' -and $script:peerPollCalls[$name] -eq 1) { throw 'peer transient failure' }
+        return $true
+    } `
+    -CompleteScript {
+        param($Handle)
+        $name = [string]$Handle.VMName
+        if ($script:peerCollectCalls.ContainsKey($name)) { $script:peerCollectCalls[$name]++ } else { $script:peerCollectCalls[$name] = 1 }
+        return [pscustomobject]@{ VMName = $name }
+    } `
+    -IsTransientErrorScript { param($ErrorRecord) $true } `
+    -SleepScript { param([int]$Seconds) })
+
+Assert-Equal -Actual $peerResults.Count -Expected 2 -Message 'A recovered VM leaves its peer result intact'
+Assert-Equal -Actual $script:peerStartCalls['VM-recovering'] -Expected 1 -Message 'Recovering VM starts exactly once'
+Assert-Equal -Actual $script:peerStartCalls['VM-peer'] -Expected 1 -Message 'Peer VM starts exactly once'
+Assert-Equal -Actual $script:peerPollCalls['VM-recovering'] -Expected 2 -Message 'Recovering VM retries independently'
+Assert-Equal -Actual $script:peerPollCalls['VM-peer'] -Expected 1 -Message 'Peer VM is not repolled after completion'
+Assert-Equal -Actual $script:peerCollectCalls['VM-recovering'] -Expected 1 -Message 'Recovering VM is collected once'
+Assert-Equal -Actual $script:peerCollectCalls['VM-peer'] -Expected 1 -Message 'Peer VM is collected once'
+Assert-Equal -Actual (@($peerResults | Where-Object { $null -ne $_.Error }).Count) -Expected 0 -Message 'Peer and recovered VM results are successful'
+
 $fleetInFlightGuardThrew = $false
 try { Invoke-InProcessAgentFleet -Items @() -MaxInFlight 0 -PollSeconds 1 -ItemTimeoutSeconds 60 -StartScript { param($i) $i } -PollScript { param($h) $true } -CompleteScript { param($h) $h } | Out-Null }
 catch { $fleetInFlightGuardThrew = $true }

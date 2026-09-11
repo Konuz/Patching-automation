@@ -160,7 +160,9 @@ function Invoke-InProcessAgentFleet {
         [scriptblock]$StartScript,
         [scriptblock]$PollScript,
         [scriptblock]$CompleteScript,
-        [scriptblock]$SleepScript = { param([int]$Seconds) Start-Sleep -Seconds $Seconds }
+        [scriptblock]$SleepScript = { param([int]$Seconds) Start-Sleep -Seconds $Seconds },
+        [scriptblock]$NowScript = { Get-Date },
+        [scriptblock]$IsTransientErrorScript = { param($ErrorRecord) $false }
     )
 
     if ($MaxInFlight -lt 1) {
@@ -178,6 +180,20 @@ function Invoke-InProcessAgentFleet {
     $inFlight = @()
     $results = @()
 
+    $collectEntry = {
+        param($Entry)
+
+        $payload = $null
+        try {
+            $payload = & $CompleteScript $Entry.Handle
+        }
+        catch {
+            Write-Warning ('Could not collect artifacts for {0}: {1}' -f (Get-RuntimePropertyValue -InputObject $Entry.Item -Name 'VMName'), $_.Exception.Message)
+        }
+
+        return $payload
+    }
+
     while ($pending.Count -gt 0 -or $inFlight.Count -gt 0) {
         # Starts are sequential but return immediately: StartProgramInGuest hands back a
         # process id without waiting, so with MaxInFlight at the target count every guest
@@ -189,7 +205,7 @@ function Invoke-InProcessAgentFleet {
                 $inFlight += [pscustomobject]@{
                     Item = $item
                     Handle = $handle
-                    StartedAt = Get-Date
+                    StartedAt = & $NowScript
                 }
             }
             catch {
@@ -199,7 +215,7 @@ function Invoke-InProcessAgentFleet {
             }
         }
 
-        $now = Get-Date
+        $now = & $NowScript
         $kept = @()
         foreach ($entry in @($inFlight)) {
             if (($now - $entry.StartedAt).TotalSeconds -ge $ItemTimeoutSeconds) {
@@ -208,34 +224,53 @@ function Invoke-InProcessAgentFleet {
                 # process result timed out. Dropping them here would turn a guest run that
                 # actually finished into a reported failure and throw away the only per-VM
                 # diagnostics. The timeout error stands regardless of what the harvest finds.
-                $timeoutPayload = $null
-                try {
-                    $timeoutPayload = & $CompleteScript $entry.Handle
-                }
-                catch {
-                    # Say why the harvest failed. Swallowing it silently would leave a timed
-                    # out VM with no payload and no explanation of what went wrong fetching it.
-                    Write-Warning ('Could not collect artifacts for {0} after its timeout: {1}' -f (Get-RuntimePropertyValue -InputObject $entry.Item -Name 'VMName'), $_.Exception.Message)
-                    $timeoutPayload = $null
-                }
+                $timeoutPayload = & $collectEntry $entry
 
                 $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage ('Agent run timed out after {0} seconds.' -f $ItemTimeoutSeconds) -Payload $timeoutPayload
                 continue
             }
 
             try {
-                if (& $PollScript $entry.Handle) {
+                $pollCompleted = [bool](& $PollScript $entry.Handle)
+            }
+            catch {
+                $pollError = $_
+                $isTransient = $false
+                try {
+                    $isTransient = [bool](& $IsTransientErrorScript $pollError)
+                }
+                catch {
+                    $isTransient = $false
+                }
+
+                if ($isTransient) {
+                    # Keep the same handle and StartedAt. The next loop iteration is the
+                    # existing poll cadence, so a transient GuestOps failure cannot launch
+                    # a second agent or extend the original deadline.
+                    $kept += $entry
+                    continue
+                }
+
+                # A permanent poll error ends this VM, but its artifacts are still the best
+                # available evidence. The collection helper deliberately cannot replace the
+                # original poll error in the result.
+                $errorPayload = & $collectEntry $entry
+                $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage $pollError.Exception.Message -Payload $errorPayload
+                continue
+            }
+
+            if ($pollCompleted) {
+                try {
                     $results += [pscustomobject]@{
                         Sequence = Get-RuntimePropertyValue -InputObject $entry.Item -Name 'Sequence'
                         VMName = Get-RuntimePropertyValue -InputObject $entry.Item -Name 'VMName'
                         Payload = (& $CompleteScript $entry.Handle)
                         Error = $null
                     }
-                    continue
                 }
-            }
-            catch {
-                $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage $_.Exception.Message
+                catch {
+                    $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage $_.Exception.Message
+                }
                 continue
             }
 

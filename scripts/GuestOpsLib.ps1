@@ -538,6 +538,113 @@ function Get-ObjectPropertyValue {
     return $current
 }
 
+function Get-GuestOperationErrorKind {
+    param($ErrorRecord)
+
+    $transientWebExceptionStatuses = @(
+        'ConnectFailure',
+        'ConnectionClosed',
+        'KeepAliveFailure',
+        'NameResolutionFailure',
+        'ProxyNameResolutionFailure',
+        'ReceiveFailure',
+        'SendFailure',
+        'Timeout',
+        'RequestCanceled',
+        'PipelineFailure'
+    )
+
+    $sawInvalidCredentials = $false
+    $sawPermissionDenied = $false
+    $sawTransient = $false
+    $current = $ErrorRecord
+
+    for ($depth = 0; $null -ne $current -and $depth -lt 32; $depth++) {
+        $candidateQueue = New-Object System.Collections.Queue
+        $candidateQueue.Enqueue($current)
+
+        $exceptionProperty = $current.PSObject.Properties['Exception']
+        if ($null -ne $exceptionProperty -and $null -ne $exceptionProperty.Value -and $exceptionProperty.Value -ne $current) {
+            $candidateQueue.Enqueue($exceptionProperty.Value)
+        }
+
+        $candidateCount = 0
+        while ($candidateQueue.Count -gt 0 -and $candidateCount -lt 16) {
+            $candidate = $candidateQueue.Dequeue()
+            $candidateCount++
+            if ($null -eq $candidate) {
+                continue
+            }
+
+            $typeNames = @()
+            try {
+                $typeNames += [string]$candidate.GetType().FullName
+                $typeNames += [string]$candidate.GetType().Name
+            }
+            catch { }
+            try {
+                $typeNames += @($candidate.PSTypeNames | ForEach-Object { [string]$_ })
+            }
+            catch { }
+
+            foreach ($typeName in @($typeNames)) {
+                if ([string]::IsNullOrWhiteSpace($typeName)) {
+                    continue
+                }
+
+                $shortTypeName = ([string]$typeName -split '\.')[-1]
+                switch ($shortTypeName) {
+                    'InvalidGuestLogin' { $sawInvalidCredentials = $true }
+                    'InvalidGuestLoginFault' { $sawInvalidCredentials = $true }
+                    'GuestPermissionDenied' { $sawPermissionDenied = $true }
+                    'GuestPermissionDeniedFault' { $sawPermissionDenied = $true }
+                    'GuestOperationsUnavailable' { $sawTransient = $true }
+                    'GuestOperationsUnavailableFault' { $sawTransient = $true }
+                    'TaskInProgress' { $sawTransient = $true }
+                    'TaskInProgressFault' { $sawTransient = $true }
+                    'TimeoutException' { $sawTransient = $true }
+                }
+
+                if ($shortTypeName -eq 'WebException') {
+                    $statusProperty = $candidate.PSObject.Properties['Status']
+                    if ($null -ne $statusProperty -and $transientWebExceptionStatuses -contains ([string]$statusProperty.Value)) {
+                        $sawTransient = $true
+                    }
+                }
+            }
+
+            $faultProperty = $candidate.PSObject.Properties['Fault']
+            if ($null -ne $faultProperty -and $null -ne $faultProperty.Value -and $faultProperty.Value -ne $candidate) {
+                $candidateQueue.Enqueue($faultProperty.Value)
+            }
+        }
+
+        $baseException = $current
+        if ($null -ne $exceptionProperty -and $null -ne $exceptionProperty.Value) {
+            $baseException = $exceptionProperty.Value
+        }
+        $innerProperty = $baseException.PSObject.Properties['InnerException']
+        if ($null -eq $innerProperty -or $null -eq $innerProperty.Value -or $innerProperty.Value -eq $baseException) {
+            $current = $null
+        }
+        else {
+            $current = $innerProperty.Value
+        }
+    }
+
+    if ($sawInvalidCredentials) {
+        return 'InvalidCredentials'
+    }
+    if ($sawPermissionDenied) {
+        return 'Permanent'
+    }
+    if ($sawTransient) {
+        return 'Transient'
+    }
+
+    return 'Permanent'
+}
+
 function Test-AgentCycleCompletion {
     param(
         $Status,
@@ -611,6 +718,7 @@ function New-VMAgentCycleHandle {
         # Seeded so the property exists before anything reads it: on the fleet timeout path
         # it is read without a poll ever having written it, and StrictMode is unforgiving.
         AgentResult = $null
+        Status = $null
     }
 }
 
@@ -678,19 +786,55 @@ function Start-VMAgentCycle {
     return New-VMAgentCycleHandle -VMName $VMName -RunId $runId -Mode $mode -Managers $Managers -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -ProcessId $agentProcessId -GuestStatusPath $guestStatusPath -GuestLogPath $guestLogPath -LocalStatusPath $localStatusPath -LocalLogPath $localLogPath -TransferTimeoutSeconds $TransferTimeoutSeconds
 }
 
+function Read-VMAgentCycleStatus {
+    param($Handle)
+
+    try {
+        Receive-GuestFile -FileManager $Handle.Managers.FileManager -VMView $Handle.VMView -GuestAuth $Handle.GuestAuth -HostName $Handle.HostName -CurlPath $Handle.CurlPath -GuestPath $Handle.GuestStatusPath -LocalPath $Handle.LocalStatusPath -TimeoutSeconds $Handle.TransferTimeoutSeconds
+    }
+    catch {
+        # A status file that has not been created yet is still an in-progress cycle. Keep
+        # other GuestOps/transfer failures visible to the fleet so its classifier can decide
+        # whether the poll is retryable.
+        $errorTypeName = [string]$_.Exception.GetType().Name
+        if ($errorTypeName -in @('FileNotFoundException', 'GuestFileNotFound', 'FileNotFound')) {
+            return $null
+        }
+        throw
+    }
+
+    if (-not (Test-Path -LiteralPath $Handle.LocalStatusPath -PathType Leaf)) {
+        return $null
+    }
+
+    try {
+        $content = Get-Content -LiteralPath $Handle.LocalStatusPath -Raw
+        if ([string]::IsNullOrWhiteSpace([string]$content)) {
+            return $null
+        }
+        return ($content | ConvertFrom-Json)
+    }
+    catch {
+        return $null
+    }
+}
+
 function Test-VMAgentCycleComplete {
     param($Handle)
 
     $processes = @($Handle.Managers.ProcessManager.ListProcessesInGuest($Handle.VMView.MoRef, $Handle.GuestAuth, @([long]$Handle.ProcessId)))
 
     if ($processes.Count -eq 0) {
-        # vSphere keeps finished process info only for a limited window. Starting a fleet is
-        # sequential, so the first guest can finish before the poll loop ever reaches it, and
-        # an empty list then means "ended, exit code lost" - never "still running". Treating
-        # it as running would spin until the item timeout on a guest that finished long ago.
-        # status.json is the primary result anyway, so hand back the shape Wait-GuestProcess
-        # uses for a lost result and let the artifacts decide.
-        return [pscustomobject]@{ Completed = $false; ExitCode = $null; EndTime = $null }
+        # vSphere keeps finished process info only for a limited window. An empty list is
+        # conclusive only when the current cycle's terminal status is already available;
+        # Started, missing, malformed, or foreign status must keep the same agent in flight.
+        $status = Read-VMAgentCycleStatus -Handle $Handle
+        if ($null -ne $status -and (Test-AgentCycleCompletion -Status $status -RunId ([string]$Handle.RunId) -Mode ([string]$Handle.Mode))) {
+            $Handle.Status = $status
+            return [pscustomobject]@{ Completed = $false; ExitCode = $null; EndTime = $null }
+        }
+
+        return $null
     }
 
     $process = $processes[0]
@@ -709,11 +853,14 @@ function Complete-VMAgentCycle {
     )
 
     $artifactErrors = @()
-    try {
-        Receive-GuestFile -FileManager $Handle.Managers.FileManager -VMView $Handle.VMView -GuestAuth $Handle.GuestAuth -HostName $Handle.HostName -CurlPath $Handle.CurlPath -GuestPath $Handle.GuestStatusPath -LocalPath $Handle.LocalStatusPath -TimeoutSeconds $Handle.TransferTimeoutSeconds
-    }
-    catch {
-        $artifactErrors += ('status.json download failed: {0}' -f $_.Exception.Message)
+    $status = Get-ObjectPropertyValue -InputObject $Handle -Path @('Status')
+    if ($null -eq $status) {
+        try {
+            $status = Read-VMAgentCycleStatus -Handle $Handle
+        }
+        catch {
+            $artifactErrors += ('status.json download failed: {0}' -f $_.Exception.Message)
+        }
     }
 
     try {
@@ -729,11 +876,10 @@ function Complete-VMAgentCycle {
         }
     }
 
-    if (-not (Test-Path -LiteralPath $Handle.LocalStatusPath -PathType Leaf)) {
+    if ($null -eq $status -or -not (Test-Path -LiteralPath $Handle.LocalStatusPath -PathType Leaf)) {
         throw ('status.json was not downloaded. Output directory: {0}' -f (Split-Path -Parent $Handle.LocalStatusPath))
     }
 
-    $status = Get-Content -LiteralPath $Handle.LocalStatusPath -Raw | ConvertFrom-Json
     $statusRunId = [string](Get-ObjectPropertyValue -InputObject $status -Path @('runId'))
     if ([string]::IsNullOrWhiteSpace([string]$Handle.RunId) -or $statusRunId -cne [string]$Handle.RunId) {
         throw 'status.json runId does not match the current agent run.'

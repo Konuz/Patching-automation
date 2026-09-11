@@ -10,6 +10,57 @@ function Assert-Equal {
     if ($Actual -ne $Expected) { $script:failures += ('{0}: expected {1}, got {2}' -f $Message, $Expected, $Actual) }
 }
 
+# Offline error fixtures carry the production type names as PowerShell type-name
+# metadata, so these tests never force-load VMware assemblies.
+function New-ErrorTypeFixture {
+    param(
+        [string]$TypeName,
+        $InnerException = $null,
+        $Fault = $null,
+        $Status = $null
+    )
+
+    $fixture = [pscustomobject]@{
+        InnerException = $InnerException
+        Fault = $Fault
+        Status = $Status
+    }
+    $fixture.PSTypeNames.Insert(0, $TypeName)
+    return $fixture
+}
+
+$guestUnavailable = New-ErrorTypeFixture -TypeName 'VMware.Vim.GuestOperationsUnavailable'
+$wrappedGuestUnavailable = [pscustomobject]@{
+    Exception = (New-ErrorTypeFixture -TypeName 'System.Exception' -InnerException $guestUnavailable)
+}
+Assert-Equal (Get-GuestOperationErrorKind -ErrorRecord $wrappedGuestUnavailable) 'Transient' 'GuestOperationsUnavailable in InnerException is transient'
+
+$taskInProgressFault = New-ErrorTypeFixture -TypeName 'VMware.Vim.TaskInProgress'
+$runtimeFaultWithTransient = New-ErrorTypeFixture -TypeName 'VMware.Vim.RuntimeFault' -Fault $taskInProgressFault
+Assert-Equal (Get-GuestOperationErrorKind -ErrorRecord ([pscustomobject]@{ Exception = $runtimeFaultWithTransient })) 'Transient' 'only a known transient VMware fault is transient'
+
+$runtimeFault = New-ErrorTypeFixture -TypeName 'VMware.Vim.RuntimeFault'
+Assert-Equal (Get-GuestOperationErrorKind -ErrorRecord ([pscustomobject]@{ Exception = $runtimeFault })) 'Permanent' 'an unspecified RuntimeFault is permanent'
+
+$invalidLogin = New-ErrorTypeFixture -TypeName 'VMware.Vim.InvalidGuestLogin'
+$wrappedInvalidLogin = [pscustomobject]@{ Exception = (New-ErrorTypeFixture -TypeName 'System.Exception' -InnerException $invalidLogin) }
+Assert-Equal (Get-GuestOperationErrorKind -ErrorRecord $wrappedInvalidLogin) 'InvalidCredentials' 'InvalidGuestLogin has its own class'
+
+$permissionDenied = New-ErrorTypeFixture -TypeName 'VMware.Vim.GuestPermissionDenied'
+Assert-Equal (Get-GuestOperationErrorKind -ErrorRecord ([pscustomobject]@{ Exception = $permissionDenied })) 'Permanent' 'GuestPermissionDenied is permanent'
+
+$timeoutFixture = New-ErrorTypeFixture -TypeName 'System.TimeoutException'
+Assert-Equal (Get-GuestOperationErrorKind -ErrorRecord ([pscustomobject]@{ Exception = $timeoutFixture })) 'Transient' 'TimeoutException is transient'
+
+$webTimeout = New-ErrorTypeFixture -TypeName 'System.Net.WebException' -Status 'Timeout'
+Assert-Equal (Get-GuestOperationErrorKind -ErrorRecord ([pscustomobject]@{ Exception = $webTimeout })) 'Transient' 'selected WebException timeout is transient'
+
+$webTrustFailure = New-ErrorTypeFixture -TypeName 'System.Net.WebException' -Status 'TrustFailure'
+Assert-Equal (Get-GuestOperationErrorKind -ErrorRecord ([pscustomobject]@{ Exception = $webTrustFailure })) 'Permanent' 'WebException trust failure is not transient'
+
+$unknownError = New-ErrorTypeFixture -TypeName 'System.InvalidOperationException'
+Assert-Equal (Get-GuestOperationErrorKind -ErrorRecord ([pscustomobject]@{ Exception = $unknownError })) 'Permanent' 'unknown errors are permanent'
+
 # Exercise the actual lookup against a fake inventory, including a full-name/short-name collision.
 & {
     function Get-VM {
@@ -172,6 +223,8 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
     New-Item -ItemType Directory -Force -Path $cycleDirectory | Out-Null
     $localStatusPath = Join-Path $cycleDirectory 'status.json'
     $localLogPath = Join-Path $cycleDirectory 'agent.log'
+    $script:f2StatusJson = '{"runId":"fixture-run","outcome":"Started","finishedAt":null,"errors":[]}'
+    $script:f2StatusReads = 0
     $processManager = New-Object psobject
     $processManager | Add-Member -MemberType ScriptMethod -Name ListProcessesInGuest -Value {
         param($MoRef, $Auth, $ProcessIds)
@@ -182,7 +235,10 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
     function Receive-GuestFile {
         param($FileManager, $VMView, $GuestAuth, $HostName, $CurlPath, $GuestPath, $LocalPath, $TimeoutSeconds)
         if ($GuestPath -eq 'status.json') {
-            '{"runId":"fixture-run","outcome":"Started","finishedAt":null,"errors":[]}' | Set-Content -LiteralPath $LocalPath -Encoding UTF8
+            $script:f2StatusReads++
+            if ($null -ne $script:f2StatusJson) {
+                $script:f2StatusJson | Set-Content -LiteralPath $LocalPath -Encoding UTF8
+            }
         }
         else {
             'synthetic agent log' | Set-Content -LiteralPath $LocalPath -Encoding UTF8
@@ -195,9 +251,40 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $applyResult = New-ApplyResultFromCycle -VMName 'fixture-vm' -Cycle $cycle
         $discovery = @([pscustomobject]@{ vmName = 'fixture-vm'; outcome = 'SearchOnly'; pendingRebootBefore = [pscustomobject]@{ isPending = $true } })
         $targets = @(Select-RebootRequiredApplyResults -ApplyResults @($applyResult) -DiscoveryRecords $discovery)
-        Assert-Equal ($null -ne $processResult -and -not $processResult.Completed) $true 'F2: an empty process list ends polling with an unknown process result'
+        Assert-Equal ($null -eq $processResult) $true 'F2: an empty process list with Started status keeps polling'
         Assert-Equal $applyResult.outcome 'Failed' 'F2: Started status becomes an apply failure'
         Assert-Equal $targets.Count 0 'F2: an unfinished apply is not a reboot target even with pending reboot before apply'
+
+        $f2StatusCases = @(
+            [pscustomobject]@{ Name = 'terminal'; Json = '{"runId":"fixture-run","outcome":"InstallSucceeded","finishedAt":"2026-09-11T10:00:00Z","errors":[]}'; Expected = $true },
+            [pscustomobject]@{ Name = 'foreign runId'; Json = '{"runId":"other-run","outcome":"InstallSucceeded","finishedAt":"2026-09-11T10:00:00Z","errors":[]}'; Expected = $false },
+            [pscustomobject]@{ Name = 'Started'; Json = '{"runId":"fixture-run","outcome":"Started","finishedAt":null,"errors":[]}'; Expected = $false },
+            [pscustomobject]@{ Name = 'malformed status'; Json = '{not-json'; Expected = $false },
+            [pscustomobject]@{ Name = 'missing status'; Json = $null; Expected = $false }
+        )
+        foreach ($f2StatusCase in $f2StatusCases) {
+            $caseDirectory = Join-Path $cycleDirectory ('case-' + $f2StatusCase.Name.Replace(' ', '-'))
+            New-Item -ItemType Directory -Force -Path $caseDirectory | Out-Null
+            $caseProcessManager = New-Object psobject
+            $script:f2ListCalls = 0
+            $caseProcessManager | Add-Member -MemberType ScriptMethod -Name ListProcessesInGuest -Value {
+                param($MoRef, $Auth, $ProcessIds)
+                $script:f2ListCalls++
+                return @()
+            }
+            $caseHandle = New-VMAgentCycleHandle -VMName 'fixture-vm' -RunId 'fixture-run' -Managers ([pscustomobject]@{ ProcessManager = $caseProcessManager; FileManager = $null }) -VMView ([pscustomobject]@{ MoRef = 'fake' }) -GuestAuth $null -HostName 'unused' -CurlPath 'unused' -ProcessId 123 -GuestStatusPath 'status.json' -GuestLogPath 'agent.log' -LocalStatusPath (Join-Path $caseDirectory 'status.json') -LocalLogPath (Join-Path $caseDirectory 'agent.log')
+            $script:f2StatusJson = $f2StatusCase.Json
+            $script:f2StatusReads = 0
+            $caseResult = Test-VMAgentCycleComplete -Handle $caseHandle
+            Assert-Equal ($null -ne $caseResult) $f2StatusCase.Expected ('F2: empty process list status case ' + $f2StatusCase.Name)
+            Assert-Equal $script:f2ListCalls 1 ('F2: status case polls the process list once: ' + $f2StatusCase.Name)
+            Assert-Equal $script:f2StatusReads 1 ('F2: status case reads status once: ' + $f2StatusCase.Name)
+            if ($f2StatusCase.Expected) {
+                Assert-Equal $caseResult.Completed $false 'F2: recovered terminal status has no process exit code'
+                Assert-Equal $caseHandle.Status.runId 'fixture-run' 'F2: recovered status remains in the cycle handle'
+            }
+            Remove-Item -LiteralPath $caseDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        }
 
         function Invoke-GuestAgentFleet { $script:failedFleet }
         function Write-PatchingSummary { param($ApplyResults) }

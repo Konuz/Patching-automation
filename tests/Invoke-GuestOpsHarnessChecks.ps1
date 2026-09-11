@@ -84,6 +84,7 @@ function New-FakeGuest {
         StatusJson = $StatusJson
         NeverFinishes = [bool]$NeverFinishes
         VanishesFromProcessList = [bool]$VanishesFromProcessList
+        TransientPollFailures = 0
         FailsToResolve = [bool]$FailsToResolve
         MkdirProcessIds = @{}
         ListProcessCallCount = 0
@@ -134,6 +135,11 @@ function New-FakeManagers {
 
         if ($this.State.NeverFinishes) {
             return @([pscustomobject]@{ Pid = $processId; EndTime = $null; ExitCode = $null })
+        }
+
+        if ($this.State.TransientPollFailures -gt 0) {
+            $this.State.TransientPollFailures--
+            throw (New-Object System.TimeoutException -ArgumentList 'synthetic transient poll failure')
         }
 
         $this.State.PollsRemaining--
@@ -468,6 +474,37 @@ try {
     $transfersWithoutTimeout = @($script:curlCalls | Where-Object { @($_.Arguments) -notcontains '--max-time' })
     Assert-Equal -Actual $transfersWithoutTimeout.Count -Expected 0 -Message 'harness: every guest transfer carries --max-time'
     Assert-Equal -Actual (@($script:curlCalls).Count -gt 0) -Expected $true -Message 'harness: transfers actually happened'
+}
+finally {
+    Remove-Item -LiteralPath $workspace -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- a transient poll error must not start a second agent ----------------------------
+
+$script:guestState = @{}
+$script:curlCalls = @()
+$workspace = New-HarnessWorkspace
+try {
+    New-FakeGuest -VMName 'VM-retry' -PollsBeforeFinish 1 -StatusJson '{"outcome":"SearchOnly","finishedAt":"2026-08-22T10:00:00.0000000Z"}'
+    $retryManagers = New-FakeManagers -VMName 'VM-retry'
+    $script:guestState['VM-retry'].TransientPollFailures = 1
+    $script:guestState['VM-retry'].Client = New-ClientBoundFakeClient -VMName 'VM-retry' -Managers $retryManagers
+    $retryItem = [pscustomobject]@{
+        Sequence = 1
+        VMName = 'VM-retry'
+        VMOutputDirectory = (Join-Path $workspace 'VM-retry')
+        MaxUpdates = 1
+        LocalSelectionPath = ''
+        GuestSelectionPath = ''
+        SearchOnly = $true
+    }
+
+    $retryResults = @(Invoke-GuestAgentFleet -FleetItems @($retryItem) -Managers $retryManagers -GuestCredentialMap @{ 'VM-retry' = $harnessCredential } -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -TimeoutSeconds 120 -PollSeconds 1 -MaxInFlight 1)
+    Assert-Equal $retryResults.Count 1 'harness: transient poll recovery returns one result'
+    Assert-Equal ([string]$retryResults[0].Error) '' 'harness: transient poll recovery has no error'
+    Assert-Equal $script:guestState['VM-retry'].StartProgramCallCount 2 'harness: transient poll recovery starts mkdir and the agent only once'
+    Assert-Equal $script:guestState['VM-retry'].ListProcessCallCount 3 'harness: transient poll recovery asks for the process once per poll plus mkdir'
+    Assert-Equal (@($retryResults[0].Payload.AgentCompletionConfirmed) -contains $true) $true 'harness: transient poll recovery retains terminal completion'
 }
 finally {
     Remove-Item -LiteralPath $workspace -Recurse -Force -ErrorAction SilentlyContinue
