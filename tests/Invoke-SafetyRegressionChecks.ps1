@@ -144,8 +144,19 @@ Assert-Equal $clusterApply.ExitCode 1 'stale plan targeting a cluster exits nonz
 Assert-Equal (@($clusterApply.Status.errors).Count -gt 0) $true 'cluster rejection reports its cause'
 # Test every process-result path: known error exit, lost result, and unavailable exit code.
 foreach ($processResult in @($clusterApply.Cycle.AgentResult, $null, [pscustomobject]@{ Completed = $true; ExitCode = $null })) {
-    $cycle = [pscustomobject]@{ Status = $clusterApply.Status; AgentResult = $processResult }
+    $cycle = [pscustomobject]@{
+        RunId = $clusterApply.Status.runId
+        Mode = 'Apply'
+        AgentCompletionConfirmed = $true
+        AgentCompletionReason = 'synthetic terminal cluster failure'
+        Status = $clusterApply.Status
+        AgentResult = $processResult
+    }
     $applyResult = New-ApplyResultFromCycle -VMName 'fixture' -Cycle $cycle
+    Assert-Equal $applyResult.action 'Install' 'cluster fixture remains an Install result before role protection'
+    Assert-Equal $applyResult.agentCompletionConfirmed $true 'cluster fixture is terminal before testing role protection'
+    Assert-Equal $applyResult.rebootRequired $true 'cluster fixture carries a reboot signal before role protection'
+    Assert-Equal $applyResult.roleFlags.failoverCluster $true 'cluster fixture preserves the failover-cluster role flag'
     Assert-Equal (@(Select-RebootRequiredApplyResults -ApplyResults @($applyResult)).Count) 0 'cluster detected by apply is excluded from reboot without discovery records'
     Assert-Equal (Test-ApplyResultsSuccessful -ApplyResults @($applyResult)) $false 'cluster installation rejection cannot be reported as success'
 }
@@ -218,10 +229,154 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $phaseResult = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $plan -Managers $null -GuestCredentialMap @{} -VIServers @() -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\unused' -TimeoutSeconds 1 -RebootTimeoutSeconds 1 -PollSeconds 1 -CycleOutputDirectory $phaseDirectory -ThrottleLimit 1 -RebootBatchSize 1 -DiscoveryRecords $discovery
         Assert-Equal $script:rebootDispatchCount 0 'F2: a poll error never dispatches a reboot after operator approval'
         Assert-Equal $phaseResult.ExitCode 1 'F2: the poll error remains an unsuccessful apply run'
+
+        # F2: exercise the real apply adapter and round loop with two VMs. One missing
+        # completion record must remain failed, while the confirmed peer may reboot and
+        # continue to the verification discovery.
+        $roundLoop = $orchestratorAst.Find({ param($node)
+            $node -is [System.Management.Automation.Language.WhileStatementAst] -and $node.Extent.Text.Contains('$roundNumber++')
+        }, $true)
+        $roundFinalization = $orchestratorAst.Find({ param($node)
+            $node -is [System.Management.Automation.Language.IfStatementAst] -and $node.Extent.Text.Contains('Write-PatchRunSummary -RunOutputDirectory')
+        }, $true)
+        Assert-Equal ($null -ne $roundLoop) $true 'F2: the production round loop is available to the mixed-VM regression'
+        Assert-Equal ($null -ne $roundFinalization) $true 'F2: the production final exit-code block is available to the mixed-VM regression'
+
+        $updateId = '22222222-2222-2222-2222-222222222222'
+        $roundUpdate = [pscustomobject]@{
+            updateId = $updateId
+            revisionNumber = 1
+            title = 'Security Update'
+            kbArticleIds = @()
+            categories = @()
+            msrcSeverity = 'Critical'
+            updateType = 'Software'
+        }
+        $roundRoleFlags = [pscustomobject]@{ failoverCluster = $false }
+        $script:roundOneDiscovery = @(
+            [pscustomobject]@{ vmName = 'unconfirmed-vm'; computerName = 'unconfirmed-vm'; outcome = 'SearchOnly'; errors = @(); roleFlags = $roundRoleFlags; pendingRebootBefore = [pscustomobject]@{ isPending = $true }; updates = @($roundUpdate) },
+            [pscustomobject]@{ vmName = 'confirmed-peer'; computerName = 'confirmed-peer'; outcome = 'SearchOnly'; errors = @(); roleFlags = $roundRoleFlags; pendingRebootBefore = [pscustomobject]@{ isPending = $false }; updates = @($roundUpdate) }
+        )
+        $script:roundTwoDiscovery = @([pscustomobject]@{ vmName = 'confirmed-peer'; computerName = 'confirmed-peer'; outcome = 'NoApplicableUpdates'; errors = @(); roleFlags = $roundRoleFlags; pendingRebootBefore = [pscustomobject]@{ isPending = $false }; updates = @() })
+        $peerCycle = [pscustomobject]@{
+            RunId = 'confirmed-peer-run'
+            Mode = 'Apply'
+            AgentCompletionConfirmed = $true
+            AgentCompletionReason = 'synthetic terminal status'
+            AgentResult = [pscustomobject]@{ Completed = $true; ExitCode = 0 }
+            Status = [pscustomobject]@{
+                runId = 'confirmed-peer-run'
+                outcome = 'InstallSucceeded'
+                finishedAt = '2026-09-11T10:00:00Z'
+                installResult = [pscustomobject]@{ rebootRequired = $true }
+                pendingRebootAfter = [pscustomobject]@{ isPending = $false }
+                roleFlags = $roundRoleFlags
+                errors = @()
+            }
+        }
+        $script:mixedFleet = @(
+            [pscustomobject]@{ Sequence = 1; VMName = 'unconfirmed-vm'; Payload = $null; Error = 'simulated missing terminal record' },
+            [pscustomobject]@{ Sequence = 2; VMName = 'confirmed-peer'; Payload = $peerCycle; Error = $null }
+        )
+        $script:roundDiscoveryTargets = @()
+        $script:roundDiscoveryCall = 0
+        $script:lastRoundApplyResults = @()
+        $script:rebootDispatchNames = @()
+
+        function Invoke-GuestAgentFleet {
+            param($FleetItems, $Managers, $GuestCredentialMap, $CurlPath, $AgentPath, $IdentityHelperPath, $GuestWorkingDirectory, $TimeoutSeconds, $PollSeconds, $MaxInFlight)
+            return @($script:mixedFleet)
+        }
+        function Invoke-DiscoveryPhase {
+            param($TargetVMNames, $Managers, $GuestCredentialMap, $CurlPath, $AgentPath, $IdentityHelperPath, $GuestWorkingDirectory, $MaxUpdates, $TimeoutSeconds, $PollSeconds, $CycleOutputDirectory, $MaxInFlight)
+            $script:roundDiscoveryCall++
+            $script:roundDiscoveryTargets += [pscustomobject]@{ Names = @($TargetVMNames) }
+            if ($script:roundDiscoveryCall -eq 1) {
+                return @($script:roundOneDiscovery)
+            }
+            return @($script:roundTwoDiscovery)
+        }
+        function Read-UpdateGroupSelection {
+            param($UpdateGroups, $PromptProvider)
+            return [pscustomobject]@{ Aborted = $false; Keys = @('{0}|1' -f $updateId) }
+        }
+        function Confirm-PatchPlan { param($SkipConfirmation) $true }
+        function Write-PatchRoundVerification { param($CompletionStates, $Round) }
+        function Write-PatchRunSummary { param($RunOutputDirectory, $RoundSummaries, $FinalStateMap) }
+        function Write-PatchingSummary { param($ApplyResults) $script:lastRoundApplyResults = @($ApplyResults) }
+        function Invoke-GuestRebootPhase {
+            param($RebootTargets, $GuestCredentialMap, [string[]]$VIServers, $VIServerCredentialMap, [switch]$IgnoreVCenterCertificate, [string]$GuestOpsLibPath, [string]$CurlPath, [string]$GuestWorkingDirectory, [int]$RebootTimeoutSeconds, [int]$PollSeconds, [int]$RebootBatchSize)
+            $script:rebootDispatchNames += @($RebootTargets | ForEach-Object { [string]$_.vmName })
+            return @($RebootTargets | ForEach-Object {
+                [pscustomobject]@{ vmName = $_.vmName; action = 'Initiated'; validationStatus = 'Confirmed' }
+            })
+        }
+
+        $roundRunDirectory = Join-Path $cycleDirectory 'mixed-round'
+        New-Item -ItemType Directory -Force -Path $roundRunDirectory | Out-Null
+        $roundNumber = 0
+        $roundTargetVMNames = @('unconfirmed-vm', 'confirmed-peer')
+        $roundSummaries = @()
+        $finalStateMap = @{}
+        $deselectedUpdateKeys = @()
+        $stoppedByRoundCap = $false
+        $sawApplyFailure = $false
+        $scriptExitCode = 0
+        $runOutputDirectory = $roundRunDirectory
+        $MaxPatchRounds = 2
+        $SearchOnly = $false
+        $PlanOnly = $false
+        $hasExplicitSelectedUpdateKeys = $false
+        $SkipConfirmation = $true
+        $PromptProvider = $null
+        $managers = $null
+        $guestCredentialMap = @{}
+        $resolvedVIServers = @()
+        $viserverCredentialMap = @{}
+        $IgnoreVCenterCertificate = $false
+        $guestOpsLibPath = 'unused'
+        $curlPath = 'unused'
+        $AgentPath = 'unused'
+        $identityHelperPath = 'unused'
+        $GuestWorkingDirectory = 'C:\unused'
+        $TimeoutMinutes = 1
+        $RebootTimeoutMinutes = 1
+        $PollSeconds = 1
+        $ThrottleLimit = 1
+        $resolvedRebootBatchSize = 1
+        $MaxUpdates = 1
+        . ([scriptblock]::Create(($roundLoop.Extent.Text + "`n" + $roundFinalization.Extent.Text)))
+
+        Assert-Equal $sawApplyFailure $true 'F2: mixed apply exit marks the round as unsuccessful before finalization'
+        Assert-Equal $script:lastRoundApplyResults.Count 2 'F2: real apply adapter returns both VM results'
+        if ($script:lastRoundApplyResults.Count -eq 2) {
+            Assert-Equal $script:lastRoundApplyResults[0].outcome 'Failed' 'F2: unconfirmed VM has a failed apply outcome'
+            Assert-Equal (@($script:lastRoundApplyResults[0].errors).Count -gt 0) $true 'F2: unconfirmed VM carries an apply error'
+            Assert-Equal $script:lastRoundApplyResults[0].agentCompletionConfirmed $false 'F2: unconfirmed VM remains failed in apply results'
+            Assert-Equal $script:lastRoundApplyResults[1].outcome 'InstallSucceeded' 'F2: confirmed peer keeps its successful outcome'
+            Assert-Equal $script:lastRoundApplyResults[1].agentCompletionConfirmed $true 'F2: confirmed peer remains eligible'
+        }
+        Assert-Equal $script:rebootDispatchNames.Count 1 'F2: mixed apply dispatches only one reboot'
+        if ($script:rebootDispatchNames.Count -eq 1) {
+            Assert-Equal $script:rebootDispatchNames[0] 'confirmed-peer' 'F2: only the confirmed peer is rebooted'
+        }
+        Assert-Equal $script:roundDiscoveryCall 2 'F2: the confirmed peer reaches verification discovery'
+        if ($script:roundDiscoveryCall -ge 2) {
+            Assert-Equal (@($script:roundDiscoveryTargets[1].Names).Count) 1 'F2: nextTargets contains only the confirmed peer'
+            Assert-Equal $script:roundDiscoveryTargets[1].Names[0] 'confirmed-peer' 'F2: unconfirmed VM is absent from nextTargets'
+        }
+        Assert-Equal $finalStateMap['unconfirmed-vm'].state 'Failed' 'F2: unconfirmed VM remains in the final state map'
+        Assert-Equal $finalStateMap['confirmed-peer'].state 'Green' 'F2: confirmed peer can finish the next round'
+        Assert-Equal $scriptExitCode 1 'F2: one unconfirmed VM keeps the mixed run unsuccessful'
     }
     finally {
         Remove-Item Function:\Receive-GuestFile -ErrorAction SilentlyContinue
         Remove-Item Function:\Invoke-GuestAgentFleet -ErrorAction SilentlyContinue
+        Remove-Item Function:\Invoke-DiscoveryPhase -ErrorAction SilentlyContinue
+        Remove-Item Function:\Read-UpdateGroupSelection -ErrorAction SilentlyContinue
+        Remove-Item Function:\Confirm-PatchPlan -ErrorAction SilentlyContinue
+        Remove-Item Function:\Write-PatchRoundVerification -ErrorAction SilentlyContinue
+        Remove-Item Function:\Write-PatchRunSummary -ErrorAction SilentlyContinue
         Remove-Item Function:\Write-PatchingSummary -ErrorAction SilentlyContinue
         Remove-Item Function:\Write-FinalReport -ErrorAction SilentlyContinue
         Remove-Item Function:\Confirm-GuestReboot -ErrorAction SilentlyContinue
