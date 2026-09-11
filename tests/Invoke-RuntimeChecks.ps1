@@ -1108,6 +1108,314 @@ Assert-Equal -Actual ($firstReadIndex -lt $firstConfirmIndex) -Expected $true -M
 # the interactive prompt loop on top and has top-level side effects, so it is extracted via
 # the AST and exercised with a Read-Host override.
 . (Join-Path $repoRoot 'scripts\VMTargetLib.ps1')
+. (Join-Path $repoRoot 'scripts\CredentialRecovery.ps1')
+
+# --- guest credential recovery ---------------------------------------------------
+# These tests exercise the resolver through injected seams. No vCenter, GuestOps operation,
+# or credential store is involved here.
+$credentialRecoveryAvailable = $false
+try {
+    $credentialRecoveryProbe = New-GuestCredentialContext -TargetNames @('probe') -CredentialMap @{}
+    $credentialRecoveryAvailable = $true
+}
+catch {
+    Add-Failure -Message ('Credential recovery RED: resolver module is not available yet. ' + $_.Exception.Message)
+}
+
+if ($credentialRecoveryAvailable) {
+    $oldGuestCredential = New-TestCredential 'OLD\adm'
+    $newBadGuestCredential = New-TestCredential 'NEW\adm'
+    $newGoodGuestCredential = New-TestCredential 'NEW2\adm'
+    $credentialMap = @{
+        'vm1.contoso.com' = $oldGuestCredential
+        'vm2.contoso.com' = $oldGuestCredential
+    }
+    $credentialContext = New-GuestCredentialContext -TargetNames @('vm1.contoso.com', 'vm2.contoso.com') -CredentialMap $credentialMap
+
+    $promptBoundaryReplacement = New-TestCredential 'PROMPT\adm'
+    $promptBoundaryContext = New-GuestCredentialContext -TargetNames @('vm-prompt-boundary') -CredentialMap @{ 'vm-prompt-boundary' = $oldGuestCredential }
+    $promptBoundaryState = [pscustomobject]@{ DecisionCalls = 0; Reason = $null }
+    $promptBoundaryResults = @(Resolve-GuestCredentialForTarget -VMName 'vm-prompt-boundary' -Context $promptBoundaryContext -Interactive -ValidateScript {
+        param($VMName, $Credential)
+        if ($Credential.UserName -eq 'OLD\adm') {
+            return [pscustomobject]@{ Status = 'Invalid'; ErrorKind = 'InvalidGuestLogin'; Error = 'synthetic rejection' }
+        }
+
+        return [pscustomobject]@{ Status = 'Valid'; ErrorKind = $null; Error = $null }
+    } -DecisionScript {
+        param($VMName, $AccountKey, $Members, $Reason)
+        $promptBoundaryState.DecisionCalls++
+        $promptBoundaryState.Reason = [string]$Reason
+        return [pscustomobject]@{ Action = 'Retry'; Credential = $promptBoundaryReplacement; Remember = $false }
+    }.GetNewClosure())
+    Assert-Equal -Actual $promptBoundaryResults.Count -Expected 1 -Message 'credential recovery returns one resolution object'
+    $promptBoundaryResult = $promptBoundaryResults[0]
+    Assert-Equal -Actual $promptBoundaryResult.Status -Expected 'Ready' -Message 'an invalid guest login invokes the decision callback and validates its replacement'
+    Assert-Equal -Actual $promptBoundaryState.DecisionCalls -Expected 1 -Message 'an invalid guest login asks for exactly one decision'
+    Assert-Equal -Actual ([string]::IsNullOrWhiteSpace($promptBoundaryState.Reason)) -Expected $false -Message 'the decision callback receives an invalid-login reason'
+    if ($promptBoundaryResult.Status -eq 'Ready') {
+        Assert-Equal -Actual $promptBoundaryResult.Credential.UserName -Expected 'PROMPT\adm' -Message 'the decision callback replacement is returned only after validation'
+    }
+
+    $script:credentialValidationCalls = @()
+    $script:credentialValidatedCalls = @()
+    $credentialDecisionState = [pscustomobject]@{ Calls = @(); MapAtDecision = @() }
+    $credentialValidationScript = {
+        param($VMName, $Credential)
+        $script:credentialValidationCalls += [pscustomobject]@{
+            VMName = $VMName
+            UserName = [string]$Credential.UserName
+        }
+
+        if ($Credential.UserName -eq 'OLD\adm' -or $Credential.UserName -eq 'NEW\adm') {
+            return [pscustomobject]@{ Status = 'Invalid'; ErrorKind = 'InvalidGuestLogin'; Error = 'synthetic rejection' }
+        }
+
+        return [pscustomobject]@{ Status = 'Valid'; ErrorKind = $null; Error = $null }
+    }
+    $credentialDecisionScript = {
+        param($VMName, $AccountKey, $Members, $Reason)
+        $credentialDecisionState.Calls += [pscustomobject]@{
+            VMName = $VMName
+            AccountKey = $AccountKey
+            Members = @($Members)
+            Reason = [string]$Reason
+        }
+        $credentialDecisionState.MapAtDecision += [string]$credentialContext.CredentialMap[$VMName].UserName
+        if ($credentialDecisionState.Calls.Count -eq 1) {
+            return [pscustomobject]@{ Action = 'Retry'; Credential = $newBadGuestCredential; Remember = $false }
+        }
+
+        return [pscustomobject]@{ Action = 'Retry'; Credential = $newGoodGuestCredential; Remember = $true }
+    }.GetNewClosure()
+    $credentialOnValidatedScript = {
+        param($AccountKey, $Members, $Credential, $Remember)
+        $script:credentialValidatedCalls += [pscustomobject]@{
+            AccountKey = $AccountKey
+            Members = @($Members)
+            UserName = [string]$Credential.UserName
+            Remember = $Remember
+        }
+    }
+
+    $readyCredential = Resolve-GuestCredentialForTarget -VMName 'vm1.contoso.com' -Context $credentialContext -Interactive -ValidateScript $credentialValidationScript -DecisionScript $credentialDecisionScript -OnValidatedScript $credentialOnValidatedScript
+    Assert-Equal -Actual $readyCredential.Status -Expected 'Ready' -Message 'invalid guest credentials can be replaced after validation'
+    Assert-Equal -Actual $readyCredential.AccountKey -Expected 'domain:contoso.com' -Message 'credential recovery uses the grouped account key'
+    if ($readyCredential.Status -eq 'Ready') {
+        Assert-Equal -Actual $readyCredential.Credential.UserName -Expected 'NEW2\adm' -Message 'only the successfully validated replacement is returned'
+    }
+    Assert-Equal -Actual (@($script:credentialValidationCalls | ForEach-Object { $_.UserName }) -join ';') -Expected 'OLD\adm;NEW\adm;NEW2\adm' -Message 'recovery never retries the rejected credential automatically'
+    Assert-Equal -Actual $credentialDecisionState.Calls.Count -Expected 2 -Message 'each rejected credential asks for one operator decision'
+    Assert-Equal -Actual (@($credentialDecisionState.MapAtDecision) -join ';') -Expected 'OLD\adm;OLD\adm' -Message 'the credential map changes only after validation succeeds'
+    Assert-Equal -Actual $script:credentialValidatedCalls.Count -Expected 1 -Message 'successful replacement invokes the validation callback once'
+    Assert-Equal -Actual $script:credentialValidatedCalls[0].Remember -Expected $true -Message 'the replacement decision passes Remember to the callback'
+    Assert-Equal -Actual $credentialMap['vm1.contoso.com'].UserName -Expected 'NEW2\adm' -Message 'the successful replacement updates the VM map in memory'
+    Assert-Equal -Actual $credentialMap['vm2.contoso.com'].UserName -Expected 'NEW2\adm' -Message 'all members receive the validated group credential in memory'
+
+    $vm2ValidationCountBefore = $script:credentialValidationCalls.Count
+    $vm2Ready = Resolve-GuestCredentialForTarget -VMName 'vm2.contoso.com' -Context $credentialContext -ValidateScript $credentialValidationScript -DecisionScript { throw 'unexpected credential decision' } -OnValidatedScript $credentialOnValidatedScript
+    Assert-Equal -Actual $vm2Ready.Status -Expected 'Ready' -Message 'a shared domain credential remains usable for another VM'
+    Assert-Equal -Actual $script:credentialValidationCalls.Count -Expected ($vm2ValidationCountBefore + 1) -Message 'each VM in a shared group is validated separately'
+    Assert-Equal -Actual $credentialContext.ValidatedTargets.ContainsKey('vm1.contoso.com') -Expected $true -Message 'the first VM records its own validation'
+    Assert-Equal -Actual $credentialContext.ValidatedTargets.ContainsKey('vm2.contoso.com') -Expected $true -Message 'the second VM records its own validation'
+    Assert-Equal -Actual $script:credentialValidatedCalls[1].Remember -Expected $null -Message 'initially supplied credentials pass a null Remember value'
+
+    $vm2CachedValidationCount = $script:credentialValidationCalls.Count
+    $vm2Cached = Resolve-GuestCredentialForTarget -VMName 'vm2.contoso.com' -Context $credentialContext -ValidateScript { throw 'cached target must not validate again' } -DecisionScript { throw 'cached target must not ask again' }
+    Assert-Equal -Actual $vm2Cached.Status -Expected 'Ready' -Message 'a target validated in this run can use its cached result'
+    Assert-Equal -Actual $script:credentialValidationCalls.Count -Expected $vm2CachedValidationCount -Message 'cached validation avoids a duplicate AuthManager call'
+
+    $forcedCredential = New-TestCredential 'FORCED\adm'
+    $forceDecisionState = [pscustomobject]@{ Calls = 0 }
+    $forceDecisionScript = {
+        param($VMName, $AccountKey, $Members, $Reason)
+        $forceDecisionState.Calls++
+        return [pscustomobject]@{ Action = 'Retry'; Credential = $forcedCredential; Remember = $false }
+    }.GetNewClosure()
+    $forcedResult = Resolve-GuestCredentialForTarget -VMName 'vm1.contoso.com' -Context $credentialContext -ForcePrompt -Interactive -ValidateScript $credentialValidationScript -DecisionScript $forceDecisionScript -OnValidatedScript $credentialOnValidatedScript
+    Assert-Equal -Actual $forcedResult.Status -Expected 'Ready' -Message 'ForcePrompt accepts a replacement without retrying the known credential'
+    Assert-Equal -Actual $forceDecisionState.Calls -Expected 1 -Message 'ForcePrompt asks for a new credential directly'
+    Assert-Equal -Actual $script:credentialValidationCalls[$script:credentialValidationCalls.Count - 1].UserName -Expected 'FORCED\adm' -Message 'ForcePrompt validates only the newly supplied credential'
+    Assert-Equal -Actual $forcedResult.Credential.UserName -Expected 'FORCED\adm' -Message 'ForcePrompt returns the replacement credential'
+    Assert-Equal -Actual $credentialContext.ValidatedTargets.ContainsKey('vm2.contoso.com') -Expected $false -Message 'changing shared credentials invalidates other VM validation entries'
+    Assert-Equal -Actual $credentialValidatedCalls[2].Remember -Expected $false -Message 'Remember=false is preserved for a replacement callback'
+
+    $forcedVm2ValidationCount = $script:credentialValidationCalls.Count
+    $forcedVm2 = Resolve-GuestCredentialForTarget -VMName 'vm2.contoso.com' -Context $credentialContext -ValidateScript $credentialValidationScript -DecisionScript { throw 'forced VM2 credential is valid' }
+    Assert-Equal -Actual $forcedVm2.Status -Expected 'Ready' -Message 'a shared-group peer can revalidate after credential replacement'
+    Assert-Equal -Actual $script:credentialValidationCalls.Count -Expected ($forcedVm2ValidationCount + 1) -Message 'invalidated peer validation is not trusted from the old credential'
+
+    $localCredential = New-TestCredential 'Administrator'
+    $localContext = New-GuestCredentialContext -TargetNames @('VM01', 'VM02') -CredentialMap @{ VM01 = $localCredential; VM02 = $localCredential }
+    $script:localValidationCalls = 0
+    $script:localDecisionCalls = 0
+    $localSkipped = Resolve-GuestCredentialForTarget -VMName 'VM01' -Context $localContext -Interactive -ValidateScript {
+        param($VMName, $Credential)
+        $script:localValidationCalls++
+        [pscustomobject]@{ Status = 'Invalid'; ErrorKind = 'InvalidCredentials'; Error = 'Rejected' }
+    } -DecisionScript {
+        param($VMName, $AccountKey, $Members, $Reason)
+        $script:localDecisionCalls++
+        [pscustomobject]@{ Action = 'SkipAccount'; Credential = $null; Remember = $true }
+    }
+    Assert-Equal -Actual $localSkipped.Status -Expected 'Skipped' -Message 'operator may skip a local account'
+    Assert-Equal -Actual $localContext.SkippedAccountKeys.ContainsKey('local:VM01') -Expected $true -Message 'skip marks only the rejected local account'
+    Assert-Equal -Actual $localContext.SkippedAccountKeys.ContainsKey('local:VM02') -Expected $false -Message 'another local account remains usable'
+    $localReady = Resolve-GuestCredentialForTarget -VMName 'VM02' -Context $localContext -ValidateScript {
+        param($VMName, $Credential)
+        $script:localValidationCalls++
+        [pscustomobject]@{ Status = 'Valid'; ErrorKind = $null; Error = $null }
+    } -DecisionScript { throw 'VM02 must not inherit VM01 skip' }
+    Assert-Equal -Actual $localReady.Status -Expected 'Ready' -Message 'a second local account continues independently'
+    Assert-Equal -Actual $script:localValidationCalls -Expected 2 -Message 'local account isolation does not suppress the second VM'
+
+    $sharedSkipContext = New-GuestCredentialContext -TargetNames @('VM01.example.test', 'VM02.example.test') -CredentialMap @{ 'VM01.example.test' = $oldGuestCredential; 'VM02.example.test' = $oldGuestCredential }
+    $sharedSkipState = [pscustomobject]@{ ValidationCalls = 0; DecisionCalls = 0 }
+    $sharedSkipFirst = Resolve-GuestCredentialForTarget -VMName 'VM01.example.test' -Context $sharedSkipContext -Interactive -ValidateScript {
+        param($VMName, $Credential)
+        $sharedSkipState.ValidationCalls++
+        return [pscustomobject]@{ Status = 'Invalid'; ErrorKind = 'InvalidGuestLogin'; Error = 'Rejected' }
+    }.GetNewClosure() -DecisionScript {
+        param($VMName, $AccountKey, $Members, $Reason)
+        $sharedSkipState.DecisionCalls++
+        return [pscustomobject]@{ Action = 'SkipAccount'; Credential = $null; Remember = $false }
+    }.GetNewClosure()
+    Assert-Equal -Actual $sharedSkipFirst.Status -Expected 'Skipped' -Message 'the operator can skip a shared domain account'
+    $sharedSkipPeer = Resolve-GuestCredentialForTarget -VMName 'VM02.example.test' -Context $sharedSkipContext -Interactive -ValidateScript {
+        $sharedSkipState.ValidationCalls++
+        throw 'a skipped shared account must not validate a later member'
+    }.GetNewClosure() -DecisionScript {
+        $sharedSkipState.DecisionCalls++
+        throw 'a skipped shared account must not prompt a later member'
+    }.GetNewClosure()
+    Assert-Equal -Actual $sharedSkipPeer.Status -Expected 'Skipped' -Message 'a skipped shared account skips later members'
+    Assert-Equal -Actual $sharedSkipState.ValidationCalls -Expected 1 -Message 'a skipped shared account performs no later validation'
+    Assert-Equal -Actual $sharedSkipState.DecisionCalls -Expected 1 -Message 'a skipped shared account performs no later decision callback'
+
+    $script:nonInteractiveDecisionCalls = 0
+    $nonInteractive = Resolve-GuestCredentialForTarget -VMName 'VM-noninteractive' -Context (New-GuestCredentialContext -TargetNames @('VM-noninteractive') -CredentialMap @{ 'VM-noninteractive' = $oldGuestCredential }) -ValidateScript {
+        param($VMName, $Credential)
+        [pscustomobject]@{ Status = 'Invalid'; ErrorKind = 'InvalidGuestLogin'; Error = 'Rejected' }
+    } -DecisionScript { $script:nonInteractiveDecisionCalls++; throw 'non-interactive recovery must not ask' }
+    Assert-Equal -Actual $nonInteractive.Status -Expected 'Failed' -Message 'non-interactive invalid credentials fail without prompting'
+    Assert-Equal -Actual $script:nonInteractiveDecisionCalls -Expected 0 -Message 'non-interactive mode never invokes the decision callback'
+
+    $script:nonLoginDecisionCalls = 0
+    $networkError = Resolve-GuestCredentialForTarget -VMName 'VM-network' -Context (New-GuestCredentialContext -TargetNames @('VM-network') -CredentialMap @{ 'VM-network' = $oldGuestCredential }) -Interactive -ValidateScript {
+        param($VMName, $Credential)
+        [pscustomobject]@{ Status = 'Error'; ErrorKind = 'Transient'; Error = 'network failure' }
+    } -DecisionScript { $script:nonLoginDecisionCalls++; throw 'network errors must not ask for a new password' }
+    Assert-Equal -Actual $networkError.Status -Expected 'Failed' -Message 'network validation errors fail without credential recovery'
+    Assert-Equal -Actual $script:nonLoginDecisionCalls -Expected 0 -Message 'non-login validation errors never invoke the decision callback'
+
+    $permissionError = Resolve-GuestCredentialForTarget -VMName 'VM-permission' -Context (New-GuestCredentialContext -TargetNames @('VM-permission') -CredentialMap @{ 'VM-permission' = $oldGuestCredential }) -Interactive -ValidateScript {
+        param($VMName, $Credential)
+        [pscustomobject]@{ Status = 'Invalid'; ErrorKind = 'GuestPermissionDenied'; Error = 'operation denied' }
+    } -DecisionScript { throw 'permission errors must not ask for a new password' }
+    Assert-Equal -Actual $permissionError.Status -Expected 'Failed' -Message 'GuestPermissionDenied is not treated as a bad password'
+
+    $cancelContext = New-GuestCredentialContext -TargetNames @('VM-cancel') -CredentialMap @{ 'VM-cancel' = $oldGuestCredential }
+    $cancelResult = Resolve-GuestCredentialForTarget -VMName 'VM-cancel' -Context $cancelContext -Interactive -ValidateScript {
+        param($VMName, $Credential)
+        [pscustomobject]@{ Status = 'Invalid'; ErrorKind = 'InvalidGuestLogin'; Error = 'Rejected' }
+    } -DecisionScript { $null }
+    Assert-Equal -Actual $cancelResult.Status -Expected 'Aborted' -Message 'an empty or cancelled credential decision aborts recovery'
+    Assert-Equal -Actual $cancelContext.Aborted -Expected $true -Message 'an empty or cancelled decision marks the context aborted'
+    $script:cancelValidationCalls = 0
+    $afterCancel = Resolve-GuestCredentialForTarget -VMName 'VM-cancel' -Context $cancelContext -Interactive -ValidateScript {
+        $script:cancelValidationCalls++
+        [pscustomobject]@{ Status = 'Valid'; ErrorKind = $null; Error = $null }
+    } -DecisionScript { throw 'aborted context must not ask again' }
+    Assert-Equal -Actual $afterCancel.Status -Expected 'Aborted' -Message 'aborted context rejects later targets'
+    Assert-Equal -Actual $script:cancelValidationCalls -Expected 0 -Message 'aborted context does not validate later credentials'
+
+    $emptyActionResult = Resolve-GuestCredentialForTarget -VMName 'VM-empty-action' -Context (New-GuestCredentialContext -TargetNames @('VM-empty-action') -CredentialMap @{ 'VM-empty-action' = $oldGuestCredential }) -Interactive -ValidateScript {
+        param($VMName, $Credential)
+        [pscustomobject]@{ Status = 'Invalid'; ErrorKind = 'InvalidGuestLogin'; Error = 'Rejected' }
+    } -DecisionScript { [pscustomobject]@{ Action = ''; Credential = $null; Remember = $false } }
+    Assert-Equal -Actual $emptyActionResult.Status -Expected 'Aborted' -Message 'an empty decision action is treated as cancellation'
+
+    $saveCredential = New-TestCredential 'SAVED\adm'
+    $saveContext = New-GuestCredentialContext -TargetNames @('VM-save') -CredentialMap @{ 'VM-save' = $oldGuestCredential }
+    $saveWarnings = @()
+    $saveDecisionScript = {
+        param($VMName, $AccountKey, $Members, $Reason)
+        [pscustomobject]@{ Action = 'Retry'; Credential = $saveCredential; Remember = $true }
+    }.GetNewClosure()
+    $saveResult = Resolve-GuestCredentialForTarget -VMName 'VM-save' -Context $saveContext -Interactive -ValidateScript {
+        param($VMName, $Credential)
+        if ($Credential.UserName -eq 'OLD\adm') {
+            [pscustomobject]@{ Status = 'Invalid'; ErrorKind = 'InvalidGuestLogin'; Error = 'Rejected' }
+        }
+        else {
+            [pscustomobject]@{ Status = 'Valid'; ErrorKind = $null; Error = $null }
+        }
+    } -DecisionScript $saveDecisionScript -OnValidatedScript {
+        throw 'synthetic credential store failure'
+    } -WarningVariable saveWarnings
+    Assert-Equal -Actual $saveResult.Status -Expected 'Ready' -Message 'a save callback failure does not discard a valid replacement'
+    Assert-Equal -Actual $saveContext.CredentialMap['VM-save'].UserName -Expected 'SAVED\adm' -Message 'a save callback failure leaves the valid credential in memory'
+    Assert-Equal -Actual ($saveWarnings.Count -gt 0) -Expected $true -Message 'a save callback failure emits a warning'
+
+    # The real GuestOps adapter must resolve every manager, including AuthManager, from
+    # the Client attached to this VM view. A global/default client is deliberately absent.
+    $processManagerB = [pscustomobject]@{ Name = 'process-B' }
+    $fileManagerB = [pscustomobject]@{ Name = 'file-B' }
+    $authManagerB = [pscustomobject]@{ Name = 'auth-B'; Calls = @(); Exception = $null }
+    $guestOpsManagerB = [pscustomobject]@{ ProcessManager = 'process-ref-B'; FileManager = 'file-ref-B'; AuthManager = 'auth-ref-B' }
+    $clientB = [pscustomobject]@{ ServiceContent = [pscustomobject]@{ GuestOperationsManager = 'guest-ops-ref-B' } }
+    $clientB | Add-Member -MemberType ScriptMethod -Name GetView -Value {
+        param($ManagedObjectReference, $PropertySpec)
+        switch ([string]$ManagedObjectReference) {
+            'guest-ops-ref-B' { return $guestOpsManagerB }
+            'process-ref-B' { return $processManagerB }
+            'file-ref-B' { return $fileManagerB }
+            'auth-ref-B' { return $authManagerB }
+            default { throw ('unexpected global or foreign reference: ' + $ManagedObjectReference) }
+        }
+    }.GetNewClosure()
+    $vmViewB = [pscustomobject]@{ Client = $clientB; MoRef = 'vm-ref-B' }
+    $managerResultB = Get-GuestOpsManagers -VMView $vmViewB
+    Assert-Equal -Actual $managerResultB.ProcessManager.Name -Expected 'process-B' -Message 'process manager comes from the VM client'
+    Assert-Equal -Actual $managerResultB.FileManager.Name -Expected 'file-B' -Message 'file manager comes from the VM client'
+    Assert-Equal -Actual $managerResultB.AuthManager.Name -Expected 'auth-B' -Message 'auth manager comes from the VM client'
+
+    $savedGuestAuthentication = (Get-Item Function:\New-GuestAuthentication).ScriptBlock
+    function New-GuestAuthentication {
+        param([pscredential]$Credential)
+        [pscustomobject]@{ UserName = $Credential.UserName }
+    }
+    try {
+        $authManagerB | Add-Member -MemberType ScriptMethod -Name ValidateCredentialsInGuest -Value {
+            param($MoRef, $Auth)
+            $this.Calls += [pscustomobject]@{ MoRef = $MoRef; UserName = $Auth.UserName }
+            if ($null -ne $this.Exception) {
+                throw $this.Exception
+            }
+        } -Force
+        $validCredentialResult = Test-GuestCredential -VMView $vmViewB -Managers $managerResultB -Credential (New-TestCredential 'VALID\adm')
+        Assert-Equal -Actual $validCredentialResult.Status -Expected 'Valid' -Message 'AuthManager validation reports valid credentials'
+        Assert-Equal -Actual $authManagerB.Calls[0].MoRef -Expected 'vm-ref-B' -Message 'credential validation uses the target VM reference'
+        Assert-Equal -Actual $authManagerB.Calls[0].UserName -Expected 'VALID\adm' -Message 'credential validation passes the supplied username'
+
+        $invalidException = New-Object System.Exception('synthetic invalid login')
+        $invalidException.PSTypeNames.Insert(0, 'VMware.Vim.InvalidGuestLogin')
+        $authManagerB.Exception = $invalidException
+        $invalidCredentialResult = Test-GuestCredential -VMView $vmViewB -Managers $managerResultB -Credential (New-TestCredential 'BAD\adm')
+        Assert-Equal -Actual $invalidCredentialResult.Status -Expected 'Invalid' -Message 'InvalidGuestLogin is a recoverable credential result'
+        Assert-Equal -Actual $invalidCredentialResult.ErrorKind -Expected 'InvalidGuestLogin' -Message 'InvalidGuestLogin remains distinct from other errors'
+
+        $permissionException = New-Object System.Exception('synthetic operation denial')
+        $permissionException.PSTypeNames.Insert(0, 'VMware.Vim.GuestPermissionDenied')
+        $authManagerB.Exception = $permissionException
+        $permissionCredentialResult = Test-GuestCredential -VMView $vmViewB -Managers $managerResultB -Credential (New-TestCredential 'PERMISSION\adm')
+        Assert-Equal -Actual $permissionCredentialResult.Status -Expected 'Error' -Message 'GuestPermissionDenied is not a credential rejection'
+        Assert-Equal -Actual $permissionCredentialResult.ErrorKind -Expected 'GuestPermissionDenied' -Message 'operation permission errors remain classified separately'
+    }
+    finally {
+        Set-Item Function:\New-GuestAuthentication -Value $savedGuestAuthentication
+    }
+}
 
 $launcherPath = Join-Path $repoRoot 'Start-PatchingGuestOps.ps1'
 $launcherTokens = $null

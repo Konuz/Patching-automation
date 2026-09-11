@@ -93,10 +93,15 @@ function Get-GuestOpsManagers {
         throw 'Unable to resolve Guest Operations managers from the VM client.'
     }
     $guestOpsManager = Get-ViewFromVMClient -VMView $VMView -ManagedObjectReference $guestOperationsManager
+    $authManagerReference = Get-ObjectPropertyValue -InputObject $guestOpsManager -Path @('AuthManager')
+    if ($null -eq $authManagerReference) {
+        throw 'Unable to resolve Guest Operations authentication manager from the VM client.'
+    }
 
     return [pscustomobject]@{
         ProcessManager = Get-ViewFromVMClient -VMView $VMView -ManagedObjectReference $guestOpsManager.ProcessManager
         FileManager = Get-ViewFromVMClient -VMView $VMView -ManagedObjectReference $guestOpsManager.FileManager
+        AuthManager = Get-ViewFromVMClient -VMView $VMView -ManagedObjectReference $authManagerReference
     }
 }
 
