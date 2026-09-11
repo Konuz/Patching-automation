@@ -56,6 +56,28 @@ function New-TestCredential {
     )
 }
 
+# Transfer timeout validation must happen during parameter binding, before any curl call.
+$script:invalidTransferCurlCalls = 0
+function Invoke-Curl {
+    param([string]$CurlPath, [string[]]$Arguments, [string]$Description)
+    $script:invalidTransferCurlCalls++
+}
+
+foreach ($transferFunctionName in @('Send-GuestFile', 'Receive-GuestFile')) {
+    foreach ($invalidTimeoutSeconds in @(0, -1)) {
+        $bindingError = $false
+        try {
+            & $transferFunctionName -FileManager $null -VMView $null -GuestAuth $null -HostName 'esxi.invalid' -CurlPath 'curl.exe' -LocalPath 'unused' -GuestPath 'unused' -TimeoutSeconds $invalidTimeoutSeconds
+        }
+        catch {
+            $bindingError = $_.Exception.Message -like '*TimeoutSeconds*' -and $_.Exception.Message -match '(?i)(range|minimum)'
+        }
+
+        Assert-Equal -Actual $bindingError -Expected $true -Message ('{0} rejects TimeoutSeconds={1} during binding' -f $transferFunctionName, $invalidTimeoutSeconds)
+    }
+}
+Assert-Equal -Actual $script:invalidTransferCurlCalls -Expected 0 -Message 'invalid transfer timeout never invokes curl'
+
 $argumentText = New-GuestAgentArguments -GuestAgentPath 'C:\ProgramData\PatchingGuestOps\Run-LocalPatch.ps1' -GuestWorkingDirectory 'C:\ProgramData\PatchingGuestOps' -MaxUpdates 2 -SelectedUpdateKeys @(
     '11111111-1111-1111-1111-111111111111|205',
     '22222222-2222-2222-2222-222222222222|17'

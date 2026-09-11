@@ -323,6 +323,10 @@ if ($existingScripts.ContainsKey($guestOpsLibPath)) {
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'C:\Windows\System32\shutdown.exe'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'PatchingGuestOps reboot after updates'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Connect-VIServersWithCredentialMap'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle '[ValidateRange(1,2147483647)][int]$TimeoutSeconds = 300'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle '--max-time'
+    Assert-TextDoesNotMatch -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Pattern '(?i)(?<![A-Za-z])(?:-k|--insecure)(?![A-Za-z])' -Reason 'GuestOps transfers must verify TLS certificates'
+    Assert-TextDoesNotMatch -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Pattern '(?i)Get-View\s+ServiceInstance' -Reason 'GuestOps managers must come from the VM client'
 }
 
 if ($existingScripts.ContainsKey($vmTargetLibPath)) {
@@ -366,6 +370,7 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'GuestOpsLib.ps1'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'VMTargetLib.ps1'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$JobInput.GuestOpsLibPath'
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '-Managers $null'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'PlanOnly'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SkipConfirmation'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SelectedUpdateKeys'

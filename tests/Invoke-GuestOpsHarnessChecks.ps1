@@ -63,6 +63,7 @@ if (-not $hasVimTypes) {
 
 $script:guestState = @{}
 $script:curlCalls = @()
+$script:capturedCurlArguments = @()
 
 function New-FakeGuest {
     param(
@@ -90,6 +91,7 @@ function New-FakeGuest {
         RunId = ''
         AgentSpec = $null
         UploadedPaths = @()
+        Client = $null
     }
 }
 
@@ -163,6 +165,7 @@ function New-FakeVMView {
     return [pscustomobject]@{
         MoRef = ('vm-{0}' -f $VMName)
         Guest = [pscustomobject]@{ ToolsRunningStatus = 'guestToolsRunning' }
+        Client = $script:guestState[$VMName].Client
     }
 }
 
@@ -199,6 +202,7 @@ function Invoke-Curl {
         [string]$Description
     )
 
+    $script:capturedCurlArguments = @($Arguments)
     $script:curlCalls += [pscustomobject]@{ Arguments = @($Arguments); Description = $Description }
 
     $outputIndex = [array]::IndexOf(@($Arguments), '--output')
@@ -221,6 +225,31 @@ function Invoke-Curl {
     }
 }
 
+function New-ClientBoundFakeClient {
+    param([string]$VMName, $Managers)
+
+    $guestOperationsReference = 'guest-ops-{0}' -f $VMName
+    $processReference = 'process-manager-{0}' -f $VMName
+    $fileReference = 'file-manager-{0}' -f $VMName
+    $guestOperationsView = [pscustomobject]@{
+        ProcessManager = $processReference
+        FileManager = $fileReference
+    }
+    $viewMap = @{
+        $guestOperationsReference = $guestOperationsView
+        $processReference = $Managers.ProcessManager
+        $fileReference = $Managers.FileManager
+    }
+    $client = New-Object psobject
+    $client | Add-Member -MemberType NoteProperty -Name ServiceContent -Value ([pscustomobject]@{ GuestOperationsManager = $guestOperationsReference })
+    $client | Add-Member -MemberType NoteProperty -Name ViewMap -Value $viewMap
+    $client | Add-Member -MemberType ScriptMethod -Name GetView -Value {
+        param($Reference, $Session)
+        return $this.ViewMap[[string]$Reference]
+    }
+    return $client
+}
+
 function New-HarnessWorkspace {
     $path = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-harness-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Force -Path $path | Out-Null
@@ -230,6 +259,134 @@ function New-HarnessWorkspace {
 $agentPath = Join-Path $Root 'guest\Run-LocalPatch.ps1'
 $identityHelperPath = Join-Path $Root 'guest\UpdateIdentity.ps1'
 $guestWorkingDirectory = 'C:\ProgramData\PatchingGuestOps'
+$harnessCredential = New-Object System.Management.Automation.PSCredential('CONTOSO\svc', (ConvertTo-SecureString 'password' -AsPlainText -Force))
+
+# --- verified TLS and transfer deadlines ---------------------------------------------
+
+$script:guestState = @{}
+$script:curlCalls = @()
+$script:capturedCurlArguments = @()
+$transferWorkspace = New-HarnessWorkspace
+try {
+    New-FakeGuest -VMName 'VM-transfer'
+    $transferManagers = New-FakeManagers -VMName 'VM-transfer'
+    $transferLocalPath = Join-Path $transferWorkspace 'upload.txt'
+    Set-Content -LiteralPath $transferLocalPath -Value 'transfer fixture' -Encoding UTF8
+
+    Send-GuestFile -FileManager $transferManagers.FileManager -VMView (New-FakeVMView -VMName 'VM-transfer') -GuestAuth $null -HostName 'esxi-fake.invalid' -CurlPath 'curl.exe' -LocalPath $transferLocalPath -GuestPath 'C:\guest\upload.txt'
+    Assert-Equal -Actual ($script:capturedCurlArguments -contains '-k') -Expected $false -Message 'send transfer keeps TLS verification enabled'
+    Assert-Equal -Actual ($script:capturedCurlArguments -contains '--insecure') -Expected $false -Message 'send transfer has no alternate insecure flag'
+    $limitIndex = [array]::IndexOf($script:capturedCurlArguments, '--max-time')
+    Assert-Equal -Actual ($limitIndex -ge 0) -Expected $true -Message 'send transfer always has a deadline'
+    if ($limitIndex -ge 0) {
+        Assert-Equal -Actual $script:capturedCurlArguments[$limitIndex + 1] -Expected '300' -Message 'send transfer uses the default budget'
+    }
+
+    $receivedPath = Join-Path $transferWorkspace 'received.json'
+    Receive-GuestFile -FileManager $transferManagers.FileManager -VMView (New-FakeVMView -VMName 'VM-transfer') -GuestAuth $null -HostName 'esxi-fake.invalid' -CurlPath 'curl.exe' -GuestPath 'C:\guest\status.json' -LocalPath $receivedPath
+    Assert-Equal -Actual ($script:capturedCurlArguments -contains '-k') -Expected $false -Message 'receive transfer keeps TLS verification enabled'
+    Assert-Equal -Actual ($script:capturedCurlArguments -contains '--insecure') -Expected $false -Message 'receive transfer has no alternate insecure flag'
+    $limitIndex = [array]::IndexOf($script:capturedCurlArguments, '--max-time')
+    Assert-Equal -Actual ($limitIndex -ge 0) -Expected $true -Message 'receive transfer always has a deadline'
+    if ($limitIndex -ge 0) {
+        Assert-Equal -Actual $script:capturedCurlArguments[$limitIndex + 1] -Expected '300' -Message 'receive transfer uses the default budget'
+    }
+}
+finally {
+    Remove-Item -LiteralPath $transferWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# A failed agent upload must abort before Start-GuestAgent is reached, with no insecure retry.
+$failureWorkspace = New-HarnessWorkspace
+$originalInvokeCurl = (Get-Item Function:\Invoke-Curl).ScriptBlock
+$originalStartGuestAgent = (Get-Item Function:\Start-GuestAgent).ScriptBlock
+$script:startGuestAgentCalls = 0
+$script:curlFailureCalls = 0
+function Invoke-Curl {
+    param([string]$CurlPath, [string[]]$Arguments, [string]$Description)
+    $script:curlFailureCalls++
+    throw 'TLS certificate validation failed; transfer aborted.'
+}
+function Start-GuestAgent {
+    param(
+        $ProcessManager, $VMView, $GuestAuth, [string]$GuestAgentPath, [string]$GuestWorkingDirectory,
+        [int]$MaxUpdates, [string[]]$SelectedUpdateKeys = @(), [string]$SelectionPath,
+        [string]$RunId, [switch]$SearchOnly
+    )
+    $script:startGuestAgentCalls++
+    return & $script:originalStartGuestAgent @PSBoundParameters
+}
+try {
+    $script:guestState = @{}
+    New-FakeGuest -VMName 'VM-upload-fails'
+    $cycleError = ''
+    try {
+        Start-VMAgentCycle -VMName 'VM-upload-fails' -Managers (New-FakeManagers -VMName 'VM-upload-fails') -GuestAuth $null -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -VMOutputDirectory (Join-Path $failureWorkspace 'VM-upload-fails') -MaxUpdates 1 | Out-Null
+    }
+    catch {
+        $cycleError = $_.Exception.Message
+    }
+    Assert-Contains -Text $cycleError -Needle 'TLS certificate validation failed' -Message 'agent upload certificate failure aborts the cycle'
+    Assert-Equal -Actual $script:curlFailureCalls -Expected 1 -Message 'agent upload certificate failure is not retried insecurely'
+    Assert-Equal -Actual $script:startGuestAgentCalls -Expected 0 -Message 'Start-GuestAgent is not called after agent upload failure'
+}
+finally {
+    Set-Item Function:\Invoke-Curl -Value $originalInvokeCurl
+    Set-Item Function:\Start-GuestAgent -Value $originalStartGuestAgent
+    Remove-Item -LiteralPath $failureWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# The fleet must not reuse a manager obtained from another vCenter client. Extract the
+# production fleet adapter because the orchestrator has top-level flow and exits when run.
+$orchestratorTokens = $null
+$orchestratorParseErrors = $null
+$orchestratorAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $Root 'scripts\Invoke-GuestOpsPatchValidation.ps1'), [ref]$orchestratorTokens, [ref]$orchestratorParseErrors)
+$fleetDefinition = @($orchestratorAst.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $Node.Name -eq 'Invoke-GuestAgentFleet' }, $true))[0]
+. ([scriptblock]::Create($fleetDefinition.Extent.Text))
+
+# --- VM client isolation -------------------------------------------------------------
+
+$isolationWorkspace = New-HarnessWorkspace
+$previousGetViewFunction = Get-Item Function:\Get-View -ErrorAction SilentlyContinue
+function Get-View {
+    throw 'global ServiceInstance lookup is not allowed in the fleet path.'
+}
+try {
+    $script:guestState = @{}
+    $script:curlCalls = @()
+    $script:capturedCurlArguments = @()
+    New-FakeGuest -VMName 'VM-A' -StatusJson '{"outcome":"SearchOnly","finishedAt":"2026-08-22T10:00:00.0000000Z"}'
+    New-FakeGuest -VMName 'VM-B' -StatusJson '{"outcome":"SearchOnly","finishedAt":"2026-08-22T10:00:00.0000000Z"}'
+    $managerA = New-FakeManagers -VMName 'VM-A'
+    $managerB = New-FakeManagers -VMName 'VM-B'
+    $script:guestState['VM-A'].Client = New-ClientBoundFakeClient -VMName 'VM-A' -Managers $managerA
+    $script:guestState['VM-B'].Client = New-ClientBoundFakeClient -VMName 'VM-B' -Managers $managerB
+    $fleetItem = [pscustomobject]@{
+        Sequence = 1
+        VMName = 'VM-B'
+        VMOutputDirectory = (Join-Path $isolationWorkspace 'VM-B')
+        MaxUpdates = 1
+        LocalSelectionPath = ''
+        GuestSelectionPath = ''
+        SearchOnly = $true
+    }
+    $isolationResults = @(Invoke-GuestAgentFleet -FleetItems @($fleetItem) -Managers $managerA -GuestCredentialMap @{ 'VM-B' = $harnessCredential } -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -TimeoutSeconds 120 -PollSeconds 1 -MaxInFlight 1)
+    Assert-Equal -Actual $isolationResults.Count -Expected 1 -Message 'fleet client isolation returns the VM B result'
+    Assert-Equal -Actual (@($isolationResults | Where-Object { $_.Error }).Count) -Expected 0 -Message 'fleet client isolation does not fail VM B'
+    Assert-Equal -Actual $script:guestState['VM-A'].StartProgramCallCount -Expected 0 -Message 'fleet client isolation never starts VM A'
+    Assert-Equal -Actual $script:guestState['VM-B'].StartProgramCallCount -Expected 2 -Message 'fleet client isolation starts VM B through client B'
+    Assert-Equal -Actual $script:guestState['VM-A'].ListProcessCallCount -Expected 0 -Message 'fleet client isolation never polls VM A manager'
+    Assert-Equal -Actual ($script:guestState['VM-B'].ListProcessCallCount -gt 0) -Expected $true -Message 'fleet client isolation polls VM B manager'
+}
+finally {
+    if ($null -eq $previousGetViewFunction) {
+        Remove-Item Function:\Get-View -ErrorAction SilentlyContinue
+    }
+    else {
+        Set-Item Function:\Get-View -Value $previousGetViewFunction.ScriptBlock
+    }
+    Remove-Item -LiteralPath $isolationWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 function New-HarnessFleetScripts {
     param([string]$Workspace, [int]$TransferTimeoutSeconds = 300)
@@ -259,8 +416,6 @@ function New-HarnessFleetScripts {
         }
     }
 }
-
-$harnessCredential = New-Object System.Management.Automation.PSCredential('CONTOSO\svc', (ConvertTo-SecureString 'password' -AsPlainText -Force))
 
 function New-HarnessItem {
     param([int]$Sequence, [string]$VMName, [bool]$SearchOnly = $true)

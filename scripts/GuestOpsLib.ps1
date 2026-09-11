@@ -82,16 +82,17 @@ function Get-ViewFromVMClient {
 function Get-GuestOpsManagers {
     param($VMView)
 
+    if ($null -eq $VMView) {
+        throw 'VMView is required to resolve Guest Operations managers.'
+    }
+
     $viewClient = Get-ObjectPropertyValue -InputObject $VMView -Path @('Client')
     $serviceContent = Get-ObjectPropertyValue -InputObject $viewClient -Path @('ServiceContent')
     $guestOperationsManager = Get-ObjectPropertyValue -InputObject $serviceContent -Path @('GuestOperationsManager')
-    if ($null -ne $guestOperationsManager) {
-        $guestOpsManager = Get-ViewFromVMClient -VMView $VMView -ManagedObjectReference $guestOperationsManager
+    if ($null -eq $viewClient -or $null -eq $serviceContent -or $null -eq $guestOperationsManager) {
+        throw 'Unable to resolve Guest Operations managers from the VM client.'
     }
-    else {
-        $serviceInstance = Get-View ServiceInstance
-        $guestOpsManager = Get-View $serviceInstance.Content.GuestOperationsManager
-    }
+    $guestOpsManager = Get-ViewFromVMClient -VMView $VMView -ManagedObjectReference $guestOperationsManager
 
     return [pscustomobject]@{
         ProcessManager = Get-ViewFromVMClient -VMView $VMView -ManagedObjectReference $guestOpsManager.ProcessManager
@@ -332,7 +333,7 @@ function Send-GuestFile {
         [string]$CurlPath,
         [string]$LocalPath,
         [string]$GuestPath,
-        [int]$TimeoutSeconds = 0
+        [ValidateRange(1,2147483647)][int]$TimeoutSeconds = 300
     )
 
     $file = Get-Item -LiteralPath $LocalPath
@@ -341,11 +342,11 @@ function Send-GuestFile {
     $resolvedUrl = Resolve-GuestFileTransferUrl -Url $url -HostName $HostName
 
     $curlArguments = @(
-        # Phase 0b validates GuestOps ESXi transfer URLs; -k is not the target production TLS pattern.
-        '-k',
         '--silent',
         '--show-error',
         '--fail',
+        '--max-time',
+        [string]$TimeoutSeconds,
         '--request',
         'PUT',
         '--upload-file',
@@ -367,7 +368,7 @@ function Receive-GuestFile {
         [string]$CurlPath,
         [string]$GuestPath,
         [string]$LocalPath,
-        [int]$TimeoutSeconds = 0
+        [ValidateRange(1,2147483647)][int]$TimeoutSeconds = 300
     )
 
     $localParent = Split-Path -Parent $LocalPath
@@ -379,11 +380,11 @@ function Receive-GuestFile {
     $resolvedUrl = Resolve-GuestFileTransferUrl -Url $transferInfo.Url -HostName $HostName
 
     $curlArguments = @(
-        # Phase 0b validates GuestOps ESXi transfer URLs; -k is not the target production TLS pattern.
-        '-k',
         '--silent',
         '--show-error',
         '--fail',
+        '--max-time',
+        [string]$TimeoutSeconds,
         '--output',
         $LocalPath,
         $resolvedUrl

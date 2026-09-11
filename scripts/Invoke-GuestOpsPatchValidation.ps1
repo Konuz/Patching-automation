@@ -154,7 +154,7 @@ function Invoke-GuestAgentFleet {
         -StartScript {
             param($Item)
             $itemAuth = New-GuestAuthentication -Credential $GuestCredentialMap[[string]$Item.VMName]
-            return Start-VMAgentCycle -VMName $Item.VMName -Managers $Managers -GuestAuth $itemAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $Item.VMOutputDirectory -MaxUpdates $Item.MaxUpdates -LocalSelectionPath $Item.LocalSelectionPath -SelectionPath $Item.GuestSelectionPath -SearchOnly:([bool]$Item.SearchOnly)
+            return Start-VMAgentCycle -VMName $Item.VMName -Managers $null -GuestAuth $itemAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $Item.VMOutputDirectory -MaxUpdates $Item.MaxUpdates -LocalSelectionPath $Item.LocalSelectionPath -SelectionPath $Item.GuestSelectionPath -SearchOnly:([bool]$Item.SearchOnly)
         } `
         -PollScript {
             param($Handle)
@@ -1251,7 +1251,7 @@ try {
     $connectResult = Connect-VIServersWithCredentialMap -VIServers $resolvedVIServers -CredentialMap $viserverCredentialMap -CredentialPromptScript $credentialPromptScript -RetryOnFailure:$retryVIServerLogin -ReuseExisting
     $connections = @($connectResult.OpenedConnections)
 
-    $managers = if ($resolvedVIServers.Count -eq 1) { Get-GuestOpsManagers } else { $null }
+    $managers = $null
 
     if (-not [string]::IsNullOrWhiteSpace($PatchPlanPath)) {
         if (-not (Test-Path -LiteralPath $PatchPlanPath -PathType Leaf)) {
