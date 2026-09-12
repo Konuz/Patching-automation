@@ -137,12 +137,31 @@ function Get-DefaultUpdateSelection {
         [string]$Title,
         [string[]]$Categories = @(),
         [string]$MsrcSeverity,
-        [string]$UpdateType
+        [string]$UpdateType,
+        [string[]]$KbArticleIds = @()
     )
 
     $text = ('{0} {1}' -f $Title, (@($Categories) -join ' '))
 
     # Exclusions first — these veto selection regardless of MSRC severity.
+    # Defender definitions ship several times a day and Defender updates them through its own
+    # channel, so preselecting them means every maintenance window installs something that was
+    # already handled continuously - and each new revision would keep a run from reaching Green.
+    # They stay visible and installable; this decides only what is ticked. KB2267602 is the
+    # stable identity, because the title is localised: matching the title alone would silently
+    # stop working on a non-English server. The category is deliberately not consulted - the
+    # agent records only the localised category name, not its GUID, so it is no more durable
+    # than the title. This covers Defender Antivirus only; SCEP and legacy Windows Defender
+    # definitions are still preselected.
+    # Every id must be the definition KB, not merely one of them: a package that listed
+    # 2267602 alongside its own KB would otherwise be dropped from the default selection - and
+    # because Green counts only preselected groups, it would stop blocking Green as well.
+    $definitionKbMatches = @($KbArticleIds | Where-Object { ([string]$_).Trim() -match '^(?i:KB)?2267602$' }).Count
+    $isDefenderDefinition = ($definitionKbMatches -gt 0) -and ($definitionKbMatches -eq @($KbArticleIds).Count)
+    if ($isDefenderDefinition -or ($Title -match '(?i)security intelligence update' -and $Title -match '(?i)defender')) {
+        return $false
+    }
+
     if ([string]$UpdateType -match '(?i)^(driver|2)$') {
         return $false
     }
@@ -302,7 +321,7 @@ function New-UpdateGroupRecords {
         # patchable VM. A group whose sole applicable VM is a Failover Cluster (excluded
         # from patchableVmNames) would otherwise show a checked box with "Patchable: 0 VM"
         # and produce a default plan that installs on nothing.
-        $selectedByDefault = ([bool](Get-DefaultUpdateSelection -Title ([string]$group.title) -Categories $group.categories -MsrcSeverity ([string]$group.msrcSeverity) -UpdateType ([string]$group.updateType))) -and ($patchableVmNames.Count -gt 0)
+        $selectedByDefault = ([bool](Get-DefaultUpdateSelection -Title ([string]$group.title) -Categories $group.categories -MsrcSeverity ([string]$group.msrcSeverity) -UpdateType ([string]$group.updateType) -KbArticleIds @($group.kbArticleIds))) -and ($patchableVmNames.Count -gt 0)
 
         $records += [pscustomobject]@{
             identityKey = $group.identityKey
