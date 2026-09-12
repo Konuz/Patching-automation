@@ -47,6 +47,15 @@ $store = $credentialResult.Credentials
 $previouslyStoredKeys = @($store.Keys)
 $rememberedKeys = @()
 
+# $store is what the run uses; $persistState.Persisted is what belongs on disk. They are
+# separate because they genuinely diverge: a replacement entered with Remember unticked must
+# serve the run while the file keeps the password that is already there.
+$persistedSeed = @{}
+foreach ($storedKey in @($previouslyStoredKeys)) {
+    $persistedSeed[$storedKey] = $store[$storedKey]
+}
+$persistState = New-CredentialPersistState -Path $credentialsPath -WorkingCredentials $store -PersistedCredentials $persistedSeed -PassThroughEntries $credentialResult.UnreadableEntries
+
 # Deduplicate before deriving credential groups. The console launcher dedupes
 # case-insensitively on its way in, but the GUI computes groups earlier, so without this
 # a list holding both OldBox and oldbox would ask for the same machine's password twice.
@@ -70,6 +79,7 @@ foreach ($missing in $missingKeys) {
     }
 
     $store[$missing.StoreKey] = $entered.Credential
+    Set-CredentialRememberPreference -State $persistState -StoreKey $missing.StoreKey -Remember ([bool]$entered.Remember)
     if ($entered.Remember) {
         $rememberedKeys += $missing.StoreKey
     }
@@ -97,17 +107,28 @@ catch {
     Write-Warning ('Settings could not be saved ({0}); continuing without persisting them.' -f $_.Exception.Message)
 }
 
-# Only what was already saved, plus what the operator explicitly agreed to remember. A
-# credential entered with Remember unticked stays in memory for this run and never
-# reaches the disk.
-if ($rememberedKeys.Count -gt 0) {
-    $credentialsToPersist = @{}
-    foreach ($storeKey in (@($previouslyStoredKeys) + @($rememberedKeys))) {
-        $credentialsToPersist[$storeKey] = $store[$storeKey]
-    }
+# The state object is handed to the callbacks explicitly. A function that assigns to an
+# enclosing script variable does not update it in PowerShell 5.1, and that failure is silent:
+# the callbacks are called from inside a generic catch, so a broken save just warns.
+function Register-ValidatedGuiCredential {
+    param(
+        [string]$StoreKey,
+        [pscredential]$Credential,
+        $Remember
+    )
 
     try {
-        Write-CredentialStore -Path $credentialsPath -Credentials $credentialsToPersist
+        $null = Register-ValidatedCredential -State $persistState -StoreKey $StoreKey -Credential $Credential -Remember $Remember
+    }
+    catch {
+        Write-Warning ('Credentials could not be saved ({0}); the corrected credential remains available for this run.' -f $_.Exception.Message)
+    }
+}
+
+# Only what the operator explicitly agreed to remember reaches the disk before the run starts.
+if ($rememberedKeys.Count -gt 0) {
+    try {
+        Save-CredentialPersistState -State $persistState
     }
     catch {
         Write-Warning ('Credentials could not be saved ({0}); continuing without persisting them.' -f $_.Exception.Message)
@@ -138,6 +159,35 @@ $launcherParams = @{
             param([string]$Message)
             $entered = Show-CredentialDialog -Title 'PatchingGuestOps credentials' -Message $Message
             if ($null -eq $entered) { $null } else { $entered.Credential }
+        }
+        RecoverGuestCredential = {
+            param($VMName, $AccountKey, $Members, $Reason)
+            $message = 'The guest {0} rejected the credentials for {1}: {2}' -f $VMName, $AccountKey, $Reason
+            Show-GuestCredentialRecoveryDialog -Message $message -Members @($Members) -AllowSkip
+        }
+        # The resolver reports the account key it grouped by ("domain:contoso.com"), which is
+        # the store key without its scope. Prefixing it here keeps guest replacements on the
+        # existing group entry instead of scattering per-VM copies of the same password.
+        CredentialValidated = {
+            param($AccountKey, $Members, $Credential, $Remember)
+            Register-ValidatedGuiCredential -StoreKey ('guest:{0}' -f $AccountKey) -Credential $Credential -Remember $Remember
+        }
+        RecoverVIServerCredential = {
+            param($Server, $Message)
+            Show-GuestCredentialRecoveryDialog -Message $Message -Members @($Server)
+        }
+
+        # One vCenter's correction is written to its own target key, never to the group entry
+        # the other servers behind that DNS suffix still rely on.
+        VIServerCredentialValidated = {
+            param($Server, $Credential, $Remember)
+            # Guard before deriving the key: an empty target name would still produce a
+            # non-blank store key and write a credential under nobody.
+            if ([string]::IsNullOrWhiteSpace([string]$Server)) {
+                return
+            }
+
+            Register-ValidatedGuiCredential -StoreKey (Get-TargetCredentialStoreKey -Scope 'vcenter' -TargetName $Server) -Credential $Credential -Remember $Remember
         }
     }
 }

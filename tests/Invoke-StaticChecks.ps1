@@ -630,6 +630,22 @@ foreach ($guiRelativePath in @($settingsStorePath, $guiPromptsPath, $guiLauncher
     }
 }
 
+# A corrected vCenter password belongs to the one server that rejected it. Writing it to the
+# group key would hand every other server behind that DNS suffix a credential nobody validated
+# against them, so the GUI must reach the store through Get-TargetCredentialStoreKey. Scoped to
+# the call itself rather than the whole file, because the group key is still correct elsewhere.
+if ($existingScripts.ContainsKey($guiLauncherPath)) {
+    $guiLauncherAst = Get-ScriptAst -RelativePath $guiLauncherPath -Path $existingScripts[$guiLauncherPath]
+    $targetKeyCalls = @($guiLauncherAst.FindAll({ param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+        ([string]$node.GetCommandName()) -eq 'Get-TargetCredentialStoreKey'
+    }, $true))
+
+    if ($targetKeyCalls.Count -eq 0) {
+        $failures += ('{0} never calls Get-TargetCredentialStoreKey, so a corrected vCenter password would overwrite the shared group entry' -f $guiLauncherPath)
+    }
+}
+
 if ($failures.Count -gt 0) {
     Write-Host 'Static checks failed:'
     foreach ($failure in $failures) {

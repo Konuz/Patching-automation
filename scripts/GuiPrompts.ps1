@@ -94,6 +94,86 @@ function Show-CredentialDialog {
     }
 }
 
+# The recovery decision, not just a credential: the operator has to be able to say "skip this
+# account" or "stop" without being forced to invent a password. Returns the same contract the
+# console prompt does (scripts/CredentialRecovery.ps1), so the resolver cannot tell them apart.
+function Show-GuestCredentialRecoveryDialog {
+    param(
+        [string]$Message,
+        [string[]]$Members,
+        # A vCenter has no account to skip: there is no way to run a patch round against a
+        # server nobody can log in to, so that caller hides the button rather than offering
+        # a choice it would silently turn into a full stop.
+        [switch]$AllowSkip
+    )
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'PatchingGuestOps credentials rejected'
+    $form.Width = 560
+    $form.Height = 250
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.ShowInTaskbar = $true
+
+    $prompt = New-GuiLabel -Text $Message -Top 15
+    $prompt.Width = 520
+    $prompt.Height = 40
+
+    $memberText = 'This account is used for: {0}' -f (@($Members) -join ', ')
+    $memberLabel = New-GuiLabel -Text $memberText -Top 60
+    $memberLabel.Width = 520
+    $memberLabel.Height = 50
+
+    $retry = New-Object System.Windows.Forms.Button
+    $retry.Text = 'Enter again'
+    $retry.Left = 15
+    $retry.Top = 160
+    $retry.Width = 150
+    $retry.DialogResult = [System.Windows.Forms.DialogResult]::Retry
+
+    $skip = New-Object System.Windows.Forms.Button
+    $skip.Text = 'Skip this account for this run'
+    $skip.Left = 180
+    $skip.Top = 160
+    $skip.Width = 220
+    $skip.DialogResult = [System.Windows.Forms.DialogResult]::Ignore
+
+    $abort = New-Object System.Windows.Forms.Button
+    $abort.Text = 'Stop'
+    $abort.Left = 415
+    $abort.Top = 160
+    $abort.Width = 110
+    $abort.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+
+    $skip.Visible = [bool]$AllowSkip
+    $skip.Enabled = [bool]$AllowSkip
+
+    $form.Controls.AddRange(@($prompt, $memberLabel, $retry, $skip, $abort))
+    $form.AcceptButton = $retry
+    $form.CancelButton = $abort
+
+    $form.Add_Shown({ $form.Activate() })
+    $result = $form.ShowDialog()
+    $form.Dispose()
+
+    if ($result -eq [System.Windows.Forms.DialogResult]::Ignore) {
+        return [pscustomobject]@{ Action = 'SkipAccount'; Credential = $null; Remember = $false }
+    }
+
+    if ($result -ne [System.Windows.Forms.DialogResult]::Retry) {
+        return [pscustomobject]@{ Action = 'Abort'; Credential = $null; Remember = $false }
+    }
+
+    # Closing the credential form is a withdrawal of the retry, not a skip: the operator asked
+    # to type a new password and then changed their mind, so nothing about the account is decided.
+    $entered = Show-CredentialDialog -Title 'PatchingGuestOps credentials' -Message $Message
+    if ($null -eq $entered) {
+        return [pscustomobject]@{ Action = 'Abort'; Credential = $null; Remember = $false }
+    }
+
+    return [pscustomobject]@{ Action = 'Retry'; Credential = $entered.Credential; Remember = [bool]$entered.Remember }
+}
+
 function Show-UpdateGroupDialog {
     param($UpdateGroups, [int[]]$DefaultCheckedIndexes)
 

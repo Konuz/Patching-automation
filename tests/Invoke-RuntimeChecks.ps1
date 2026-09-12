@@ -1435,6 +1435,31 @@ if ($credentialRecoveryAvailable) {
     Assert-Equal -Actual $saveContext.CredentialMap['VM-save'].UserName -Expected 'SAVED\adm' -Message 'a save callback failure leaves the valid credential in memory'
     Assert-Equal -Actual ($saveWarnings.Count -gt 0) -Expected $true -Message 'a save callback failure emits a warning'
 
+    # A replacement the guest also refuses must never reach the store: overwriting a saved
+    # entry with it would leave the operator with a file that is wrong in a new way, and they
+    # would have no way to tell which of the two passwords the file now holds.
+    $script:rejectedSaveCalls = 0
+    $rejectedContext = New-GuestCredentialContext -TargetNames @('VM-reject') -CredentialMap @{ 'VM-reject' = $oldGuestCredential }
+    $script:rejectedDecisions = 0
+    $rejectedResult = Resolve-GuestCredentialForTarget -VMName 'VM-reject' -Context $rejectedContext -Interactive -ValidateScript {
+        param($VMName, $Credential)
+        [pscustomobject]@{ Status = 'Invalid'; ErrorKind = 'InvalidGuestLogin'; Error = 'Rejected' }
+    } -DecisionScript {
+        param($VMName, $AccountKey, $Members, $Reason)
+        $script:rejectedDecisions++
+        if ($script:rejectedDecisions -eq 1) {
+            [pscustomobject]@{ Action = 'Retry'; Credential = (New-TestCredential 'ALSO\wrong'); Remember = $true }
+        }
+        else {
+            [pscustomobject]@{ Action = 'SkipAccount'; Credential = $null; Remember = $false }
+        }
+    } -OnValidatedScript {
+        param($AccountKey, $Members, $Credential, $Remember)
+        $script:rejectedSaveCalls++
+    }
+    Assert-Equal -Actual $rejectedResult.Status -Expected 'Skipped' -Message 'a replacement the guest also refuses ends in a skip, not a ready credential'
+    Assert-Equal -Actual $script:rejectedSaveCalls -Expected 0 -Message 'a replacement that never validated is never offered to the credential store'
+
     # The real GuestOps adapter must resolve every manager, including AuthManager, from
     # the Client attached to this VM view. A global/default client is deliberately absent.
     $processManagerB = [pscustomobject]@{ Name = 'process-B' }
@@ -1636,6 +1661,71 @@ Assert-Contains -Text $script:retryPromptMessages[0] -Needle 'vc02.contoso.com' 
 Assert-Equal -Actual $retryVIServerCredentialMap['vc01.contoso.com'].UserName -Expected 'CONTOSO\vc-admin' -Message 'retry does not replace credential for successful vCenter'
 Assert-Equal -Actual $retryVIServerCredentialMap['vc02.contoso.com'].UserName -Expected 'administrator@vsphere.local' -Message 'retry stores replacement credential for failed vCenter'
 
+# The GUI recovery contract: a decision object rather than a bare credential, and a callback
+# that fires only for a login this run actually performed. Without the callback the operator
+# retypes the corrected password on every run, because nothing ever writes it back.
+$script:recoveryCalls = @()
+$script:validatedCalls = @()
+$recoveryMap = @{ 'vc01.contoso.com' = (New-TestCredential -UserName 'CONTOSO\old-adm'); 'vc02.contoso.com' = (New-TestCredential -UserName 'CONTOSO\old-adm') }
+$recoveryResult = Connect-VIServersWithCredentialMap -VIServers @('vc01.contoso.com', 'vc02.contoso.com') -CredentialMap $recoveryMap -RetryOnFailure -ConnectScript {
+    param($Server, $Credential)
+    if ($Server -eq 'vc02.contoso.com' -and $Credential.UserName -eq 'CONTOSO\old-adm') {
+        throw 'domain credential rejected'
+    }
+    return [pscustomobject]@{ Server = $Server; UserName = $Credential.UserName }
+} -CredentialPromptScript {
+    param([string]$Message)
+    throw 'the old prompt must not be used when a recovery script is supplied'
+} -CredentialRecoveryScript {
+    param($Server, $Message)
+    $script:recoveryCalls += [string]$Server
+    return [pscustomobject]@{ Action = 'Retry'; Credential = (New-TestCredential -UserName 'administrator@vsphere.local'); Remember = $true }
+} -CredentialValidatedScript {
+    param($Server, $Credential, $Remember)
+    $script:validatedCalls += [pscustomobject]@{ Server = [string]$Server; UserName = $Credential.UserName; Remember = $Remember }
+} 3>$null
+
+Assert-Equal -Actual @($recoveryResult.Connections).Count -Expected 2 -Message 'a recovered vCenter login still returns both connections'
+Assert-Equal -Actual (@($script:recoveryCalls) -join ',') -Expected 'vc02.contoso.com' -Message 'only the vCenter that failed reaches the recovery dialog'
+Assert-Equal -Actual $recoveryMap['vc02.contoso.com'].UserName -Expected 'administrator@vsphere.local' -Message 'the in-memory map still takes the replacement credential'
+Assert-Equal -Actual $recoveryMap['vc01.contoso.com'].UserName -Expected 'CONTOSO\old-adm' -Message 'the vCenter that worked keeps its own credential'
+Assert-Equal -Actual @($script:validatedCalls).Count -Expected 2 -Message 'every login this run performed reports its validated credential'
+$replacementValidation = @($script:validatedCalls | Where-Object { $_.Server -eq 'vc02.contoso.com' })[0]
+Assert-Equal -Actual $replacementValidation.UserName -Expected 'administrator@vsphere.local' -Message 'the replacement is reported against the server that needed it'
+Assert-Equal -Actual $replacementValidation.Remember -Expected $true -Message 'an explicit Remember from the recovery dialog is passed through'
+$startupValidation = @($script:validatedCalls | Where-Object { $_.Server -eq 'vc01.contoso.com' })[0]
+Assert-Equal -Actual ($null -eq $startupValidation.Remember) -Expected $true -Message 'a credential supplied at startup reports no explicit preference, so the caller decides'
+
+# Aborting recovery must not fall through to a retry loop or a second dialog.
+$script:abortRecoveryCalls = 0
+$abortMap = @{ 'vc03.contoso.com' = (New-TestCredential -UserName 'CONTOSO\old-adm') }
+$abortFailed = $false
+try {
+    Connect-VIServersWithCredentialMap -VIServers @('vc03.contoso.com') -CredentialMap $abortMap -RetryOnFailure -ConnectScript {
+        param($Server, $Credential)
+        throw 'credential rejected'
+    } -CredentialRecoveryScript {
+        param($Server, $Message)
+        $script:abortRecoveryCalls++
+        return [pscustomobject]@{ Action = 'Abort'; Credential = $null; Remember = $false }
+    } 3>$null | Out-Null
+}
+catch {
+    $abortFailed = $true
+}
+Assert-Equal -Actual $abortFailed -Expected $true -Message 'aborting vCenter credential recovery fails the connection instead of looping'
+Assert-Equal -Actual $script:abortRecoveryCalls -Expected 1 -Message 'aborting vCenter credential recovery asks exactly once'
+
+# A reused session proves nothing about a password: it was validated by whoever opened it.
+$script:reuseValidatedCalls = 0
+Connect-VIServersWithCredentialMap -VIServers @('vc1.example.local') `
+    -CredentialMap @{ 'vc1.example.local' = (New-TestCredential -UserName 'u1') } `
+    -ReuseExisting `
+    -GetExistingConnectionsScript { return @([pscustomobject]@{ Name = 'vc1.example.local'; IsConnected = $true }) } `
+    -ConnectScript { param($Server, $Credential) throw 'a reused session must not log in again' } `
+    -CredentialValidatedScript { param($Server, $Credential, $Remember) $script:reuseValidatedCalls++ } | Out-Null
+Assert-Equal -Actual $script:reuseValidatedCalls -Expected 0 -Message 'reusing an existing session never reports a validated credential'
+
 # Reusing a live vCenter session: the run must not log in again, and must not disconnect a
 # session it did not open.
 $reuseConnectAttempts = New-Object System.Collections.Generic.List[string]
@@ -1787,6 +1877,114 @@ $nullStoreMissing = @(Get-MissingCredentialStoreKeys -Scope 'guest' -TargetNames
 Assert-Equal -Actual $nullStoreMissing.Count -Expected 1 -Message 'a null store means everything is missing, not a thrown error'
 $nullStoreMap = Expand-CredentialStoreMap -Scope 'guest' -TargetNames @('vm1.contoso.com') -Store $null
 Assert-Equal -Actual $nullStoreMap.Count -Expected 0 -Message 'a null store expands to an empty map rather than throwing'
+
+# --- Exact-target credential overrides (scripts/SettingsStore.ps1) ---
+# Two vCenters behind one DNS suffix share a group entry. When only one of them rejects its
+# password, the replacement must land on that server alone - rewriting the group entry would
+# hand the other server a credential nobody validated against it.
+$targetKey = Get-TargetCredentialStoreKey -Scope 'vcenter' -TargetName ' VC01.EXAMPLE.TEST '
+Assert-Equal -Actual $targetKey -Expected 'vcenter:target:vc01.example.test' -Message 'an exact-target key is stable across casing and surrounding whitespace'
+
+$overrideStore = @{
+    'vcenter:domain:example.test' = (New-TestCredential 'previous-user')
+    'vcenter:target:vc01.example.test' = (New-TestCredential 'replacement-user')
+}
+$overrideMap = Expand-CredentialStoreMap -Scope 'vcenter' -TargetNames @('vc01.example.test', 'vc02.example.test') -Store $overrideStore
+Assert-Equal -Actual $overrideMap['vc01.example.test'].UserName -Expected 'replacement-user' -Message 'the corrected server uses its exact-target override'
+Assert-Equal -Actual $overrideMap['vc02.example.test'].UserName -Expected 'previous-user' -Message 'another server behind the same suffix keeps the group credential'
+
+$targetOnlyStore = @{ 'guest:target:vm9.fabrikam.com' = (New-TestCredential ('FABRIKAM\adm')) }
+$targetOnlyMissing = @(Get-MissingCredentialStoreKeys -Scope 'guest' -TargetNames @('vm9.fabrikam.com') -Store $targetOnlyStore)
+Assert-Equal -Actual $targetOnlyMissing.Count -Expected 0 -Message 'a member covered by an exact-target entry alone is not asked for again'
+$partlyCoveredMissing = @(Get-MissingCredentialStoreKeys -Scope 'guest' -TargetNames @('vm8.fabrikam.com', 'vm9.fabrikam.com') -Store $targetOnlyStore)
+Assert-Equal -Actual $partlyCoveredMissing.Count -Expected 1 -Message 'a group with an uncovered member is still asked for'
+Assert-Equal -Actual (@($partlyCoveredMissing[0].Members) -join ',') -Expected 'vm8.fabrikam.com' -Message 'the prompt covers only the members no entry reaches'
+
+$legacyOnlyMap = Expand-CredentialStoreMap -Scope 'guest' -TargetNames @('vm1.contoso.com') -Store $store
+Assert-Equal -Actual $legacyOnlyMap['vm1.contoso.com'].UserName -Expected ('CONTOSO\adm') -Message 'a store written before exact-target keys existed still reads back'
+
+# --- Persisting a corrected credential (scripts/SettingsStore.ps1) ---
+# A credential validated mid-run may or may not be meant for disk. The recovery dialog states
+# it outright; a credential typed at startup carries only the preference from that form, and
+# where there is no preference at all the answer is "do not write a new entry" - never a guess.
+Assert-Equal -Actual (Resolve-CredentialPersistDecision -Remember $true -RememberPreference $false) -Expected $true -Message 'an explicit Remember from the recovery dialog wins over the startup preference'
+Assert-Equal -Actual (Resolve-CredentialPersistDecision -Remember $false -RememberPreference $true) -Expected $false -Message 'an explicit refusal from the recovery dialog also wins'
+Assert-Equal -Actual (Resolve-CredentialPersistDecision -Remember $null -RememberPreference $true) -Expected $true -Message 'no explicit answer falls back to the preference from the startup form'
+Assert-Equal -Actual (Resolve-CredentialPersistDecision -Remember $null -RememberPreference $false) -Expected $false -Message 'a startup form that unticked Remember keeps the credential out of the file'
+Assert-Equal -Actual (Resolve-CredentialPersistDecision -Remember $null -RememberPreference $null) -Expected $false -Message 'no answer and no preference means no new entry is written'
+
+# The working map and the saved map are separate objects because they genuinely diverge: a
+# replacement entered with Remember unticked has to serve the run while the file keeps the
+# password already on disk. These drive the real functions - the GUI callbacks are three lines
+# of delegation on top of them, and a state object passed by hand cannot reproduce the
+# PowerShell 5.1 trap where a function assigning to an enclosing variable silently creates a
+# local instead of updating it.
+$persistDir = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-persist-' + [guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $persistDir)
+$persistPath = Join-Path $persistDir 'credentials.json'
+try {
+    $workingMap = @{ 'guest:domain:contoso.com' = (New-TestCredential 'CONTOSO\old') }
+    Write-CredentialStore -Path $persistPath -Credentials $workingMap
+    $persistState = New-CredentialPersistState -Path $persistPath -WorkingCredentials $workingMap -PersistedCredentials @{ 'guest:domain:contoso.com' = $workingMap['guest:domain:contoso.com'] }
+    Set-CredentialRememberPreference -State $persistState -StoreKey 'guest:domain:contoso.com' -Remember $true
+
+    $savedReplacement = Register-ValidatedCredential -State $persistState -StoreKey 'guest:domain:contoso.com' -Credential (New-TestCredential 'CONTOSO\new') -Remember $true
+    Assert-Equal -Actual $savedReplacement -Expected $true -Message 'a validated replacement the operator remembered is written'
+    Assert-Equal -Actual (Read-CredentialStore -Path $persistPath).Credentials['guest:domain:contoso.com'].UserName -Expected 'CONTOSO\new' -Message 'the next read of the store returns the corrected password'
+    Assert-Equal -Actual $workingMap['guest:domain:contoso.com'].UserName -Expected 'CONTOSO\new' -Message 'the run itself also takes the corrected password'
+
+    $unapproved = Register-ValidatedCredential -State $persistState -StoreKey 'guest:local:sandbox' -Credential (New-TestCredential 'sandbox\adm') -Remember $null
+    Assert-Equal -Actual $unapproved -Expected $false -Message 'a credential with no answer and no preference is not written'
+    Assert-Equal -Actual $workingMap['guest:local:sandbox'].UserName -Expected 'sandbox\adm' -Message 'a credential that is not written is still available to the run'
+    Assert-Equal -Actual (Read-CredentialStore -Path $persistPath).Credentials.ContainsKey('guest:local:sandbox') -Expected $false -Message 'an unapproved credential stays out of the file'
+
+    # An explicit refusal must outrank the startup preference for the rest of the run. This is
+    # the whole reason the two maps are separate: the refused password sits in the working map
+    # under a key that IS approved, so a single shared map would sweep it onto disk.
+    $refused = Register-ValidatedCredential -State $persistState -StoreKey 'guest:domain:contoso.com' -Credential (New-TestCredential 'CONTOSO\refused') -Remember $false
+    Assert-Equal -Actual $refused -Expected $false -Message 'a replacement the operator refused to remember is not written'
+    Assert-Equal -Actual (Read-CredentialStore -Path $persistPath).Credentials['guest:domain:contoso.com'].UserName -Expected 'CONTOSO\new' -Message 'refusing to remember leaves the file as it was'
+    $laterValidation = Register-ValidatedCredential -State $persistState -StoreKey 'guest:domain:contoso.com' -Credential (New-TestCredential 'CONTOSO\refused') -Remember $null
+    Assert-Equal -Actual $laterValidation -Expected $false -Message 'a later validation cannot resurrect the startup preference the operator overrode'
+    Assert-Equal -Actual (Read-CredentialStore -Path $persistPath).Credentials['guest:domain:contoso.com'].UserName -Expected 'CONTOSO\new' -Message 'the refused password never reaches the file through another VM in the same account'
+
+    Set-CredentialRememberPreference -State $persistState -StoreKey 'vcenter:domain:corp.local' -Remember $true
+    $workingMap['vcenter:domain:corp.local'] = (New-TestCredential 'CORP\svc')
+    $persistState.Persisted['vcenter:domain:corp.local'] = $workingMap['vcenter:domain:corp.local']
+    $savedTarget = Register-ValidatedCredential -State $persistState -StoreKey (Get-TargetCredentialStoreKey -Scope 'vcenter' -TargetName 'vc01.corp.local') -Credential (New-TestCredential 'CORP\vc01') -Remember $true
+    Assert-Equal -Actual $savedTarget -Expected $true -Message 'a corrected vCenter password is written'
+    $afterTarget = (Read-CredentialStore -Path $persistPath).Credentials
+    Assert-Equal -Actual $afterTarget['vcenter:target:vc01.corp.local'].UserName -Expected 'CORP\vc01' -Message 'the correction lands under the exact-target key'
+    Assert-Equal -Actual $afterTarget['vcenter:domain:corp.local'].UserName -Expected 'CORP\svc' -Message 'the shared vCenter group entry survives a single-server correction'
+    Assert-Equal -Actual $afterTarget['guest:domain:contoso.com'].UserName -Expected 'CONTOSO\new' -Message 'saving one account leaves the others intact'
+    Assert-Equal -Actual $afterTarget.ContainsKey('guest:local:sandbox') -Expected $false -Message 'an unapproved account is still absent after later saves'
+}
+finally {
+    Remove-Item -LiteralPath $persistDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# An entry this Windows account cannot decrypt belongs to another profile, not to nobody.
+$passThroughDir = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-passthrough-' + [guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $passThroughDir)
+$passThroughPath = Join-Path $passThroughDir 'credentials.json'
+try {
+    @{
+        'guest:domain:contoso.com' = @{ UserName = 'CONTOSO\old'; Password = 'not-a-dpapi-blob' }
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $passThroughPath -Encoding UTF8
+
+    $passThroughRead = Read-CredentialStore -Path $passThroughPath 3>$null
+    Assert-Equal -Actual $passThroughRead.Credentials.Count -Expected 0 -Message 'an undecryptable entry is not offered as a usable credential'
+    Assert-Equal -Actual $passThroughRead.UnreadableEntries.ContainsKey('guest:domain:contoso.com') -Expected $true -Message 'an undecryptable entry is kept so a later save does not delete it'
+
+    $passThroughState = New-CredentialPersistState -Path $passThroughPath -WorkingCredentials @{} -PersistedCredentials @{} -PassThroughEntries $passThroughRead.UnreadableEntries
+    $null = Register-ValidatedCredential -State $passThroughState -StoreKey 'guest:local:sandbox' -Credential (New-TestCredential 'sandbox\adm') -Remember $true
+    $afterPassThrough = Get-Content -LiteralPath $passThroughPath -Raw | ConvertFrom-Json
+    Assert-Equal -Actual ([string]$afterPassThrough.PSObject.Properties['guest:domain:contoso.com'].Value.Password) -Expected 'not-a-dpapi-blob' -Message 'saving a new account preserves an entry that belongs to another Windows profile'
+    Assert-Equal -Actual ([string]$afterPassThrough.PSObject.Properties['guest:local:sandbox'].Value.UserName) -Expected 'sandbox\adm' -Message 'the new account is saved alongside it'
+}
+finally {
+    Remove-Item -LiteralPath $passThroughDir -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 # --- Settings file (scripts/SettingsStore.ps1) ---
 $settingsDir = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-settings-' + [guid]::NewGuid().ToString('N'))
@@ -2109,6 +2307,96 @@ else {
         $cancelledCredential = & $credentialBlock 'Credentials for vCenter vc1'
         Assert-Equal -Actual ($null -eq $cancelledCredential) -Expected $true -Message 'a cancelled credential dialog yields $null for the retry loop to reject'
 
+        # The four recovery hooks. Each one is a scriptblock whose parameters must line up
+        # positionally with a caller in another file, and nothing else checks that: a renamed
+        # parameter or a swapped argument shows up as a password written under the wrong key.
+        $recoverGuestPair = @($providerPairs | Where-Object { [string]$_.Item1.Extent.Text -eq 'RecoverGuestCredential' })
+        Assert-Equal -Actual $recoverGuestPair.Count -Expected 1 -Message 'the GUI provider offers guest credential recovery'
+        $validatedPair = @($providerPairs | Where-Object { [string]$_.Item1.Extent.Text -eq 'CredentialValidated' })
+        Assert-Equal -Actual $validatedPair.Count -Expected 1 -Message 'the GUI provider reports validated guest credentials'
+        $recoverVIPair = @($providerPairs | Where-Object { [string]$_.Item1.Extent.Text -eq 'RecoverVIServerCredential' })
+        Assert-Equal -Actual $recoverVIPair.Count -Expected 1 -Message 'the GUI provider offers vCenter credential recovery'
+        $validatedVIPair = @($providerPairs | Where-Object { [string]$_.Item1.Extent.Text -eq 'VIServerCredentialValidated' })
+        Assert-Equal -Actual $validatedVIPair.Count -Expected 1 -Message 'the GUI provider reports validated vCenter credentials'
+
+        $script:recoveryDialogMembers = @()
+        $script:recoveryDialogMessage = ''
+        $script:recoveryDialogAllowSkip = $null
+        function Show-GuestCredentialRecoveryDialog {
+            param([string]$Message, [string[]]$Members, [switch]$AllowSkip)
+            $script:recoveryDialogMessage = $Message
+            $script:recoveryDialogMembers = @($Members)
+            $script:recoveryDialogAllowSkip = [bool]$AllowSkip
+            return [pscustomobject]@{ Action = 'Retry'; Credential = (New-TestCredential 'GUI\replacement'); Remember = $true }
+        }
+        $script:registeredCredentials = @()
+        function Register-ValidatedGuiCredential {
+            param([string]$StoreKey, [pscredential]$Credential, $Remember)
+            $script:registeredCredentials += [pscustomobject]@{ StoreKey = $StoreKey; UserName = $Credential.UserName; Remember = $Remember }
+        }
+
+        # Exactly how scripts/CredentialRecovery.ps1 calls the decision script.
+        $guestDecision = & ($recoverGuestPair[0].Item2.GetPureExpression().ScriptBlock.GetScriptBlock()) 'vm1.contoso.com' 'domain:contoso.com' @('vm1.contoso.com', 'vm2.contoso.com') 'The guest rejected the supplied credential.'
+        Assert-Equal -Actual $guestDecision.Action -Expected 'Retry' -Message 'the guest recovery hook returns the shared decision contract'
+        Assert-Contains -Text $script:recoveryDialogMessage -Needle 'vm1.contoso.com' -Message 'the recovery dialog names the guest that refused the login'
+        Assert-Contains -Text $script:recoveryDialogMessage -Needle 'domain:contoso.com' -Message 'the recovery dialog names the account, not just the guest'
+        Assert-Equal -Actual (@($script:recoveryDialogMembers) -join ',') -Expected 'vm1.contoso.com,vm2.contoso.com' -Message 'the recovery dialog lists every target the account covers'
+        Assert-Equal -Actual $script:recoveryDialogAllowSkip -Expected $true -Message 'a guest account can be skipped for the rest of the run'
+
+        # Exactly how Resolve-GuestCredentialForTarget reports a validated replacement.
+        & ($validatedPair[0].Item2.GetPureExpression().ScriptBlock.GetScriptBlock()) 'domain:contoso.com' @('vm1.contoso.com') (New-TestCredential 'CONTOSO\new') $true | Out-Null
+        Assert-Equal -Actual $script:registeredCredentials[-1].StoreKey -Expected 'guest:domain:contoso.com' -Message 'a corrected guest password is written back to its existing group entry'
+        Assert-Equal -Actual $script:registeredCredentials[-1].Remember -Expected $true -Message 'the explicit Remember reaches the store decision'
+
+        # Exactly how Connect-VIServersWithCredentialMap calls its two hooks.
+        $viDecision = & ($recoverVIPair[0].Item2.GetPureExpression().ScriptBlock.GetScriptBlock()) 'vc01.example.test' 'Credentials for vCenter vc01.example.test (previous login failed)'
+        Assert-Equal -Actual $viDecision.Action -Expected 'Retry' -Message 'the vCenter recovery hook returns the same decision contract'
+        Assert-Equal -Actual (@($script:recoveryDialogMembers) -join ',') -Expected 'vc01.example.test' -Message 'a vCenter recovery dialog covers that one server'
+        # There is no way to run a patch round against a vCenter nobody can log in to, so the
+        # button is hidden rather than offered and then silently turned into a full stop.
+        Assert-Equal -Actual $script:recoveryDialogAllowSkip -Expected $false -Message 'a vCenter cannot be skipped, so the dialog does not offer it'
+
+        $registeredBeforeBlank = @($script:registeredCredentials).Count
+        & ($validatedVIPair[0].Item2.GetPureExpression().ScriptBlock.GetScriptBlock()) '   ' (New-TestCredential 'VC\replacement') $true | Out-Null
+        Assert-Equal -Actual (@($script:registeredCredentials).Count) -Expected $registeredBeforeBlank -Message 'a blank vCenter name writes no credential under an empty target key'
+
+        & ($validatedVIPair[0].Item2.GetPureExpression().ScriptBlock.GetScriptBlock()) ' VC01.Example.Test ' (New-TestCredential 'VC\replacement') $null | Out-Null
+        Assert-Equal -Actual $script:registeredCredentials[-1].StoreKey -Expected 'vcenter:target:vc01.example.test' -Message 'a corrected vCenter password is written under its own target key, never the shared group entry'
+        Assert-Equal -Actual ($null -eq $script:registeredCredentials[-1].Remember) -Expected $true -Message 'a credential validated without an explicit answer leaves the decision to the startup preference'
+
+        Remove-Item Function:\Register-ValidatedGuiCredential -ErrorAction SilentlyContinue
+
+        # The GUI's own delegation, lifted from the real launcher and run against a real state.
+        # Every assertion above this point stubbed it out, which is exactly the shape that once
+        # failed silently: a function that assigns to an enclosing script variable does not
+        # update it in PowerShell 5.1, and the callback is invoked from inside a generic catch.
+        $delegationFunctions = @($guiAst.FindAll({ param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -eq 'Register-ValidatedGuiCredential'
+        }, $true))
+        Assert-Equal -Actual $delegationFunctions.Count -Expected 1 -Message 'the GUI launcher defines the credential delegation the provider hooks call'
+
+        $delegationDir = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-delegation-' + [guid]::NewGuid().ToString('N'))
+        [void](New-Item -ItemType Directory -Path $delegationDir)
+        try {
+            $delegationPath = Join-Path $delegationDir 'credentials.json'
+            $store = @{ 'guest:domain:contoso.com' = (New-TestCredential 'CONTOSO\old') }
+            Write-CredentialStore -Path $delegationPath -Credentials $store
+            $persistState = New-CredentialPersistState -Path $delegationPath -WorkingCredentials $store -PersistedCredentials @{ 'guest:domain:contoso.com' = $store['guest:domain:contoso.com'] }
+            Set-CredentialRememberPreference -State $persistState -StoreKey 'guest:domain:contoso.com' -Remember $true
+
+            . ([scriptblock]::Create($delegationFunctions[0].Extent.Text))
+            Register-ValidatedGuiCredential -StoreKey 'guest:domain:contoso.com' -Credential (New-TestCredential 'CONTOSO\new') -Remember $true
+
+            Assert-Equal -Actual (Read-CredentialStore -Path $delegationPath).Credentials['guest:domain:contoso.com'].UserName -Expected 'CONTOSO\new' -Message 'the GUI delegation actually reaches the file, not just the in-memory state'
+            Assert-Equal -Actual $store['guest:domain:contoso.com'].UserName -Expected 'CONTOSO\new' -Message 'the GUI delegation also leaves the corrected credential in the working map'
+        }
+        finally {
+            Remove-Item Function:\Register-ValidatedGuiCredential -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $delegationDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        Remove-Item Function:\Show-GuestCredentialRecoveryDialog -ErrorAction SilentlyContinue
         Remove-Item Function:\Show-UpdateGroupDialog -ErrorAction SilentlyContinue
         Remove-Item Function:\Show-CredentialDialog -ErrorAction SilentlyContinue
     }

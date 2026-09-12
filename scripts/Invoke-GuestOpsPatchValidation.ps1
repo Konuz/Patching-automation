@@ -1624,6 +1624,16 @@ $guestCredentialInteractive = -not $SkipConfirmation
 if ($null -ne $PromptProvider -and $PromptProvider.ContainsKey('CredentialValidated')) {
     $guestCredentialValidatedScript = $PromptProvider['CredentialValidated']
 }
+# The vCenter hooks are the same idea one layer down, and they are separate entries because a
+# vCenter has no account group: a corrected password belongs to that one server.
+$viserverRecoveryScript = $null
+$viserverValidatedScript = $null
+if ($null -ne $PromptProvider -and $PromptProvider.ContainsKey('VIServerCredentialValidated')) {
+    $viserverValidatedScript = $PromptProvider['VIServerCredentialValidated']
+}
+if ($guestCredentialInteractive -and $null -ne $PromptProvider -and $PromptProvider.ContainsKey('RecoverVIServerCredential')) {
+    $viserverRecoveryScript = $PromptProvider['RecoverVIServerCredential']
+}
 if ($guestCredentialInteractive) {
     if ($null -ne $PromptProvider -and $PromptProvider.ContainsKey('RecoverGuestCredential')) {
         $guestCredentialDecisionScript = $PromptProvider['RecoverGuestCredential']
@@ -1657,7 +1667,7 @@ try {
     # Only the sessions this run opened go into $connections: the finally block disconnects
     # them, and a session the operator already had (-KeepConnected from an earlier run) must
     # survive this one.
-    $connectResult = Connect-VIServersWithCredentialMap -VIServers $resolvedVIServers -CredentialMap $viserverCredentialMap -CredentialPromptScript $credentialPromptScript -RetryOnFailure:$retryVIServerLogin -ReuseExisting
+    $connectResult = Connect-VIServersWithCredentialMap -VIServers $resolvedVIServers -CredentialMap $viserverCredentialMap -CredentialPromptScript $credentialPromptScript -RetryOnFailure:$retryVIServerLogin -ReuseExisting -CredentialRecoveryScript $viserverRecoveryScript -CredentialValidatedScript $viserverValidatedScript
     $connections = @($connectResult.OpenedConnections)
 
     $managers = $null

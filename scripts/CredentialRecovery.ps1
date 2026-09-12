@@ -289,7 +289,7 @@ function Resolve-GuestCredentialForTarget {
                         $null = & $OnValidatedScript $accountKey @($group.Members) $candidateCredential $remember
                     }
                     catch {
-                        Write-Warning ('Unable to remember the validated credential for account {0}; the credential remains available in memory.' -f $accountKey)
+                        Write-Warning ('Unable to remember the validated credential for account {0} ({1}); the credential remains available in memory.' -f $accountKey, $_.Exception.Message)
                     }
                 }
             }
@@ -298,7 +298,7 @@ function Resolve-GuestCredentialForTarget {
                     $null = & $OnValidatedScript $accountKey @($group.Members) $candidateCredential $null
                 }
                 catch {
-                    Write-Warning ('Unable to remember the validated credential for account {0}; the credential remains available in memory.' -f $accountKey)
+                    Write-Warning ('Unable to remember the validated credential for account {0} ({1}); the credential remains available in memory.' -f $accountKey, $_.Exception.Message)
                 }
             }
 

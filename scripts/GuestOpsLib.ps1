@@ -111,6 +111,11 @@ function Connect-VIServersWithCredentialMap {
         [hashtable]$CredentialMap,
         [scriptblock]$ConnectScript,
         [scriptblock]$CredentialPromptScript,
+        # The recovery variant answers with a decision object rather than a bare credential,
+        # so the caller can say "skip" or "abort" instead of being forced to produce one. The
+        # old prompt stays exactly as it was and is used whenever no recovery script is given.
+        [scriptblock]$CredentialRecoveryScript,
+        [scriptblock]$CredentialValidatedScript,
         [scriptblock]$GetExistingConnectionsScript,
         [switch]$RetryOnFailure,
         [switch]$ReuseExisting
@@ -182,6 +187,7 @@ function Connect-VIServersWithCredentialMap {
             continue
         }
 
+        $rememberPreference = $null
         while ($true) {
             $credential = $null
             if ($CredentialMap.ContainsKey($serverName)) {
@@ -194,6 +200,18 @@ function Connect-VIServersWithCredentialMap {
 
             try {
                 $newConnections = @(& $ConnectScript $serverName $credential)
+                # Only a login this run performed proves the credential: a reused session was
+                # validated by whoever opened it, and reporting it would persist a password
+                # this run never tested. $rememberPreference is $null until a recovery dialog
+                # states one, which is how the caller knows to fall back to its own preference.
+                if ($null -ne $CredentialValidatedScript) {
+                    try {
+                        $null = & $CredentialValidatedScript $serverName $credential $rememberPreference
+                    }
+                    catch {
+                        Write-Warning ("Unable to remember the validated credential for {0} ({1}); it remains available for this run." -f $serverName, $_.Exception.Message)
+                    }
+                }
                 $connections += $newConnections
                 $openedConnections += $newConnections
                 break
@@ -211,7 +229,30 @@ function Connect-VIServersWithCredentialMap {
                 }
 
                 Write-Warning ('vCenter login failed for {0}: {1}' -f $serverName, $_.Exception.Message)
-                $CredentialMap[$serverName] = & $CredentialPromptScript ('Credentials for vCenter {0} (previous login failed)' -f $serverName)
+                $retryMessage = 'Credentials for vCenter {0} (previous login failed)' -f $serverName
+                if ($null -eq $CredentialRecoveryScript) {
+                    $CredentialMap[$serverName] = & $CredentialPromptScript $retryMessage
+                    continue
+                }
+
+                $decision = & $CredentialRecoveryScript $serverName $retryMessage
+                $decisionAction = [string](Get-ObjectPropertyValue -InputObject $decision -Path @('Action'))
+                $decisionCredential = Get-ObjectPropertyValue -InputObject $decision -Path @('Credential')
+                if ($decisionAction -ne 'Retry' -or $decisionCredential -isnot [pscredential]) {
+                    # Skip and abort both mean "stop": there is no way to run a patch round
+                    # against a vCenter nobody can log in to, so this ends like a plain refusal.
+                    foreach ($connection in @($openedConnections)) {
+                        try {
+                            Disconnect-VIServer -Server $connection -Confirm:$false | Out-Null
+                        }
+                        catch { }
+                    }
+
+                    throw ('vCenter credential recovery for {0} did not supply a replacement credential.' -f $serverName)
+                }
+
+                $CredentialMap[$serverName] = $decisionCredential
+                $rememberPreference = [bool](Get-ObjectPropertyValue -InputObject $decision -Path @('Remember') -DefaultValue $false)
             }
         }
     }
