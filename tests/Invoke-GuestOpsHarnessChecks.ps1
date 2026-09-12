@@ -390,7 +390,6 @@ try {
         VMOutputDirectory = (Join-Path $isolationWorkspace 'VM-B')
         MaxUpdates = 1
         LocalSelectionPath = ''
-        GuestSelectionPath = ''
         SearchOnly = $true
     }
     $isolationResults = @(Invoke-GuestAgentFleet -FleetItems @($fleetItem) -Managers $managerA -GuestCredentialMap @{ 'VM-B' = $harnessCredential } -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -TimeoutSeconds 120 -PollSeconds 1 -MaxInFlight 1)
@@ -547,7 +546,6 @@ try {
         VMOutputDirectory = (Join-Path $workspace 'VM-retry')
         MaxUpdates = 1
         LocalSelectionPath = ''
-        GuestSelectionPath = ''
         SearchOnly = $true
     }
 

@@ -235,7 +235,6 @@ function New-AgentFleetItem {
         [string]$VMOutputDirectory,
         [int]$MaxUpdates,
         [string]$LocalSelectionPath = '',
-        [string]$GuestSelectionPath = '',
         [bool]$SearchOnly = $false
     )
 
@@ -247,7 +246,6 @@ function New-AgentFleetItem {
         VMOutputDirectory = $VMOutputDirectory
         MaxUpdates = $MaxUpdates
         LocalSelectionPath = $LocalSelectionPath
-        GuestSelectionPath = $GuestSelectionPath
         SearchOnly = $SearchOnly
     }
 }
@@ -276,12 +274,12 @@ function Invoke-GuestAgentFleet {
             param($Item)
             if (-not $credentialRecoveryEnabled) {
                 $itemAuth = New-GuestAuthentication -Credential $GuestCredentialMap[[string]$Item.VMName]
-                return Start-VMAgentCycle -VMName $Item.VMName -Managers $null -GuestAuth $itemAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $Item.VMOutputDirectory -MaxUpdates $Item.MaxUpdates -LocalSelectionPath $Item.LocalSelectionPath -SelectionPath $Item.GuestSelectionPath -SearchOnly:([bool]$Item.SearchOnly)
+                return Start-VMAgentCycle -VMName $Item.VMName -Managers $null -GuestAuth $itemAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $Item.VMOutputDirectory -MaxUpdates $Item.MaxUpdates -LocalSelectionPath $Item.LocalSelectionPath -SearchOnly:([bool]$Item.SearchOnly)
             }
 
             return Invoke-GuestOperationWithCredentialRecovery -VMName $Item.VMName -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive -OperationScript {
                 param($ItemAuth)
-                return Start-VMAgentCycle -VMName $Item.VMName -Managers $null -GuestAuth $ItemAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $Item.VMOutputDirectory -MaxUpdates $Item.MaxUpdates -LocalSelectionPath $Item.LocalSelectionPath -SelectionPath $Item.GuestSelectionPath -SearchOnly:([bool]$Item.SearchOnly)
+                return Start-VMAgentCycle -VMName $Item.VMName -Managers $null -GuestAuth $ItemAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $Item.VMOutputDirectory -MaxUpdates $Item.MaxUpdates -LocalSelectionPath $Item.LocalSelectionPath -SearchOnly:([bool]$Item.SearchOnly)
             }
         } `
         -PollScript {

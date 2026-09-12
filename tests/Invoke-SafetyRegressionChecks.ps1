@@ -1187,7 +1187,6 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         VMOutputDirectory = 'C:\synthetic\out'
         MaxUpdates = 1
         LocalSelectionPath = ''
-        GuestSelectionPath = ''
         SearchOnly = $true
     }
 
