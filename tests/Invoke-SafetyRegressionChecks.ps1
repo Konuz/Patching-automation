@@ -1210,6 +1210,174 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
     }
 }
 
+# F3: the guest working directory is shared with whatever else the customer keeps under it, and
+# the only deletion this tool performs is recursive. So it happens once, on one directory, and
+# only when this cycle is provably finished and both artifacts are already on the stepping stone.
+& {
+    $cleanupRoot = 'C:\ProgramData\PatchingGuestOps'
+    $cleanupRunId = '1234567890abcdef1234567890abcdef'
+
+    $cleanupLocalDir = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-cleanup-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $cleanupLocalDir | Out-Null
+
+    $script:cleanupDeleteCalls = @()
+    $script:cleanupDeleteThrows = $false
+    $script:cleanupStatusJson = ('{"runId":"' + $cleanupRunId + '","outcome":"InstallSucceeded","finishedAt":"2026-09-11T10:00:00Z","errors":[]}')
+    $script:cleanupStatusDownloadFails = $false
+    $script:cleanupLogDownloadFails = $false
+    $script:cleanupLogArrivesEmpty = $false
+
+    function Receive-GuestFile {
+        param($FileManager, $VMView, $GuestAuth, $HostName, $CurlPath, $GuestPath, $LocalPath, $TimeoutSeconds)
+        if (([string]$GuestPath).EndsWith('status.json')) {
+            if ($script:cleanupStatusDownloadFails) { throw 'synthetic status download failure' }
+            Set-Content -LiteralPath $LocalPath -Value $script:cleanupStatusJson -Encoding UTF8
+            return
+        }
+
+        if ($script:cleanupLogDownloadFails) { throw 'synthetic agent.log download failure' }
+        if ($script:cleanupLogArrivesEmpty) { return }
+        Set-Content -LiteralPath $LocalPath -Value 'synthetic agent log' -Encoding UTF8
+    }
+
+    function New-CleanupHandle {
+        param([string]$CycleDirectory, [string]$RunId = $cleanupRunId, [string]$Root = $cleanupRoot)
+
+        $fileManager = New-Object psobject
+        $fileManager | Add-Member -MemberType ScriptMethod -Name DeleteDirectoryInGuest -Value {
+            param($MoRef, $Auth, $DirectoryPath, $Recursive)
+            $script:cleanupDeleteCalls += [pscustomobject]@{ Path = [string]$DirectoryPath; Recursive = [bool]$Recursive }
+            if ($script:cleanupDeleteThrows) { throw 'synthetic guest delete failure' }
+        }
+
+        $handle = New-VMAgentCycleHandle -VMName 'cleanup-vm' -RunId $RunId -Mode 'Apply' -Managers ([pscustomobject]@{ ProcessManager = $null; FileManager = $fileManager }) -VMView ([pscustomobject]@{ MoRef = 'fake' }) -GuestAuth $null -HostName 'unused' -CurlPath 'unused' -ProcessId 4242 -GuestStatusPath (Join-Path $CycleDirectory 'status.json') -GuestLogPath (Join-Path $CycleDirectory 'agent.log') -LocalStatusPath (Join-Path $cleanupLocalDir 'status.json') -LocalLogPath (Join-Path $cleanupLocalDir 'agent.log') -GuestWorkingDirectory $Root -GuestCycleDirectory $CycleDirectory
+        return $handle
+    }
+
+    function Reset-CleanupCase {
+        $script:cleanupDeleteCalls = @()
+        $script:cleanupDeleteThrows = $false
+        $script:cleanupStatusJson = ('{"runId":"' + $cleanupRunId + '","outcome":"InstallSucceeded","finishedAt":"2026-09-11T10:00:00Z","errors":[]}')
+        $script:cleanupStatusDownloadFails = $false
+        $script:cleanupLogDownloadFails = $false
+        $script:cleanupLogArrivesEmpty = $false
+        Remove-Item -LiteralPath (Join-Path $cleanupLocalDir 'status.json') -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $cleanupLocalDir 'agent.log') -Force -ErrorAction SilentlyContinue
+    }
+
+    $completedResult = [pscustomobject]@{ Completed = $true; ExitCode = 0; EndTime = (Get-Date) }
+
+    try {
+        # The one case that is allowed to delete anything.
+        Reset-CleanupCase
+        $goodCycle = Join-Path $cleanupRoot $cleanupRunId
+        $goodPayload = Complete-VMAgentCycle -Handle (New-CleanupHandle -CycleDirectory $goodCycle) -AgentResult $completedResult
+        Assert-Equal -Actual $goodPayload.StatusDownloaded -Expected $true -Message 'F3: a completed cycle reports its status came from this download'
+        Assert-Equal -Actual $goodPayload.LogDownloaded -Expected $true -Message 'F3: a completed cycle reports its log came from this download'
+        Assert-Equal -Actual $goodPayload.CleanupStatus -Expected 'Removed' -Message 'F3: a provably finished cycle with both artifacts collected is cleaned up'
+        Assert-Equal -Actual @($script:cleanupDeleteCalls).Count -Expected 1 -Message 'F3: cleanup deletes exactly once'
+        Assert-Equal -Actual $script:cleanupDeleteCalls[0].Path -Expected $goodCycle -Message 'F3: cleanup deletes the cycle directory, not the working root'
+        Assert-Equal -Actual $script:cleanupDeleteCalls[0].Recursive -Expected $true -Message 'F3: the cycle directory is removed recursively'
+        Assert-Equal -Actual $goodPayload.AgentCompletionConfirmed -Expected $true -Message 'F3: cleanup does not disturb the WUA result'
+
+        # Nothing below this line may delete anything.
+        $negativeCases = @(
+            [pscustomobject]@{ Name = 'the agent is still running'; Cycle = (Join-Path $cleanupRoot $cleanupRunId); RunId = $cleanupRunId; Root = $cleanupRoot; AgentResult = $null }
+            [pscustomobject]@{ Name = 'the process id was lost from vSphere'; Cycle = (Join-Path $cleanupRoot $cleanupRunId); RunId = $cleanupRunId; Root = $cleanupRoot; AgentResult = ([pscustomobject]@{ Completed = $false; ExitCode = $null; EndTime = $null }) }
+            [pscustomobject]@{ Name = 'the status is still Started'; Cycle = (Join-Path $cleanupRoot $cleanupRunId); RunId = $cleanupRunId; Root = $cleanupRoot; AgentResult = $completedResult; StatusJson = ('{"runId":"' + $cleanupRunId + '","outcome":"Started","finishedAt":null,"errors":[]}') }
+            [pscustomobject]@{ Name = 'the agent log download failed'; Cycle = (Join-Path $cleanupRoot $cleanupRunId); RunId = $cleanupRunId; Root = $cleanupRoot; AgentResult = $completedResult; LogFails = $true }
+            [pscustomobject]@{ Name = 'the cycle directory is a drive root'; Cycle = 'C:\'; RunId = $cleanupRunId; Root = $cleanupRoot; AgentResult = $completedResult }
+            [pscustomobject]@{ Name = 'the cycle directory is the working root itself'; Cycle = $cleanupRoot; RunId = $cleanupRunId; Root = $cleanupRoot; AgentResult = $completedResult }
+            [pscustomobject]@{ Name = 'the cycle path climbs out with ..'; Cycle = (Join-Path $cleanupRoot ('..' + [System.IO.Path]::DirectorySeparatorChar + $cleanupRunId)); RunId = $cleanupRunId; Root = $cleanupRoot; AgentResult = $completedResult }
+            [pscustomobject]@{ Name = 'a sibling directory shares the root prefix'; Cycle = (Join-Path ($cleanupRoot + 'Extra') $cleanupRunId); RunId = $cleanupRunId; Root = $cleanupRoot; AgentResult = $completedResult }
+            [pscustomobject]@{ Name = 'the directory name is a different run'; Cycle = (Join-Path $cleanupRoot 'ffffffffffffffffffffffffffffffff'); RunId = $cleanupRunId; Root = $cleanupRoot; AgentResult = $completedResult }
+            [pscustomobject]@{ Name = 'the run id is not a guid'; Cycle = (Join-Path $cleanupRoot 'not-a-guid'); RunId = 'not-a-guid'; Root = $cleanupRoot; AgentResult = $completedResult }
+            [pscustomobject]@{ Name = 'the cycle path is relative'; Cycle = ('relative' + [System.IO.Path]::DirectorySeparatorChar + $cleanupRunId); RunId = $cleanupRunId; Root = 'relative'; AgentResult = $completedResult }
+            [pscustomobject]@{ Name = 'the working root is a UNC share'; Cycle = (Join-Path '\\fileserver\share' $cleanupRunId); RunId = $cleanupRunId; Root = '\\fileserver\share'; AgentResult = $completedResult }
+            [pscustomobject]@{ Name = 'the working directory was written non-canonically'; Cycle = ('C:\ProgramData/PatchingGuestOps/' + $cleanupRunId); RunId = $cleanupRunId; Root = 'C:\ProgramData/PatchingGuestOps'; AgentResult = $completedResult }
+            # The root and the cycle are validated independently: a handle where only one of
+            # them is malformed must still refuse, whichever one it is.
+            [pscustomobject]@{ Name = 'only the working root is malformed'; Cycle = (Join-Path 'C:\ProgramData\PatchingGuestOps' $cleanupRunId); RunId = $cleanupRunId; Root = 'C:\ProgramData/PatchingGuestOps'; AgentResult = $completedResult }
+            [pscustomobject]@{ Name = 'only the cycle directory is malformed'; Cycle = ('C:\ProgramData/PatchingGuestOps/' + $cleanupRunId); RunId = $cleanupRunId; Root = 'C:\ProgramData\PatchingGuestOps'; AgentResult = $completedResult }
+        )
+
+        foreach ($negativeCase in $negativeCases) {
+            Reset-CleanupCase
+            if ($null -ne $negativeCase.PSObject.Properties['StatusJson']) {
+                $script:cleanupStatusJson = ('{"runId":"' + $negativeCase.RunId + '","outcome":"Started","finishedAt":null,"errors":[]}')
+            }
+            else {
+                # The status has to carry THIS case's run id, or Complete-VMAgentCycle throws on
+                # the identity comparison and the case never reaches the guard it is named for.
+                $script:cleanupStatusJson = ('{"runId":"' + $negativeCase.RunId + '","outcome":"InstallSucceeded","finishedAt":"2026-09-11T10:00:00Z","errors":[]}')
+            }
+            if ($null -ne $negativeCase.PSObject.Properties['LogFails']) {
+                $script:cleanupLogDownloadFails = $true
+            }
+
+            $caseHandle = New-CleanupHandle -CycleDirectory $negativeCase.Cycle -RunId $negativeCase.RunId -Root $negativeCase.Root
+            $casePayload = $null
+            try {
+                $casePayload = Complete-VMAgentCycle -Handle $caseHandle -AgentResult $negativeCase.AgentResult
+            }
+            catch {
+                $casePayload = $null
+            }
+
+            Assert-Equal -Actual @($script:cleanupDeleteCalls).Count -Expected 0 -Message ('F3: nothing is deleted when ' + $negativeCase.Name)
+            if ($null -ne $casePayload) {
+                Assert-Equal -Actual $casePayload.CleanupStatus -Expected 'Retained' -Message ('F3: the cycle directory is retained when ' + $negativeCase.Name)
+                Assert-Equal -Actual ([string]::IsNullOrWhiteSpace([string]$casePayload.CleanupReason)) -Expected $false -Message ('F3: retaining the directory says why when ' + $negativeCase.Name)
+            }
+        }
+
+        # The status came from an earlier read rather than this collection - which is how
+        # Test-VMAgentCycleComplete recovers a cycle whose process vSphere has forgotten.
+        # Everything else looks finished, which is exactly why this has to be checked: the file
+        # on the stepping stone says nothing about what is still sitting on the guest.
+        Reset-CleanupCase
+        $staleStatusHandle = New-CleanupHandle -CycleDirectory (Join-Path $cleanupRoot $cleanupRunId)
+        $staleStatusHandle.Status = ($script:cleanupStatusJson | ConvertFrom-Json)
+        Set-Content -LiteralPath (Join-Path $cleanupLocalDir 'status.json') -Value $script:cleanupStatusJson -Encoding UTF8
+        $stalePayload = Complete-VMAgentCycle -Handle $staleStatusHandle -AgentResult $completedResult
+        Assert-Equal -Actual $stalePayload.StatusDownloaded -Expected $false -Message 'F3: a status carried over from an earlier read is not reported as downloaded'
+        Assert-Equal -Actual $stalePayload.CleanupStatus -Expected 'Retained' -Message 'F3: a cycle whose status was not downloaded this time keeps its guest directory'
+        Assert-Equal -Actual @($script:cleanupDeleteCalls).Count -Expected 0 -Message 'F3: a status carried over from an earlier read deletes nothing'
+
+        # The log download failed, but a log from an earlier attempt is still on disk. Checking
+        # only that the file exists would read that leftover as a successful collection.
+        Reset-CleanupCase
+        Set-Content -LiteralPath (Join-Path $cleanupLocalDir 'agent.log') -Value 'stale agent log from an earlier attempt' -Encoding UTF8
+        $script:cleanupLogDownloadFails = $true
+        $staleLogPayload = Complete-VMAgentCycle -Handle (New-CleanupHandle -CycleDirectory (Join-Path $cleanupRoot $cleanupRunId)) -AgentResult $completedResult 3>$null
+        Assert-Equal -Actual $staleLogPayload.LogDownloaded -Expected $false -Message 'F3: a stale local log is not reported as downloaded'
+        Assert-Equal -Actual $staleLogPayload.CleanupStatus -Expected 'Retained' -Message 'F3: a stale local log does not license a delete'
+        Assert-Equal -Actual @($script:cleanupDeleteCalls).Count -Expected 0 -Message 'F3: a stale local log deletes nothing'
+
+        # curl can exit 0 and still leave nothing on disk. A transfer that reports success is
+        # not the same fact as an artifact that arrived, and only the second one licenses a
+        # delete: the guest copy is the only copy left once the directory is gone.
+        Reset-CleanupCase
+        $script:cleanupLogArrivesEmpty = $true
+        $emptyLogPayload = Complete-VMAgentCycle -Handle (New-CleanupHandle -CycleDirectory (Join-Path $cleanupRoot $cleanupRunId)) -AgentResult $completedResult
+        Assert-Equal -Actual $emptyLogPayload.LogDownloaded -Expected $true -Message 'F3: a transfer that raised no error is reported as a completed download'
+        Assert-Equal -Actual $emptyLogPayload.CleanupStatus -Expected 'Retained' -Message 'F3: an artifact that never reached the stepping stone keeps the guest directory'
+        Assert-Equal -Actual @($script:cleanupDeleteCalls).Count -Expected 0 -Message 'F3: a download that produced no file deletes nothing'
+
+        # A guest that refuses the delete is a warning, not a failed patch run.
+        Reset-CleanupCase
+        $script:cleanupDeleteThrows = $true
+        $warnPayload = Complete-VMAgentCycle -Handle (New-CleanupHandle -CycleDirectory (Join-Path $cleanupRoot $cleanupRunId)) -AgentResult $completedResult 3>$null
+        Assert-Equal -Actual $warnPayload.CleanupStatus -Expected 'Warning' -Message 'F3: a failed delete is reported as a warning'
+        Assert-Equal -Actual ([string]::IsNullOrWhiteSpace([string]$warnPayload.CleanupReason)) -Expected $false -Message 'F3: a failed delete explains itself'
+        Assert-Equal -Actual $warnPayload.AgentCompletionConfirmed -Expected $true -Message 'F3: a failed delete does not overwrite the WUA result'
+        Assert-Equal -Actual ([string]$warnPayload.Status.outcome) -Expected 'InstallSucceeded' -Message 'F3: a failed delete leaves the agent status intact'
+    }
+    finally {
+        Remove-Item -LiteralPath $cleanupLocalDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 if ($failures.Count -gt 0) {
     foreach ($failure in $failures) { Write-Host ('FAIL: ' + $failure) }
     exit 1

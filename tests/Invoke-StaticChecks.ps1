@@ -646,6 +646,51 @@ if ($existingScripts.ContainsKey($guiLauncherPath)) {
     }
 }
 
+# Guest-side deletion is recursive and runs against a directory the customer configured, so it
+# has exactly one entry point that everything else has to go through. A second call site would
+# not have to be wrong to be dangerous - it would simply not be covered by the preconditions and
+# path validation in Remove-CompletedVMAgentCycleArtifacts.
+$guestDeletionPattern = '(?i)Delete(Directory|File)InGuest'
+$guestDeletionSites = @()
+# Production scripts only: the harness fixture necessarily defines a delete double.
+foreach ($deletionRelativePath in @($existingScripts.Keys | Where-Object { $_ -notlike 'tests\*' })) {
+    if (-not $existingScripts.ContainsKey($deletionRelativePath)) {
+        continue
+    }
+
+    $deletionText = Get-ScriptText -Path $existingScripts[$deletionRelativePath]
+    foreach ($deletionMatch in @([regex]::Matches($deletionText, $guestDeletionPattern))) {
+        $guestDeletionSites += ('{0}: {1}' -f $deletionRelativePath, $deletionMatch.Value)
+    }
+}
+
+if ($guestDeletionSites.Count -ne 1) {
+    $failures += ('guest-side deletion must have exactly one call site, found {0}: {1}' -f $guestDeletionSites.Count, (@($guestDeletionSites) -join '; '))
+}
+
+if ($existingScripts.ContainsKey($guestOpsLibPath)) {
+    $cleanupAst = Get-ScriptAst -RelativePath $guestOpsLibPath -Path $existingScripts[$guestOpsLibPath]
+    $cleanupFunction = @($cleanupAst.FindAll({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Remove-CompletedVMAgentCycleArtifacts'
+    }, $true))
+
+    if ($cleanupFunction.Count -ne 1) {
+        $failures += ('{0} must define Remove-CompletedVMAgentCycleArtifacts as the single cleanup entry point' -f $guestOpsLibPath)
+    }
+    elseif (([string]$cleanupFunction[0].Extent.Text) -notmatch '(?i)Delete(Directory|File)InGuest') {
+        $failures += ('{0}: the guest deletion call moved out of Remove-CompletedVMAgentCycleArtifacts, away from its preconditions' -f $guestOpsLibPath)
+    }
+
+    # A finally block would delete on the failure paths too - exactly the cycles whose guest-side
+    # files are worth keeping - so the cleanup call must not sit in one.
+    foreach ($tryStatement in @($cleanupAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.TryStatementAst] }, $true))) {
+        if ($null -ne $tryStatement.Finally -and ([string]$tryStatement.Finally.Extent.Text) -match '(?i)Remove-CompletedVMAgentCycleArtifacts') {
+            $failures += ('{0}: cycle cleanup must not run from a finally block' -f $guestOpsLibPath)
+        }
+    }
+}
+
 if ($failures.Count -gt 0) {
     Write-Host 'Static checks failed:'
     foreach ($failure in $failures) {

@@ -1577,6 +1577,15 @@ if ($resolvedVIServers.Count -eq 0) {
     throw 'At least one vCenter is required. Use -VIServer with one or more names separated by semicolons.'
 }
 
+# Checked here rather than only at the deletion point, because failing there is silent: the run
+# succeeds on every VM and the cycle directories simply accumulate, which is the symptom the
+# cleanup exists to remove. A path written with forward slashes works for every other part of
+# the run, so nothing else would ever tell the operator.
+$workingDirectoryVerdict = Test-GuestDirectoryCanonical -Path $GuestWorkingDirectory
+if (-not $workingDirectoryVerdict.IsCanonical) {
+    throw ('GuestWorkingDirectory "{0}" cannot be used: {1}' -f $GuestWorkingDirectory, $workingDirectoryVerdict.Reason)
+}
+
 if (-not [string]::IsNullOrWhiteSpace($InstallSelection)) {
     throw 'InstallSelection is not supported with grouped update selection. Use SelectedUpdateKeys instead.'
 }

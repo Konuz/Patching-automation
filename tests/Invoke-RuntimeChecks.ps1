@@ -1878,6 +1878,27 @@ Assert-Equal -Actual $nullStoreMissing.Count -Expected 1 -Message 'a null store 
 $nullStoreMap = Expand-CredentialStoreMap -Scope 'guest' -TargetNames @('vm1.contoso.com') -Store $null
 Assert-Equal -Actual $nullStoreMap.Count -Expected 0 -Message 'a null store expands to an empty map rather than throwing'
 
+# --- Guest directory canonical form (scripts/GuestOpsLib.ps1) ---
+# The only destructive operation this tool performs deletes a directory under this path, and the
+# check guarding it runs hours into a run where failing is silent. Rejecting a directory the
+# cleanup could never validate belongs at the entry point, while the operator is still there.
+Assert-Equal -Actual (Test-GuestDirectoryCanonical -Path 'C:\ProgramData\PatchingGuestOps').IsCanonical -Expected $true -Message 'a canonical absolute guest directory is accepted'
+Assert-Equal -Actual (Test-GuestDirectoryCanonical -Path 'C:\ProgramData\PatchingGuestOps\').IsCanonical -Expected $true -Message 'a trailing separator does not make a guest directory non-canonical'
+Assert-Equal -Actual (Test-GuestDirectoryCanonical -Path 'C:\ProgramData/PatchingGuestOps').IsCanonical -Expected $false -Message 'forward slashes are rejected, because cleanup could never match them'
+Assert-Equal -Actual (Test-GuestDirectoryCanonical -Path 'C:\ProgramData/PatchingGuestOps').CanonicalPath -Expected 'C:\ProgramData\PatchingGuestOps' -Message 'a rejected guest directory names the form the operator should write instead'
+Assert-Equal -Actual (Test-GuestDirectoryCanonical -Path 'relative\dir').IsCanonical -Expected $false -Message 'a relative guest directory is rejected before it can be resolved against the stepping stone'
+Assert-Equal -Actual (Test-GuestDirectoryCanonical -Path 'C:relative').IsCanonical -Expected $false -Message 'a drive-relative guest directory is rejected'
+Assert-Equal -Actual (Test-GuestDirectoryCanonical -Path '\\fileserver\share').IsCanonical -Expected $false -Message 'a UNC guest directory is rejected'
+Assert-Contains -Text (Test-GuestDirectoryCanonical -Path '\\fileserver\share').Reason -Needle 'UNC' -Message 'a UNC guest directory says so rather than suggesting itself'
+Assert-Equal -Actual (Test-GuestDirectoryCanonical -Path 'C:\ProgramData\..\ProgramData\PatchingGuestOps').IsCanonical -Expected $false -Message 'a guest directory carrying .. segments is rejected'
+Assert-Equal -Actual (Test-GuestDirectoryCanonical -Path '').IsCanonical -Expected $false -Message 'an empty guest directory is rejected'
+# The reason distinguishes the guards, so each one is observable on its own: a relative path is
+# refused for not being absolute - before GetFullPath could launder it - and not merely because
+# its canonical form differs from what was written.
+Assert-Contains -Text (Test-GuestDirectoryCanonical -Path 'relative\dir').Reason -Needle 'absolute' -Message 'a relative guest directory is refused for not being absolute, before canonicalisation'
+Assert-Contains -Text (Test-GuestDirectoryCanonical -Path 'C:\ProgramData/PatchingGuestOps').Reason -Needle 'canonical' -Message 'a non-canonical absolute path is refused on canonical form, not absoluteness'
+Assert-Contains -Text (Test-GuestDirectoryCanonical -Path '').Reason -Needle 'No guest directory' -Message 'an empty guest directory says it is missing rather than malformed'
+
 # --- Exact-target credential overrides (scripts/SettingsStore.ps1) ---
 # Two vCenters behind one DNS suffix share a group entry. When only one of them rejects its
 # password, the replacement must land on that server alone - rewriting the group entry would

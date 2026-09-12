@@ -90,6 +90,7 @@ function New-FakeGuest {
         ListProcessCallCount = 0
         StartProgramCallCount = 0
         RunId = ''
+        DeletedDirectories = @()
         AgentSpec = $null
         UploadedPaths = @()
         Client = $null
@@ -160,6 +161,10 @@ function New-FakeManagers {
     $fileManager | Add-Member -MemberType ScriptMethod -Name InitiateFileTransferFromGuest -Value {
         param($MoRef, $Auth, $GuestPath)
         return [pscustomobject]@{ Url = 'https://*/guestFile?id=1&token=download'; Size = 10 }
+    }
+    $fileManager | Add-Member -MemberType ScriptMethod -Name DeleteDirectoryInGuest -Value {
+        param($MoRef, $Auth, $DirectoryPath, $Recursive)
+        $this.State.DeletedDirectories += [pscustomobject]@{ Path = [string]$DirectoryPath; Recursive = [bool]$Recursive }
     }
 
     # Get-GuestOpsManagers resolves an AuthManager through the VM's own client, so a fixture
@@ -474,6 +479,27 @@ try {
     Assert-Equal -Actual ([string]::IsNullOrWhiteSpace([string]@($results | Where-Object { $_.VMName -eq 'VM01' })[0].Payload.AgentCompletionReason)) -Expected $false -Message 'harness: completion confirmation carries a reason'
     Assert-Equal -Actual (Test-Path -LiteralPath (Join-Path (Join-Path $workspace 'VM01') 'status.json')) -Expected $true -Message 'harness: status.json lands in the per-VM output directory'
 
+    # The whole cleanup contract against the real Start-VMAgentCycle, which is the only place
+    # that builds the directory pair the removal validates against.
+    Assert-Equal -Actual ([string]@($results | Where-Object { $_.VMName -eq 'VM01' })[0].Payload.CleanupStatus) -Expected 'Removed' -Message 'harness: a completed cycle removes its guest directory'
+    $vm01Deletes = @($script:guestState['VM01'].DeletedDirectories)
+    Assert-Equal -Actual $vm01Deletes.Count -Expected 1 -Message 'harness: a completed cycle deletes exactly once'
+    Assert-Equal -Actual $vm01Deletes[0].Recursive -Expected $true -Message 'harness: the cycle directory is removed recursively'
+    Assert-Equal -Actual ([System.IO.Path]::GetFileName($vm01Deletes[0].Path)) -Expected $script:guestState['VM01'].RunId -Message 'harness: the directory removed is the one this run created'
+    Assert-Equal -Actual ([System.IO.Path]::GetDirectoryName($vm01Deletes[0].Path)) -Expected $guestWorkingDirectory -Message 'harness: the working directory itself is never the delete target'
+
+    # Fleet-wide, not per VM: every guest must have removed its own directory and nobody else's.
+    # VM-name collisions are a tested concern elsewhere in this repo, and a cleanup that crossed
+    # VMs would delete a directory on a machine that is still patching.
+    $fleetDeletes = @('VM01', 'VM02', 'VM03') | ForEach-Object {
+        [pscustomobject]@{ VMName = $_; Deletes = @($script:guestState[$_].DeletedDirectories) }
+    }
+    Assert-Equal -Actual (@($fleetDeletes | Where-Object { $_.Deletes.Count -ne 1 }).Count) -Expected 0 -Message 'harness: every completed cycle in the fleet deletes exactly its own directory once'
+    $crossVmDeletes = @($fleetDeletes | Where-Object { [System.IO.Path]::GetFileName($_.Deletes[0].Path) -ne $script:guestState[$_.VMName].RunId })
+    Assert-Equal -Actual $crossVmDeletes.Count -Expected 0 -Message 'harness: no guest deletes a directory belonging to another run'
+    $distinctDeletedPaths = @(@($fleetDeletes | ForEach-Object { $_.Deletes[0].Path }) | Select-Object -Unique)
+    Assert-Equal -Actual $distinctDeletedPaths.Count -Expected 3 -Message 'harness: the three guests delete three distinct directories'
+
     # Every VM must have been started before the first guest was polled for its agent.
     Assert-Equal -Actual $script:guestState['VM03'].StartProgramCallCount -Expected 2 -Message 'harness: each guest gets one mkdir and one agent start'
 
@@ -568,6 +594,10 @@ try {
     Assert-Equal -Actual ([string]$results[0].Payload.Status.outcome) -Expected 'InstallSucceeded' -Message 'harness: the artifacts still decide the outcome'
     Assert-Equal -Actual ([string]$results[0].Payload.Mode) -Expected 'Apply' -Message 'harness: apply cycles carry their mode'
     Assert-Equal -Actual ([bool]$results[0].Payload.AgentCompletionConfirmed) -Expected $true -Message 'harness: terminal apply status confirms completion despite a vanished process'
+    # A process result vSphere has forgotten is not proof the agent finished, so the guest-side
+    # files stay where a human can still read them.
+    Assert-Equal -Actual ([string]$results[0].Payload.CleanupStatus) -Expected 'Retained' -Message 'harness: a cycle whose process result was lost keeps its guest directory'
+    Assert-Equal -Actual @($script:guestState['VM20'].DeletedDirectories).Count -Expected 0 -Message 'harness: a lost process result deletes nothing'
 }
 finally {
     Remove-Item -LiteralPath $workspace -Recurse -Force -ErrorAction SilentlyContinue

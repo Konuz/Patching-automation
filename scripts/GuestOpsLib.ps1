@@ -741,6 +741,10 @@ function New-VMAgentCycleHandle {
         [string]$GuestLogPath,
         [string]$LocalStatusPath,
         [string]$LocalLogPath,
+        # Two directories, not one. Cleanup compares them, so collapsing them - as the cycle
+        # start used to, by reassigning its own parameter - leaves nothing to validate against.
+        [string]$GuestWorkingDirectory,
+        [string]$GuestCycleDirectory,
         [int]$TransferTimeoutSeconds = 300,
         [ValidateSet('SearchOnly', 'Apply', IgnoreCase = $false)]
         [string]$Mode = 'Apply'
@@ -760,6 +764,8 @@ function New-VMAgentCycleHandle {
         GuestLogPath = $GuestLogPath
         LocalStatusPath = $LocalStatusPath
         LocalLogPath = $LocalLogPath
+        GuestWorkingDirectory = $GuestWorkingDirectory
+        GuestCycleDirectory = $GuestCycleDirectory
         TransferTimeoutSeconds = $TransferTimeoutSeconds
         # Seeded so the property exists before anything reads it: on the fleet timeout path
         # it is read without a poll ever having written it, and StrictMode is unforgiving.
@@ -798,18 +804,20 @@ function Start-VMAgentCycle {
     New-Item -ItemType Directory -Force -Path $VMOutputDirectory | Out-Null
 
     $runId = [guid]::NewGuid().ToString('N')
-    $GuestWorkingDirectory = Join-Path $GuestWorkingDirectory $runId
+    # The root is kept as it was given. Overwriting the parameter here left the handle with
+    # one path where cleanup needs two, and a recursive delete with nothing to validate against.
+    $guestCycleDirectory = Join-Path $GuestWorkingDirectory $runId
     if (-not [string]::IsNullOrWhiteSpace($LocalSelectionPath)) {
-        $SelectionPath = Join-Path $GuestWorkingDirectory 'selection.json'
+        $SelectionPath = Join-Path $guestCycleDirectory 'selection.json'
     }
 
-    $guestAgentPath = Join-Path $GuestWorkingDirectory 'Run-LocalPatch.ps1'
-    $guestStatusPath = Join-Path $GuestWorkingDirectory 'status.json'
-    $guestLogPath = Join-Path $GuestWorkingDirectory 'agent.log'
+    $guestAgentPath = Join-Path $guestCycleDirectory 'Run-LocalPatch.ps1'
+    $guestStatusPath = Join-Path $guestCycleDirectory 'status.json'
+    $guestLogPath = Join-Path $guestCycleDirectory 'agent.log'
     $localStatusPath = Join-Path $VMOutputDirectory 'status.json'
     $localLogPath = Join-Path $VMOutputDirectory 'agent.log'
 
-    $mkdirProcessId = New-GuestDirectory -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -DirectoryPath $GuestWorkingDirectory
+    $mkdirProcessId = New-GuestDirectory -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -DirectoryPath $guestCycleDirectory
     $mkdirResult = Wait-GuestProcess -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -ProcessId $mkdirProcessId -TimeoutSeconds 120 -PollSeconds 5
     if (-not $mkdirResult.Completed -or ($null -ne $mkdirResult.ExitCode -and $mkdirResult.ExitCode -ne 0)) {
         throw ('Failed to create guest working directory. Completed={0}; ExitCode={1}' -f $mkdirResult.Completed, $mkdirResult.ExitCode)
@@ -819,17 +827,17 @@ function Start-VMAgentCycle {
     # nothing else bounds a curl hanging against an unresponsive ESXi data plane.
     Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $AgentPath -GuestPath $guestAgentPath -TimeoutSeconds $TransferTimeoutSeconds
 
-    $guestIdentityHelperPath = Join-Path $GuestWorkingDirectory 'UpdateIdentity.ps1'
+    $guestIdentityHelperPath = Join-Path $guestCycleDirectory 'UpdateIdentity.ps1'
     Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $IdentityHelperPath -GuestPath $guestIdentityHelperPath -TimeoutSeconds $TransferTimeoutSeconds
 
     if (-not [string]::IsNullOrWhiteSpace($LocalSelectionPath) -and -not [string]::IsNullOrWhiteSpace($SelectionPath)) {
         Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $LocalSelectionPath -GuestPath $SelectionPath -TimeoutSeconds $TransferTimeoutSeconds
     }
 
-    $agentProcessId = Start-GuestAgent -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -GuestAgentPath $guestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -RunId $runId -SearchOnly:$SearchOnly
+    $agentProcessId = Start-GuestAgent -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -GuestAgentPath $guestAgentPath -GuestWorkingDirectory $guestCycleDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -RunId $runId -SearchOnly:$SearchOnly
 
     $mode = if ($SearchOnly) { 'SearchOnly' } else { 'Apply' }
-    return New-VMAgentCycleHandle -VMName $VMName -RunId $runId -Mode $mode -Managers $Managers -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -ProcessId $agentProcessId -GuestStatusPath $guestStatusPath -GuestLogPath $guestLogPath -LocalStatusPath $localStatusPath -LocalLogPath $localLogPath -TransferTimeoutSeconds $TransferTimeoutSeconds
+    return New-VMAgentCycleHandle -VMName $VMName -RunId $runId -Mode $mode -Managers $Managers -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -ProcessId $agentProcessId -GuestStatusPath $guestStatusPath -GuestLogPath $guestLogPath -LocalStatusPath $localStatusPath -LocalLogPath $localLogPath -GuestWorkingDirectory $GuestWorkingDirectory -GuestCycleDirectory $guestCycleDirectory -TransferTimeoutSeconds $TransferTimeoutSeconds
 }
 
 function Test-GuestOperationFileNotFound {
@@ -948,6 +956,191 @@ function Test-VMAgentCycleComplete {
     return $null
 }
 
+# The guest working directory belongs to the customer, not to this tool: it is a fixed path the
+# operator configured, and anything else may live under it. The only delete this tool performs is
+# recursive, so it is fenced in by an explicit allow-list of conditions rather than by a check for
+# anything obviously wrong. Every failure answers "retain", never "delete and hope".
+# The entry point and the deletion point have to agree on what "canonical" means, or a
+# working directory accepted at startup fails validation hours later, silently, on every VM.
+# Returns the canonical form so the caller can tell the operator what to write instead.
+function Test-GuestDirectoryCanonical {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return [pscustomobject]@{ IsCanonical = $false; CanonicalPath = $null; Reason = 'No guest directory was supplied.' }
+    }
+
+    if ($Path.StartsWith('\\')) {
+        return [pscustomobject]@{ IsCanonical = $false; CanonicalPath = $null; Reason = 'A UNC path is not a supported guest directory.' }
+    }
+
+    # Checked BEFORE GetFullPath, which resolves a relative path against the stepping
+    # stone's current directory and would hand back something absolute that never was.
+    if ($Path -notmatch '^[A-Za-z]:\\') {
+        return [pscustomobject]@{ IsCanonical = $false; CanonicalPath = $null; Reason = 'A guest directory must be an absolute local path such as C:\ProgramData\PatchingGuestOps.' }
+    }
+
+    $canonical = $null
+    try {
+        $canonical = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    }
+    catch {
+        return [pscustomobject]@{ IsCanonical = $false; CanonicalPath = $null; Reason = 'The guest directory is not a usable Windows path.' }
+    }
+
+    if (-not [string]::Equals($canonical, $Path.TrimEnd('\'), [System.StringComparison]::Ordinal)) {
+        return [pscustomobject]@{ IsCanonical = $false; CanonicalPath = $canonical; Reason = ('The guest directory is not in canonical form; write "{0}" instead.' -f $canonical) }
+    }
+
+    return [pscustomobject]@{ IsCanonical = $true; CanonicalPath = $canonical; Reason = $null }
+}
+
+function Test-GuestCycleDirectoryRemovable {
+    param($Handle)
+
+    $rootRaw = [string](Get-ObjectPropertyValue -InputObject $Handle -Path @('GuestWorkingDirectory'))
+    $cycleRaw = [string](Get-ObjectPropertyValue -InputObject $Handle -Path @('GuestCycleDirectory'))
+    $runId = [string](Get-ObjectPropertyValue -InputObject $Handle -Path @('RunId'))
+
+    if ([string]::IsNullOrWhiteSpace($rootRaw) -or [string]::IsNullOrWhiteSpace($cycleRaw)) {
+        return New-GuestCycleCleanupVerdict -Removable $false -Reason 'The cycle handle carries no guest directory pair.'
+    }
+
+    # The run id names the directory, so it decides what may be deleted. Only the format this
+    # tool generates is accepted; anything else means the handle was not built by a cycle start.
+    if ($runId -cnotmatch '^[0-9a-f]{32}\z') {
+        return New-GuestCycleCleanupVerdict -Removable $false -Reason ('Run id "{0}" is not a generated cycle identity.' -f $runId)
+    }
+
+    # One notion of canonical, shared with the entry point that accepted this directory in the
+    # first place. Absoluteness is settled there, before GetFullPath, and so is the requirement
+    # that the string sent to the guest is the string this validated - where those differ, the
+    # stepping stone's normalisation is an assumption about the guest rather than a fact.
+    $rootVerdict = Test-GuestDirectoryCanonical -Path $rootRaw
+    if (-not $rootVerdict.IsCanonical) {
+        return New-GuestCycleCleanupVerdict -Removable $false -Reason ('Working directory "{0}" cannot be validated: {1}' -f $rootRaw, $rootVerdict.Reason)
+    }
+
+    $cycleVerdict = Test-GuestDirectoryCanonical -Path $cycleRaw
+    if (-not $cycleVerdict.IsCanonical) {
+        return New-GuestCycleCleanupVerdict -Removable $false -Reason ('Cycle directory "{0}" cannot be validated: {1}' -f $cycleRaw, $cycleVerdict.Reason)
+    }
+
+    $rootPath = $rootVerdict.CanonicalPath
+    $cyclePath = $cycleVerdict.CanonicalPath
+
+    # A drive root trims to "C:", which has no parent to compare against.
+    if ($cyclePath.Length -le 2 -or $rootPath.Length -le 2) {
+        return New-GuestCycleCleanupVerdict -Removable $false -Reason 'A drive root is never removed.'
+    }
+
+    if ([string]::Equals($cyclePath, $rootPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return New-GuestCycleCleanupVerdict -Removable $false -Reason 'The cycle directory is the working directory itself.'
+    }
+
+    # Comparing the immediate parent rather than a prefix is what makes a sibling that merely
+    # starts with the same characters - PatchingGuestOpsOld next to PatchingGuestOps - unreachable.
+    $parentPath = [string][System.IO.Path]::GetDirectoryName($cyclePath)
+    if ([string]::IsNullOrWhiteSpace($parentPath)) {
+        return New-GuestCycleCleanupVerdict -Removable $false -Reason 'The cycle directory has no parent to validate.'
+    }
+    $parentPath = $parentPath.TrimEnd('\')
+
+    if (-not [string]::Equals($parentPath, $rootPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return New-GuestCycleCleanupVerdict -Removable $false -Reason ('The cycle directory is not directly under the working directory: "{0}".' -f $cyclePath)
+    }
+
+    # Case-sensitive: the run id was generated lowercase, and a name that differs only in case
+    # is a different directory as far as this tool is concerned.
+    if (-not [string]::Equals([System.IO.Path]::GetFileName($cyclePath), $runId, [System.StringComparison]::Ordinal)) {
+        return New-GuestCycleCleanupVerdict -Removable $false -Reason ('The cycle directory is not named for this run: "{0}".' -f $cyclePath)
+    }
+
+    return New-GuestCycleCleanupVerdict -Removable $true -Reason $null -Path $cyclePath
+}
+
+function New-GuestCycleCleanupVerdict {
+    param(
+        [bool]$Removable,
+        [string]$Reason,
+        [string]$Path
+    )
+
+    return [pscustomobject]@{
+        Removable = $Removable
+        Reason = $Reason
+        Path = $Path
+    }
+}
+
+# The sole deletion point. It runs after the artifacts are collected and parsed, never from a
+# finally block: a cycle that failed half way through is exactly the one whose guest-side files
+# are worth keeping.
+function Remove-CompletedVMAgentCycleArtifacts {
+    param(
+        $Handle,
+        $Cycle
+    )
+
+    $completionConfirmed = [bool](Get-ObjectPropertyValue -InputObject $Cycle -Path @('AgentCompletionConfirmed') -DefaultValue $false)
+    if (-not $completionConfirmed) {
+        return New-GuestCycleCleanupResult -Status 'Retained' -Reason 'The agent did not confirm a terminal status for this run.'
+    }
+
+    # A process result the fleet never obtained is not evidence of completion, whatever the
+    # status file says: the agent writes status.json eagerly, and a guest that dropped out of
+    # vSphere's process list may still be running.
+    $agentResult = Get-ObjectPropertyValue -InputObject $Cycle -Path @('AgentResult')
+    if ($null -eq $agentResult -or -not [bool](Get-ObjectPropertyValue -InputObject $agentResult -Path @('Completed') -DefaultValue $false)) {
+        return New-GuestCycleCleanupResult -Status 'Retained' -Reason 'The guest process did not report completion.'
+    }
+
+    # Both artifacts must have arrived in THIS collection. A status left over from an earlier
+    # read proves nothing about what is on the guest now.
+    if (-not [bool](Get-ObjectPropertyValue -InputObject $Cycle -Path @('StatusDownloaded') -DefaultValue $false)) {
+        return New-GuestCycleCleanupResult -Status 'Retained' -Reason 'status.json was not downloaded during this collection.'
+    }
+
+    if (-not [bool](Get-ObjectPropertyValue -InputObject $Cycle -Path @('LogDownloaded') -DefaultValue $false)) {
+        return New-GuestCycleCleanupResult -Status 'Retained' -Reason 'agent.log was not downloaded during this collection.'
+    }
+
+    foreach ($localPath in @([string]$Handle.LocalStatusPath, [string]$Handle.LocalLogPath)) {
+        if (-not (Test-Path -LiteralPath $localPath -PathType Leaf)) {
+            return New-GuestCycleCleanupResult -Status 'Retained' -Reason ('The collected artifact "{0}" is not on the stepping stone.' -f $localPath)
+        }
+    }
+
+    $verdict = Test-GuestCycleDirectoryRemovable -Handle $Handle
+    if (-not $verdict.Removable) {
+        return New-GuestCycleCleanupResult -Status 'Retained' -Reason $verdict.Reason
+    }
+
+    try {
+        $null = $Handle.Managers.FileManager.DeleteDirectoryInGuest($Handle.VMView.MoRef, $Handle.GuestAuth, $verdict.Path, $true)
+    }
+    catch {
+        # A guest that refuses the delete leaves files behind; it does not make a successful
+        # patch run into a failed one, so this never touches the WUA result.
+        return New-GuestCycleCleanupResult -Status 'Warning' -Reason ('The cycle directory could not be removed: {0}' -f $_.Exception.Message)
+    }
+
+    return New-GuestCycleCleanupResult -Status 'Removed' -Reason $null
+}
+
+function New-GuestCycleCleanupResult {
+    param(
+        [ValidateSet('Removed', 'Retained', 'Warning')]
+        [string]$Status,
+        [string]$Reason
+    )
+
+    return [pscustomobject]@{
+        CleanupStatus = $Status
+        CleanupReason = $Reason
+    }
+}
+
 function Complete-VMAgentCycle {
     param(
         $Handle,
@@ -959,10 +1152,16 @@ function Complete-VMAgentCycle {
     # mid-cycle shows up here as an InvalidGuestLogin, and re-throwing a bare string below
     # would erase the one piece of information that lets the caller offer recovery.
     $artifactException = $null
+    # Whether each artifact arrived in THIS collection, which is not the same question as
+    # whether a file is sitting in the output directory: a status left over from an earlier
+    # read proves nothing about what is still on the guest.
+    $statusDownloaded = $false
+    $logDownloaded = $false
     $status = Get-ObjectPropertyValue -InputObject $Handle -Path @('Status')
     if ($null -eq $status) {
         try {
             $status = Read-VMAgentCycleStatus -Handle $Handle
+            $statusDownloaded = ($null -ne $status)
         }
         catch {
             $artifactErrors += ('status.json download failed: {0}' -f $_.Exception.Message)
@@ -972,6 +1171,7 @@ function Complete-VMAgentCycle {
 
     try {
         Receive-GuestFile -FileManager $Handle.Managers.FileManager -VMView $Handle.VMView -GuestAuth $Handle.GuestAuth -HostName $Handle.HostName -CurlPath $Handle.CurlPath -GuestPath $Handle.GuestLogPath -LocalPath $Handle.LocalLogPath -TimeoutSeconds $Handle.TransferTimeoutSeconds
+        $logDownloaded = $true
     }
     catch {
         $artifactErrors += ('agent.log download failed: {0}' -f $_.Exception.Message)
@@ -1006,14 +1206,45 @@ function Complete-VMAgentCycle {
         'Agent status does not confirm terminal completion for the current run.'
     }
 
-    return [pscustomobject]@{
+    $cycle = [pscustomobject]@{
         RunId = $Handle.RunId
         Mode = $mode
         AgentCompletionConfirmed = [bool]$agentCompletionConfirmed
         AgentCompletionReason = $agentCompletionReason
         AgentResult = $AgentResult
         Status = $status
+        StatusDownloaded = $statusDownloaded
+        LogDownloaded = $logDownloaded
+        CleanupStatus = $null
+        CleanupReason = $null
     }
+
+    # Cleanup runs here and nowhere else: after both downloads and after the status has been
+    # parsed and matched to this run. A finally block would fire on the failure paths above,
+    # which are exactly the cycles whose guest-side files someone will want to look at.
+    # Minor 2: the cleanup decision must never turn a successful patch into a failed VM.
+    # Nothing in it is expected to throw, which is exactly why an unexpected throw here
+    # would be so expensive - it would surface as a fleet collection error.
+    $cleanup = $null
+    try {
+        $cleanup = Remove-CompletedVMAgentCycleArtifacts -Handle $Handle -Cycle $cycle
+    }
+    catch {
+        $cleanup = New-GuestCycleCleanupResult -Status 'Warning' -Reason ('Cycle cleanup could not be evaluated: {0}' -f $_.Exception.Message)
+    }
+    $cycle.CleanupStatus = $cleanup.CleanupStatus
+    $cycle.CleanupReason = $cleanup.CleanupReason
+    # A directory left behind is the symptom this cleanup exists to remove, so it is never
+    # silent: without this line the only way to notice is to go and look at the guest.
+    if ($cleanup.CleanupStatus -eq 'Retained') {
+        Write-Step -Message ('Guest cycle directory kept on {0}: {1}' -f (Get-ObjectPropertyValue -InputObject $Handle -Path @('VMName')), $cleanup.CleanupReason)
+    }
+
+    if ($cleanup.CleanupStatus -eq 'Warning') {
+        Write-Warning $cleanup.CleanupReason
+    }
+
+    return $cycle
 }
 
 function Invoke-VMGuestReboot {

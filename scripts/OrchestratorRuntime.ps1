@@ -426,6 +426,8 @@ function New-ApplyResultFromCycle {
         rebootRequired = $rebootRequired
         agentCompletionConfirmed = $agentCompletionConfirmed
         agentCompletionReason = $agentCompletionReason
+        cleanupStatus = Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus'
+        cleanupReason = Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason'
         errors = @($errors)
     }
 }
