@@ -137,31 +137,12 @@ function Get-DefaultUpdateSelection {
         [string]$Title,
         [string[]]$Categories = @(),
         [string]$MsrcSeverity,
-        [string]$UpdateType,
-        [string[]]$KbArticleIds = @()
+        [string]$UpdateType
     )
 
     $text = ('{0} {1}' -f $Title, (@($Categories) -join ' '))
 
     # Exclusions first — these veto selection regardless of MSRC severity.
-    # Defender definitions ship several times a day and Defender updates them through its own
-    # channel, so preselecting them means every maintenance window installs something that was
-    # already handled continuously - and each new revision would keep a run from reaching Green.
-    # They stay visible and installable; this decides only what is ticked. KB2267602 is the
-    # stable identity, because the title is localised: matching the title alone would silently
-    # stop working on a non-English server. The category is deliberately not consulted - the
-    # agent records only the localised category name, not its GUID, so it is no more durable
-    # than the title. This covers Defender Antivirus only; SCEP and legacy Windows Defender
-    # definitions are still preselected.
-    # Every id must be the definition KB, not merely one of them: a package that listed
-    # 2267602 alongside its own KB would otherwise be dropped from the default selection - and
-    # because Green counts only preselected groups, it would stop blocking Green as well.
-    $definitionKbMatches = @($KbArticleIds | Where-Object { ([string]$_).Trim() -match '^(?i:KB)?2267602$' }).Count
-    $isDefenderDefinition = ($definitionKbMatches -gt 0) -and ($definitionKbMatches -eq @($KbArticleIds).Count)
-    if ($isDefenderDefinition -or ($Title -match '(?i)security intelligence update' -and $Title -match '(?i)defender')) {
-        return $false
-    }
-
     if ([string]$UpdateType -match '(?i)^(driver|2)$') {
         return $false
     }
@@ -321,7 +302,7 @@ function New-UpdateGroupRecords {
         # patchable VM. A group whose sole applicable VM is a Failover Cluster (excluded
         # from patchableVmNames) would otherwise show a checked box with "Patchable: 0 VM"
         # and produce a default plan that installs on nothing.
-        $selectedByDefault = ([bool](Get-DefaultUpdateSelection -Title ([string]$group.title) -Categories $group.categories -MsrcSeverity ([string]$group.msrcSeverity) -UpdateType ([string]$group.updateType) -KbArticleIds @($group.kbArticleIds))) -and ($patchableVmNames.Count -gt 0)
+        $selectedByDefault = ([bool](Get-DefaultUpdateSelection -Title ([string]$group.title) -Categories $group.categories -MsrcSeverity ([string]$group.msrcSeverity) -UpdateType ([string]$group.updateType))) -and ($patchableVmNames.Count -gt 0)
 
         $records += [pscustomobject]@{
             identityKey = $group.identityKey
@@ -491,6 +472,35 @@ function ConvertTo-PatchPlanRecords {
     return @($records)
 }
 
+# Defender security intelligence updates are installed like anything else - they are cheap,
+# need no reboot, and the operator can untick them. What they must not do is decide whether a
+# VM is finished. WUA republishes them several times a day under a new UpdateID|RevisionNumber,
+# so round N installs one revision and round N+1 discovers the next as a different group: a
+# fleet that is fully patched would never reach Green and every run would exhaust MaxPatchRounds
+# and exit 1. They are judged on their own schedule, not on the maintenance window.
+#
+# The match is on KB2267602 rather than the title, because the title is localised and a title
+# rule would silently stop working on a non-English server; the English title is a backstop for
+# a guest that returns no KB ids. Every id must be the definition KB, not merely one of them,
+# so a package listing it alongside its own KB still counts normally. The category is not
+# consulted: the agent records only its localised name, not its GUID.
+#
+# Defender platform, engine and cumulative Windows updates are untouched by this, and so are
+# SCEP and legacy Windows Defender definitions.
+function Test-IsDefenderDefinitionUpdate {
+    param(
+        [string]$Title,
+        [string[]]$KbArticleIds = @()
+    )
+
+    $definitionKbMatches = @($KbArticleIds | Where-Object { ([string]$_).Trim() -match '^(?i:KB)?2267602$' }).Count
+    if (($definitionKbMatches -gt 0) -and ($definitionKbMatches -eq @($KbArticleIds).Count)) {
+        return $true
+    }
+
+    return (($Title -match '(?i)security intelligence update') -and ($Title -match '(?i)defender'))
+}
+
 function Get-VMPatchCompletionStates {
     param(
         $DiscoveryRecords,
@@ -519,6 +529,13 @@ function Get-VMPatchCompletionStates {
     $deselectedCountByVm = @{}
     foreach ($group in @($UpdateGroups)) {
         if ($null -eq $group -or -not [bool](Get-ModelPropertyValue -InputObject $group -Name 'selectedByDefault' -DefaultValue $false)) {
+            continue
+        }
+
+        # Signatures are installed like anything else; they simply do not get a vote on whether
+        # the VM is finished. Counting them either way would mean a fully patched fleet never
+        # converges, because the next revision is published within hours.
+        if (Test-IsDefenderDefinitionUpdate -Title ([string](Get-ModelPropertyValue -InputObject $group -Name 'title')) -KbArticleIds @(Get-ModelPropertyValue -InputObject $group -Name 'kbArticleIds' -DefaultValue @())) {
             continue
         }
 

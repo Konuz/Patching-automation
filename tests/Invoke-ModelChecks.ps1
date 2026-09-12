@@ -192,25 +192,29 @@ Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Security-like d
 Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Localized package title' -Categories @('Updates') -MsrcSeverity 'Critical' -UpdateType '2')) -Message 'integer driver enum value is skipped like the Driver string'
 Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title '2026-06 Preview Cumulative Update for Windows Server' -Categories @('Updates') -MsrcSeverity 'Critical' -UpdateType 'Software')) -Message 'critical severity does not override the preview exclusion'
 
-# Defender definition updates ship several times a day and Defender has its own update channel,
-# so preselecting them means every maintenance window installs something that was already
-# handled continuously. They stay visible and installable - this only changes what is ticked.
-# KB2267602 is the stable identity; the title is localised and cannot be relied on alone.
-Assert-Equal -Actual (Get-DefaultUpdateSelection -Title 'Security Intelligence Update for Microsoft Defender Antivirus' -Categories @('Definition Updates') -UpdateType Software -KbArticleIds @('2267602')) -Expected $false -Message 'Defender definitions are opt-in'
-# Marked Critical, which is what this KB usually carries, so nothing but the KB rule can
-# deselect it: without the severity the localised title would fall through to $false anyway
-# and the assertion would hold for the wrong reason.
-Assert-Equal -Actual (Get-DefaultUpdateSelection -Title 'Aktualizacja analizy zabezpieczen dla Microsoft Defender Antivirus' -MsrcSeverity 'Critical' -UpdateType Software -KbArticleIds @('KB2267602')) -Expected $false -Message 'KB metadata is independent of title language'
-Assert-Equal -Actual (Get-DefaultUpdateSelection -Title 'Security Update for Microsoft Defender Antivirus antimalware platform' -UpdateType Software -KbArticleIds @('4052623')) -Expected $true -Message 'Platform security updates remain selected'
+# Defender security intelligence updates are ticked like anything else - they install cheaply and
+# need no reboot. What they must not do is decide whether a VM is finished; that is asserted in the
+# completion-state section below, not here.
+Assert-Equal -Actual (Get-DefaultUpdateSelection -Title 'Security Intelligence Update for Microsoft Defender Antivirus' -Categories @('Definition Updates') -MsrcSeverity 'Critical' -UpdateType Software) -Expected $true -Message 'a Defender definition is still selected by default'
+Assert-Equal -Actual (Get-DefaultUpdateSelection -Title 'Security Update for Microsoft Defender Antivirus antimalware platform' -UpdateType Software) -Expected $true -Message 'Platform security updates remain selected'
 
-# The exclusion has to come before the severity rules, or a definition marked Critical by MSRC
-# would be preselected anyway - which is the common case for this KB.
-Assert-Equal -Actual (Get-DefaultUpdateSelection -Title 'Security Intelligence Update for Microsoft Defender Antivirus' -Categories @('Definition Updates') -MsrcSeverity 'Critical' -UpdateType Software -KbArticleIds @('2267602')) -Expected $false -Message 'MSRC severity does not override the Defender definition exclusion'
-Assert-Equal -Actual (Get-DefaultUpdateSelection -Title 'Security Intelligence Update for Microsoft Defender Antivirus' -Categories @('Definition Updates') -UpdateType Software) -Expected $false -Message 'an English definition title is excluded even when WUA exposed no KB id'
-Assert-Equal -Actual (Get-DefaultUpdateSelection -Title 'Aktualizacja analizy zabezpieczen dla Microsoft Defender Antivirus' -MsrcSeverity 'Critical' -UpdateType Software -KbArticleIds @(' kb2267602 ')) -Expected $false -Message 'a KB id with surrounding whitespace and mixed case is still recognised'
-Assert-Equal -Actual (Get-DefaultUpdateSelection -Title '2026-06 Cumulative Update for Windows Server' -Categories @('Security Updates') -KbArticleIds @('5031234')) -Expected $true -Message 'an unrelated KB id does not deselect a cumulative update'
-Assert-Equal -Actual (Get-DefaultUpdateSelection -Title '2026-06 Cumulative Update for Windows Server' -Categories @('Security Updates') -KbArticleIds @('22676021')) -Expected $true -Message 'a KB id that merely contains the definition number is not the definition update'
-Assert-Equal -Actual (Get-DefaultUpdateSelection -Title '2026-06 Cumulative Update for Windows Server' -Categories @('Security Updates') -MsrcSeverity 'Critical' -KbArticleIds @('5031234', '2267602')) -Expected $true -Message 'a package listing the definition KB alongside its own is not treated as the definition'
+# The predicate that keeps them out of the completion count. KB2267602 is the stable identity -
+# the title is localised, so a title rule would silently stop working on a non-English server.
+Assert-Equal -Actual (Test-IsDefenderDefinitionUpdate -Title 'Security Intelligence Update for Microsoft Defender Antivirus' -KbArticleIds @('2267602')) -Expected $true -Message 'a Defender definition is recognised by its KB id'
+Assert-Equal -Actual (Test-IsDefenderDefinitionUpdate -Title 'Aktualizacja analizy zabezpieczen dla Microsoft Defender Antivirus' -KbArticleIds @('KB2267602')) -Expected $true -Message 'KB metadata is independent of title language'
+Assert-Equal -Actual (Test-IsDefenderDefinitionUpdate -Title 'Aktualizacja analizy zabezpieczen dla Microsoft Defender Antivirus' -KbArticleIds @(' kb2267602 ')) -Expected $true -Message 'a KB id with surrounding whitespace and mixed case is still recognised'
+Assert-Equal -Actual (Test-IsDefenderDefinitionUpdate -Title 'Security Intelligence Update for Microsoft Defender Antivirus') -Expected $true -Message 'an English definition title is recognised even when WUA exposed no KB id'
+Assert-Equal -Actual (Test-IsDefenderDefinitionUpdate -Title 'Security Update for Microsoft Defender Antivirus antimalware platform' -KbArticleIds @('4052623')) -Expected $false -Message 'the Defender platform update is not a definition'
+Assert-Equal -Actual (Test-IsDefenderDefinitionUpdate -Title '2026-06 Cumulative Update for Windows Server' -KbArticleIds @('5031234')) -Expected $false -Message 'an unrelated KB id is not a definition'
+Assert-Equal -Actual (Test-IsDefenderDefinitionUpdate -Title '2026-06 Cumulative Update for Windows Server' -KbArticleIds @('22676021')) -Expected $false -Message 'a KB id that merely contains the definition number is not the definition update'
+Assert-Equal -Actual (Test-IsDefenderDefinitionUpdate -Title '2026-06 Cumulative Update for Windows Server' -KbArticleIds @('5031234', '2267602')) -Expected $false -Message 'a package listing the definition KB alongside its own is not the definition'
+Assert-Equal -Actual (Test-IsDefenderDefinitionUpdate -Title 'Definition Update for Microsoft Endpoint Protection' -KbArticleIds @('2461484')) -Expected $false -Message 'SCEP definitions are a separate family this rule does not claim'
+
+Assert-True -Condition (Get-DefaultUpdateSelection -Title 'Localized package title' -Categories @('Updates') -MsrcSeverity 'Critical' -UpdateType 'Software') -Message 'critical MSRC severity is selected even when title is not English'
+Assert-True -Condition (Get-DefaultUpdateSelection -Title 'Localized package title' -Categories @('Updates') -MsrcSeverity 'Important' -UpdateType 'Software') -Message 'important MSRC severity is selected even when title is not English'
+Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Security-like driver title' -Categories @('Security Updates') -MsrcSeverity 'Critical' -UpdateType 'Driver')) -Message 'driver update type is skipped even when severity is critical'
+Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Localized package title' -Categories @('Updates') -MsrcSeverity 'Critical' -UpdateType '2')) -Message 'integer driver enum value is skipped like the Driver string'
+Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title '2026-06 Preview Cumulative Update for Windows Server' -Categories @('Updates') -MsrcSeverity 'Critical' -UpdateType 'Software')) -Message 'critical severity does not override the preview exclusion'
 
 Assert-Equal -Actual (Get-RoleFlagText -RoleFlags $null) -Expected 'unknown' -Message 'missing role flags are unknown'
 Assert-Equal -Actual (Get-RoleFlagText -RoleFlags ([pscustomobject]@{ detected = @() })) -Expected 'none' -Message 'empty role flags are none'
@@ -469,22 +473,23 @@ $definitionKey = 'dddddddd-4444-4444-4444-444444444444|200'
 $cumulativeKey = 'cccccccc-3333-3333-3333-333333333333|1'
 $platformKey = 'eeeeeeee-5555-5555-5555-555555555555|1'
 
-Assert-Equal -Actual ($null -ne (Get-GroupFor -Groups $defenderGroups -IdentityKey $definitionKey)) -Expected $true -Message 'a Defender definition is still offered to the operator'
-Assert-Equal -Actual (Get-GroupFor -Groups $defenderGroups -IdentityKey $definitionKey).selectedByDefault -Expected $false -Message 'a Defender definition is not ticked by default'
+Assert-Equal -Actual ($null -ne (Get-GroupFor -Groups $defenderGroups -IdentityKey $definitionKey)) -Expected $true -Message 'a Defender definition is offered to the operator'
+Assert-Equal -Actual (Get-GroupFor -Groups $defenderGroups -IdentityKey $definitionKey).selectedByDefault -Expected $true -Message 'a Defender definition is ticked like any other update'
 Assert-Equal -Actual (Get-GroupFor -Groups $defenderGroups -IdentityKey $cumulativeKey).selectedByDefault -Expected $true -Message 'the Windows cumulative update is still ticked by default'
 Assert-Equal -Actual (Get-GroupFor -Groups $defenderGroups -IdentityKey $platformKey).selectedByDefault -Expected $true -Message 'the Defender platform update is still ticked by default'
 Assert-Equal -Actual (Get-GroupFor -Groups $defenderGroups -IdentityKey 'ffffffff-6666-6666-6666-666666666666|1').selectedByDefault -Expected $false -Message 'the driver exclusion is unchanged'
 Assert-Equal -Actual (Get-GroupFor -Groups $defenderGroups -IdentityKey '11111111-7777-7777-7777-777777777777|1').selectedByDefault -Expected $false -Message 'the preview exclusion is unchanged'
 
-# An explicit tick has to reach the guest as an install, or "opt-in" would mean "unavailable".
+# A ticked definition reaches the guest as an install like anything else.
 $defenderPlan = @(New-PatchPlanRecords -DiscoveryRecords $defenderDiscovery -SelectedUpdateKeys @($definitionKey))
 $defenderPlanVM = @($defenderPlan | Where-Object { $_.vmName -eq 'VM01' })[0]
-Assert-Equal -Actual $defenderPlanVM.action -Expected 'Install' -Message 'an operator who ticks the definition gets an install'
-Assert-Equal -Actual @($defenderPlanVM.selectedUpdates).Count -Expected 1 -Message 'the plan carries exactly the update the operator ticked'
+Assert-Equal -Actual $defenderPlanVM.action -Expected 'Install' -Message 'a selected definition is installed'
+Assert-Equal -Actual @($defenderPlanVM.selectedUpdates).Count -Expected 1 -Message 'the plan carries exactly the selected update'
 Assert-Equal -Actual $defenderPlanVM.selectedUpdates[0].identityKey -Expected $definitionKey -Message 'the plan carries the definition by its identity key'
 
-# A definition nobody ticked must not keep the round loop running: it is replaced several times
-# a day, so counting it would mean a fleet that never reaches Green.
+# A definition is installed, but it does not get a vote on whether the VM is finished. WUA
+# republishes it within hours under a new revision, so counting it would mean round N+1 discovers
+# a different group and a fully patched fleet never converges.
 $definitionOnlyDiscovery = @(
     [pscustomobject]@{ vmName = 'VM01'; outcome = 'SearchOnly'; errors = @(); roleFlags = $null; updates = @(
         [pscustomobject]@{ updateId = 'dddddddd-4444-4444-4444-444444444444'; revisionNumber = 200; title = 'Aktualizacja analizy zabezpieczen dla Microsoft Defender Antivirus - KB2267602'; kbArticleIds = @('2267602'); categories = @('Definition Updates'); msrcSeverity = 'Critical'; updateType = 'Software' }
@@ -492,10 +497,13 @@ $definitionOnlyDiscovery = @(
 )
 $definitionOnlyGroups = @(New-UpdateGroupRecords -DiscoveryRecords $definitionOnlyDiscovery)
 $definitionOnlyStates = @(Get-VMPatchCompletionStates -DiscoveryRecords $definitionOnlyDiscovery -UpdateGroups $definitionOnlyGroups)
-Assert-Equal -Actual (Get-StateFor -States $definitionOnlyStates -VMName 'VM01').state -Expected 'Green' -Message 'an unticked Defender definition on its own does not keep a VM pending'
+Assert-Equal -Actual (Get-StateFor -States $definitionOnlyStates -VMName 'VM01').state -Expected 'Green' -Message 'a Defender definition on its own does not keep a VM pending'
+Assert-Equal -Actual (Get-StateFor -States $definitionOnlyStates -VMName 'VM01').pendingSelectableCount -Expected 0 -Message 'a Defender definition is not counted as a pending group'
+Assert-Equal -Actual (Get-StateFor -States $definitionOnlyStates -VMName 'VM01').deselectedSelectableCount -Expected 0 -Message 'a Defender definition is not counted as a deselected group either'
+Assert-Equal -Actual (Get-GroupFor -Groups $definitionOnlyGroups -IdentityKey $definitionKey).selectedByDefault -Expected $true -Message 'the definition that does not block Green is nevertheless installed'
 
-# The revision changes with every definition release, so a definition the operator explicitly
-# unticked must not come back under a new revision either.
+# The revision changes with every definition release. Whether the operator unticked the previous
+# one or not, the new revision must not start blocking Green.
 $definitionRevisedDiscovery = @(
     [pscustomobject]@{ vmName = 'VM01'; outcome = 'SearchOnly'; errors = @(); roleFlags = $null; updates = @(
         [pscustomobject]@{ updateId = 'dddddddd-4444-4444-4444-444444444444'; revisionNumber = 201; title = 'Aktualizacja analizy zabezpieczen dla Microsoft Defender Antivirus - KB2267602'; kbArticleIds = @('2267602'); categories = @('Definition Updates'); msrcSeverity = 'Critical'; updateType = 'Software' }
@@ -503,12 +511,18 @@ $definitionRevisedDiscovery = @(
 )
 $definitionRevisedGroups = @(New-UpdateGroupRecords -DiscoveryRecords $definitionRevisedDiscovery)
 $definitionRevisedStates = @(Get-VMPatchCompletionStates -DiscoveryRecords $definitionRevisedDiscovery -UpdateGroups $definitionRevisedGroups -DeselectedUpdateKeys @($definitionKey))
-Assert-Equal -Actual (Get-StateFor -States $definitionRevisedStates -VMName 'VM01').state -Expected 'Green' -Message 'a new definition revision does not resurrect a group the operator unticked'
+Assert-Equal -Actual (Get-StateFor -States $definitionRevisedStates -VMName 'VM01').state -Expected 'Green' -Message 'a new definition revision does not start blocking Green'
 
 # A real Windows update arriving alongside a definition still has to stop the loop.
 $mixedStates = @(Get-VMPatchCompletionStates -DiscoveryRecords $defenderDiscovery -UpdateGroups $defenderGroups)
 Assert-Equal -Actual (Get-StateFor -States $mixedStates -VMName 'VM01').state -Expected 'Pending' -Message 'a default-selected Windows update still keeps the VM pending alongside a definition'
 Assert-Equal -Actual (Get-StateFor -States $mixedStates -VMName 'VM01').pendingSelectableCount -Expected 2 -Message 'the pending count covers the Windows and platform updates but not the definition'
+
+# Installing the definition is not what makes the VM green, and failing to install it is not what
+# keeps it pending: it is simply absent from the judgement either way.
+$defenderDeselectedStates = @(Get-VMPatchCompletionStates -DiscoveryRecords $defenderDiscovery -UpdateGroups $defenderGroups -DeselectedUpdateKeys @($definitionKey, $cumulativeKey, $platformKey))
+Assert-Equal -Actual (Get-StateFor -States $defenderDeselectedStates -VMName 'VM01').state -Expected 'GreenByOperatorChoice' -Message 'unticking the real updates is what changes the verdict'
+Assert-Equal -Actual (Get-StateFor -States $defenderDeselectedStates -VMName 'VM01').deselectedSelectableCount -Expected 2 -Message 'the definition is not counted among the deselected groups'
 
 $nextRound = @(Get-NextRoundVMNames -CompletionStates $greenStates)
 Assert-Equal -Actual $nextRound.Count -Expected 1 -Message 'only pending VMs enter the next round'
