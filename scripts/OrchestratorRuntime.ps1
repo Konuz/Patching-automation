@@ -883,7 +883,7 @@ function Write-RebootActionArtifacts {
 
     $actions = @($RebootActions)
     $artifactPath = Join-Path $CycleOutputDirectory 'reboot-actions.json'
-    $actions | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $artifactPath -Encoding UTF8
+    ConvertTo-Json -InputObject @($actions) -Depth 5 | Set-Content -LiteralPath $artifactPath -Encoding UTF8
 
     $summaryPath = Join-Path $CycleOutputDirectory 'summary.md'
     $confirmed = @($actions | Where-Object { $_.action -eq 'Initiated' -and $_.validationStatus -eq 'Confirmed' })
@@ -943,7 +943,7 @@ function Write-PatchRunSummary {
 
     $rounds = @($RoundSummaries)
     $roundsPath = Join-Path $RunOutputDirectory 'rounds.json'
-    $rounds | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $roundsPath -Encoding UTF8
+    ConvertTo-Json -InputObject @($rounds) -Depth 8 | Set-Content -LiteralPath $roundsPath -Encoding UTF8
 
     $finalStates = @(@($FinalStateMap.Keys) | Sort-Object | ForEach-Object { $FinalStateMap[$_] })
     $green = @($finalStates | Where-Object { [string]$_.state -eq 'Green' })

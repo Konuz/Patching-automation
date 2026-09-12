@@ -1878,6 +1878,99 @@ Assert-Equal -Actual $nullStoreMissing.Count -Expected 1 -Message 'a null store 
 $nullStoreMap = Expand-CredentialStoreMap -Scope 'guest' -TargetNames @('vm1.contoso.com') -Store $null
 Assert-Equal -Actual $nullStoreMap.Count -Expected 0 -Message 'a null store expands to an empty map rather than throwing'
 
+# --- One VM's failure never ends the phase (scripts/OrchestratorRuntime.ps1) ---
+# There is no job boundary around a guest any more, so a throw anywhere in the fleet would take
+# the whole phase with it and the other VMs would never be attempted. This is what the removed
+# `catch { }` text rule was reaching for; it asserted the spelling of a catch block rather than
+# the behaviour, which a rename would have broken and a comment would have satisfied.
+foreach ($failingStage in @('Start', 'Poll', 'Complete')) {
+        $isolationItems = @(
+            [pscustomobject]@{ Sequence = 1; VMName = 'VM-throws' },
+            [pscustomobject]@{ Sequence = 2; VMName = 'VM-works' }
+        )
+
+        $isolationResults = @(Invoke-InProcessAgentFleet -Items $isolationItems -MaxInFlight 2 -PollSeconds 1 -ItemTimeoutSeconds 60 -SleepScript { param([int]$Seconds) } -StartScript {
+            param($Item)
+            if ($Item.VMName -eq 'VM-throws' -and $failingStage -eq 'Start') {
+                throw 'synthetic start failure'
+            }
+            return [pscustomobject]@{ VMName = $Item.VMName; AgentResult = $null }
+        } -PollScript {
+            param($Handle)
+            if ($Handle.VMName -eq 'VM-throws' -and $failingStage -eq 'Poll') {
+                throw 'synthetic poll failure'
+            }
+            return $true
+        } -CompleteScript {
+            param($Handle)
+            if ($Handle.VMName -eq 'VM-throws' -and $failingStage -eq 'Complete') {
+                throw 'synthetic completion failure'
+            }
+            return [pscustomobject]@{ VMName = $Handle.VMName; Collected = $true }
+        } 3>$null)
+
+        Assert-Equal -Actual @($isolationResults).Count -Expected 2 -Message ('a {0} failure still returns one result per VM' -f $failingStage)
+        $working = @($isolationResults | Where-Object { $_.VMName -eq 'VM-works' })
+        Assert-Equal -Actual $working.Count -Expected 1 -Message ('a {0} failure on one guest does not remove the other from the results' -f $failingStage)
+        Assert-Equal -Actual ([string]$working[0].Error) -Expected '' -Message ('a {0} failure on one guest leaves the other successful' -f $failingStage)
+        Assert-Equal -Actual ([bool]$working[0].Payload.Collected) -Expected $true -Message ('a {0} failure on one guest does not stop the other from being collected' -f $failingStage)
+        $throwing = @($isolationResults | Where-Object { $_.VMName -eq 'VM-throws' })
+    Assert-Equal -Actual ([string]::IsNullOrWhiteSpace([string]$throwing[0].Error)) -Expected $false -Message ('a {0} failure is reported against the guest that caused it' -f $failingStage)
+}
+
+# --- Collection artifacts are always JSON arrays (scripts/OrchestratorRuntime.ps1) ---
+# A pipeline into ConvertTo-Json unrolls the collection, so zero records produce no file content
+# at all and one record produces a bare object. Anything reading these files back - the resume
+# path, an operator's script, a later round - then has to special-case two shapes it cannot see
+# coming. These drive the real writers rather than ConvertTo-Json, because the defect is a
+# missed production call site, not a misunderstanding of the cmdlet.
+function Assert-JsonArrayArtifact {
+    param(
+        [string]$Path,
+        [int]$ExpectedCount,
+        [string]$Label
+    )
+
+    Assert-Equal -Actual (Test-Path -LiteralPath $Path -PathType Leaf) -Expected $true -Message ('{0}: the artifact is written even for {1} record(s)' -f $Label, $ExpectedCount)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return
+    }
+
+    $raw = [string](Get-Content -LiteralPath $Path -Raw)
+    Assert-Equal -Actual ($raw.TrimStart().StartsWith('[')) -Expected $true -Message ('{0}: {1} record(s) serialise to a JSON array' -f $Label, $ExpectedCount)
+    # Assign before wrapping: ConvertFrom-Json emits the whole array as ONE pipeline object in
+    # PowerShell 5.1, so @($raw | ConvertFrom-Json) counts the array itself, not its elements.
+    $parsed = $raw | ConvertFrom-Json
+    Assert-Equal -Actual @($parsed).Count -Expected $ExpectedCount -Message ('{0}: {1} record(s) read back as that many elements' -f $Label, $ExpectedCount)
+}
+
+$artifactDir = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-artifacts-' + [guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $artifactDir)
+try {
+    foreach ($count in @(0, 1, 2)) {
+        $caseDir = Join-Path $artifactDir ('reboot-' + $count)
+        [void](New-Item -ItemType Directory -Path $caseDir)
+        $rebootActions = @(1..2 | Select-Object -First $count | ForEach-Object {
+            New-RebootActionRecord -VMName ('VM0{0}' -f $_) -Action 'Initiated' -ProcessId 100 -RebootReason 'Reported after apply' -BatchNumber 1 -Sequence $_ -ValidationStatus 'Confirmed'
+        })
+        Write-RebootActionArtifacts -CycleOutputDirectory $caseDir -RebootActions $rebootActions
+        Assert-JsonArrayArtifact -Path (Join-Path $caseDir 'reboot-actions.json') -ExpectedCount $count -Label 'reboot-actions.json'
+    }
+
+    foreach ($count in @(0, 1, 2)) {
+        $caseDir = Join-Path $artifactDir ('rounds-' + $count)
+        [void](New-Item -ItemType Directory -Path $caseDir)
+        $roundSummaries = @(1..2 | Select-Object -First $count | ForEach-Object {
+            [pscustomobject]@{ round = $_; targetVMNames = @('VM01'); outputDirectory = $caseDir; applyExitCode = 0; rebootRan = $false }
+        })
+        Write-PatchRunSummary -RunOutputDirectory $caseDir -RoundSummaries $roundSummaries -FinalStateMap @{}
+        Assert-JsonArrayArtifact -Path (Join-Path $caseDir 'rounds.json') -ExpectedCount $count -Label 'rounds.json'
+    }
+}
+finally {
+    Remove-Item -LiteralPath $artifactDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 # --- Guest directory canonical form (scripts/GuestOpsLib.ps1) ---
 # The only destructive operation this tool performs deletes a directory under this path, and the
 # check guarding it runs hours into a run where failing is silent. Rejecting a directory the

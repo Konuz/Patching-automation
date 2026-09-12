@@ -913,9 +913,8 @@ function Invoke-ApplyPhase {
         $selectionDocument = New-UpdateSelectionDocument -SelectedUpdateKeys $selectedKeys
         $localSelectionPath = Join-Path $vmOutputDirectory 'selection.json'
         $selectionDocument | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $localSelectionPath -Encoding UTF8
-        $guestSelectionPath = Join-Path $GuestWorkingDirectory 'selection.json'
 
-        $fleetItems += New-AgentFleetItem -Sequence $recordNumber -VMName ([string]$record.vmName) -VMOutputDirectory $vmOutputDirectory -MaxUpdates $selectedKeys.Count -LocalSelectionPath $localSelectionPath -GuestSelectionPath $guestSelectionPath -SearchOnly $false
+        $fleetItems += New-AgentFleetItem -Sequence $recordNumber -VMName ([string]$record.vmName) -VMOutputDirectory $vmOutputDirectory -MaxUpdates $selectedKeys.Count -LocalSelectionPath $localSelectionPath -SearchOnly $false
     }
 
     if ($fleetItems.Count -gt 0) {
@@ -978,7 +977,7 @@ function Invoke-ApplyPhase {
 
     $results = @($resultEntries | Sort-Object Sequence | ForEach-Object { $_.Result })
     $applyResultsPath = Join-Path $CycleOutputDirectory 'apply-results.json'
-    $results | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $applyResultsPath -Encoding UTF8
+    ConvertTo-Json -InputObject @($results) -Depth 12 | Set-Content -LiteralPath $applyResultsPath -Encoding UTF8
     return @($results)
 }
 
@@ -1532,7 +1531,7 @@ function Invoke-DiscoveryPhase {
 
     $records = @($recordEntries | Sort-Object Sequence | ForEach-Object { $_.Record })
     $discoveryPath = Join-Path $CycleOutputDirectory 'discovery.json'
-    @($records) | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $discoveryPath -Encoding UTF8
+    ConvertTo-Json -InputObject @($records) -Depth 12 | Set-Content -LiteralPath $discoveryPath -Encoding UTF8
 
     Write-Host ''
     Write-Host 'Discovery summary'
@@ -1592,10 +1591,6 @@ if (-not [string]::IsNullOrWhiteSpace($InstallSelection)) {
 
 if ($hasExplicitSelectedUpdateKeys -and @($SelectedUpdateKeys).Count -eq 0) {
     throw 'SelectedUpdateKeys did not contain any non-empty update keys.'
-}
-
-if ([string]::IsNullOrWhiteSpace($VMName)) {
-    $VMName = $targetVMNames[0]
 }
 
 . (Join-Path $PSScriptRoot 'PatchPlanModel.ps1')
@@ -1803,7 +1798,7 @@ try {
                     $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
                     $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
                     $patchPlanPath = Join-Path $roundOutputDirectory 'patch-plan.json'
-                    $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
+                    ConvertTo-Json -InputObject @($patchPlanRecords) -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
                     Show-PatchPlan -PatchPlanRecords $patchPlanRecords
                     $scriptExitCode = Get-PlanOnlyExitCode -PatchPlanRecords $patchPlanRecords
                 }
@@ -1863,7 +1858,7 @@ try {
         $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
         $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
         $patchPlanPath = Join-Path $roundOutputDirectory 'patch-plan.json'
-        $patchPlanRecords | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
+        ConvertTo-Json -InputObject @($patchPlanRecords) -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
         Show-PatchPlan -PatchPlanRecords $patchPlanRecords
 
         if (-not (Confirm-PatchPlan -SkipConfirmation:$SkipConfirmation)) {

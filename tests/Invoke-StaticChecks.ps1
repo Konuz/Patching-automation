@@ -366,7 +366,6 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'ThrottleLimit'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Invoke-ThrottledJobs'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'JobTimeoutSeconds'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'catch { }'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'GuestOpsLib.ps1'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'VMTargetLib.ps1'
     # Credential recovery is resolved per VM inside the orchestrator's own phases, so the
@@ -413,7 +412,6 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'VMs rejected by Failover Cluster'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'DiscoveryRecords'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Select-RebootRequiredApplyResults -ApplyResults $applyResults -DiscoveryRecords $DiscoveryRecords'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Write-FinalReport -PatchPlanRecords $PatchPlanRecords -ApplyResults $applyResults -CycleOutputDirectory $CycleOutputDirectory -RebootTargets $rebootTargets'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '-DiscoveryRecords $discoveryRecords'
     Assert-TextMatches -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)\$discoveryRecords\s*=\s*Invoke-DiscoveryPhase\b.*?Invoke-ApplyAndOptionalReboot\b[^\r\n]*-DiscoveryRecords\s+\$discoveryRecords' -Reason 'normal discovery-driven apply path passes discovery records into reboot target selection'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Get-VMPatchCompletionStates'
@@ -458,7 +456,6 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Read-RebootBatchSize'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)function\s+Read-RebootBatchSize\b(?:(?!\bfunction\b).)*?SkipConfirmation' -Reason 'reboot batch size prompt must not honor -SkipConfirmation, matching the REBOOT prompt'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)function\s+Confirm-GuestReboot\b(?:(?!\bfunction\b).)*?SkipConfirmation' -Reason 'reboot confirmation must not honor -SkipConfirmation'
-    Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)IsNullOrWhiteSpace\(\$PatchPlanPath\)\).*?\breturn\b' -Reason 'resume branch must exit with the computed code, not return before the final exit'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern 'Validation summary' -Reason 'Single-VM validation summary path was unified into the phase-based flow'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern 'skipSingleVmValidationSummary' -Reason 'Single-VM validation flag removed by path unification'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$roundSelection.Aborted'
@@ -621,12 +618,6 @@ foreach ($guiRelativePath in @($settingsStorePath, $guiPromptsPath, $guiLauncher
         Assert-NoOrphanedBranchKeyword -Ast $guiAst -RelativePath $guiRelativePath
         Assert-TextDoesNotMatch -RelativePath $guiRelativePath -Text $guiText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
 
-        # Either parameter ends the patch-round loop after round one, in the
-        # ExplicitSelectionOnly and NonInteractive guards of Get-PatchRoundDecision. A GUI
-        # run that passed one would silently collapse to a single patch round, so the GUI
-        # returns its selection through the injected prompt provider instead.
-        Assert-TextDoesNotMatch -RelativePath $guiRelativePath -Text $guiText -Pattern '(?i)SelectedUpdateKeys' -Reason 'GUI code returns its selection through the prompt provider, never as an explicit key list'
-        Assert-TextDoesNotMatch -RelativePath $guiRelativePath -Text $guiText -Pattern '(?i)SkipConfirmation' -Reason 'a GUI run is interactive; -SkipConfirmation would cap it at one round'
     }
 }
 
@@ -690,6 +681,471 @@ if ($existingScripts.ContainsKey($guestOpsLibPath)) {
         }
     }
 }
+
+# --- AST-scoped replacements for four text rules that pinned spelling rather than behaviour ---
+# A needle over the whole file answers "does this string appear", which a comment satisfies and a
+# renamed variable breaks. These ask the syntax tree about the construct that actually matters.
+
+function Get-CommandAstsByName {
+    param($Ast, [string]$Name)
+
+    return @($Ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst]
+    }, $true) | Where-Object { ([string]$_.GetCommandName()) -eq $Name })
+}
+
+# PowerShell binds abbreviations, so -SkipConfirm reaches -SkipConfirmation. A rule that only
+# matched the full spelling would be trivially avoidable without meaning to avoid it.
+function Test-CommandAstHasParameter {
+    param($CommandAst, [string]$ParameterName)
+
+    foreach ($element in @($CommandAst.CommandElements)) {
+        if ($element -isnot [System.Management.Automation.Language.CommandParameterAst]) {
+            continue
+        }
+
+        $written = [string]$element.ParameterName
+        if ([string]::IsNullOrWhiteSpace($written)) {
+            continue
+        }
+
+        if ($ParameterName.StartsWith($written, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Test-CommandAstSplats {
+    param($CommandAst)
+
+    foreach ($element in @($CommandAst.CommandElements)) {
+        if ($element -is [System.Management.Automation.Language.VariableExpressionAst] -and $element.Splatted) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+# Returns 'ok', 'missing', or the first shortfall. The gate and the in-memory probes both call
+# this, so a probe can never report that a rule works after the rule has been weakened.
+function Test-FinalReportContract {
+    param($Ast)
+
+    $calls = @(Get-CommandAstsByName -Ast $Ast -Name 'Write-FinalReport')
+    if ($calls.Count -eq 0) {
+        return 'missing'
+    }
+
+    foreach ($call in $calls) {
+        # A splatted call carries its arguments in a hashtable the AST cannot see into; demanding
+        # named parameters there would be a false positive, so it is simply not checked.
+        if (Test-CommandAstSplats -CommandAst $call) {
+            continue
+        }
+
+        foreach ($requiredParameter in @('PatchPlanRecords', 'ApplyResults', 'CycleOutputDirectory', 'RebootTargets')) {
+            if (-not (Test-CommandAstHasParameter -CommandAst $call -ParameterName $requiredParameter)) {
+                return ('missing-' + $requiredParameter)
+            }
+
+            # An empty literal satisfies "the parameter is present" while passing nothing. The
+            # report would then omit the reboot targets or the results it exists to show.
+            foreach ($element in @($call.CommandElements)) {
+                if ($element -is [System.Management.Automation.Language.ArrayExpressionAst] -and
+                    @($element.SubExpression.Statements).Count -eq 0) {
+                    return ('empty-argument-' + $requiredParameter)
+                }
+            }
+        }
+    }
+
+    return 'ok'
+}
+
+# The GUI must never hand the launcher a parameter that ends the patch-round loop after round
+# one. Checking the call's parameters alone is not enough: the GUI builds a splat hashtable and
+# adds most of its options by member assignment, which is invisible to a CommandParameterAst scan.
+function Test-GuiForbiddenLauncherParameter {
+    param($Ast)
+
+    $forbidden = @('SelectedUpdateKeys', 'SkipConfirmation')
+
+    foreach ($command in @($Ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst]
+    }, $true))) {
+        foreach ($forbiddenParameter in $forbidden) {
+            if (Test-CommandAstHasParameter -CommandAst $command -ParameterName $forbiddenParameter) {
+                return ('parameter-' + $forbiddenParameter)
+            }
+        }
+    }
+
+    foreach ($hashtable in @($Ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.HashtableAst]
+    }, $true))) {
+        foreach ($pair in @($hashtable.KeyValuePairs)) {
+            $keyText = ([string]$pair.Item1.Extent.Text).Trim(([char]39), ([char]34))
+            if ($forbidden -contains $keyText) {
+                return ('splat-' + $keyText)
+            }
+        }
+    }
+
+    # $launcherParams.SkipConfirmation = $true and $launcherParams['SelectedUpdateKeys'] = ...
+    # are how this GUI adds most of its launcher options, so they are the likeliest way the
+    # parameter would arrive - and the only way the earlier text rule caught that this one must.
+    foreach ($assignment in @($Ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.AssignmentStatementAst]
+    }, $true))) {
+        $left = $assignment.Left
+        $written = $null
+        if ($left -is [System.Management.Automation.Language.MemberExpressionAst]) {
+            $written = ([string]$left.Member.Extent.Text).Trim(([char]39), ([char]34))
+        }
+        elseif ($left -is [System.Management.Automation.Language.IndexExpressionAst]) {
+            $written = ([string]$left.Index.Extent.Text).Trim(([char]39), ([char]34))
+        }
+
+        if ($null -ne $written -and $forbidden -contains $written) {
+            return ('assignment-' + $written)
+        }
+    }
+
+    return 'ok'
+}
+
+# The resume branch has to fall through to the single exit at the end of the script; a return
+# anywhere in it would skip the computed exit code. Scoped to that branch's own statements, so a
+# return inside a scriptblock elsewhere in the file - or the word in a comment - is not its business.
+# A return at script scope ends the script. The finally block still runs, but Write-PatchRunSummary,
+# the all-green evaluation and the final `exit $scriptExitCode` do not - so the process exits on a
+# stale $LASTEXITCODE and a failed patch run is reported as success with no run-level artifacts.
+# The rule therefore covers the whole tail of the script from the resume branch onwards, which is
+# what the text needle it replaces reached, and not just the resume branch itself: the round loop
+# below it leaves via `break` and is exactly where a `return` would be written by mistake.
+function Test-ScriptTailHasReturn {
+    param($Ast)
+
+    $endBlock = $Ast.EndBlock
+    if ($null -eq $endBlock) {
+        return $null
+    }
+
+    $resumeOffset = $null
+    foreach ($statement in @($endBlock.Statements)) {
+        foreach ($ifStatement in @($statement.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.IfStatementAst]
+        }, $true))) {
+            # Every clause, not just the first: restructuring the branch as an elseif must not
+            # quietly move it out of scope.
+            foreach ($clause in @($ifStatement.Clauses)) {
+                if (([string]$clause.Item1.Extent.Text) -like '*IsNullOrWhiteSpace($PatchPlanPath)*') {
+                    if ($null -eq $resumeOffset -or $statement.Extent.StartOffset -lt $resumeOffset) {
+                        $resumeOffset = $statement.Extent.StartOffset
+                    }
+                }
+            }
+        }
+    }
+
+    if ($null -eq $resumeOffset) {
+        return $null
+    }
+
+    foreach ($statement in @($endBlock.Statements | Where-Object { $_.Extent.StartOffset -ge $resumeOffset })) {
+        foreach ($returnStatement in @($statement.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.ReturnStatementAst]
+        }, $true))) {
+            # A return inside a nested function or scriptblock leaves that scriptblock, not the
+            # script, so it cannot skip the final exit code and is none of this rule's business.
+            # The walk includes the statement itself: a top-level function definition IS the
+            # statement, so stopping before it would read its return as script-scope.
+            $enclosing = $returnStatement
+            $nested = $false
+            while ($null -ne $enclosing) {
+                if ($enclosing -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -or
+                    $enclosing -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                    $nested = $true
+                    break
+                }
+                if ($enclosing -eq $statement) {
+                    break
+                }
+                $enclosing = $enclosing.Parent
+            }
+
+            if (-not $nested) {
+                return $true
+            }
+        }
+    }
+
+    return $false
+}
+
+# The script must still end on the computed exit code; a rule about returns is only half the
+# guarantee if nothing checks that the exit it protects is actually there.
+function Test-ScriptExitsWithComputedCode {
+    param($Ast)
+
+    $endBlock = $Ast.EndBlock
+    if ($null -eq $endBlock) {
+        return $false
+    }
+
+    # The LAST top-level statement, not merely some exit somewhere: the resume branch has its own
+    # exit, so "an exit with the computed code exists" would still hold after the final one was
+    # changed to a literal - and that is the line every non-resume run leaves through.
+    $topLevel = @($endBlock.Statements)
+    if ($topLevel.Count -eq 0) {
+        return $false
+    }
+
+    $last = $topLevel[$topLevel.Count - 1]
+    return (([string]$last.Extent.Text) -match '(?i)^exit\s+\$scriptExitCode$')
+}
+
+if ($existingScripts.ContainsKey($orchestratorPath)) {
+    $orchestratorAstForChecks = Get-ScriptAst -RelativePath $orchestratorPath -Path $existingScripts[$orchestratorPath]
+
+    $tailHasReturn = Test-ScriptTailHasReturn -Ast $orchestratorAstForChecks
+    if ($null -eq $tailHasReturn) {
+        $failures += ('{0}: the -PatchPlanPath resume branch was not found, so the script tail cannot be checked' -f $orchestratorPath)
+    }
+    elseif ($tailHasReturn) {
+        $failures += ('{0}: a return at script scope below the resume branch would skip the run summary and the computed exit code' -f $orchestratorPath)
+    }
+
+    if (-not (Test-ScriptExitsWithComputedCode -Ast $orchestratorAstForChecks)) {
+        $failures += ('{0}: the script must end on exit $scriptExitCode' -f $orchestratorPath)
+    }
+
+    # The final report has to be handed the plan it applied and the reboot targets it computed.
+    # Which variables carry them is the implementation's business; that they are passed is not.
+    $finalReportVerdict = Test-FinalReportContract -Ast $orchestratorAstForChecks
+    if ($finalReportVerdict -ne 'ok') {
+        $failures += ('{0}: the Write-FinalReport contract is not met ({1})' -f $orchestratorPath, $finalReportVerdict)
+    }
+}
+
+# Either parameter ends the patch-round loop after round one, in the ExplicitSelectionOnly and
+# NonInteractive guards of Get-PatchRoundDecision, so a GUI run that passed one would silently
+# collapse to a single round. The check is on the arguments the GUI actually passes to the
+# launcher - a comment or a local variable of the same name is nobody's problem.
+if ($existingScripts.ContainsKey($guiLauncherPath)) {
+    $guiLauncherAstForChecks = Get-ScriptAst -RelativePath $guiLauncherPath -Path $existingScripts[$guiLauncherPath]
+
+    $guiVerdict = Test-GuiForbiddenLauncherParameter -Ast $guiLauncherAstForChecks
+    if ($guiVerdict -ne 'ok') {
+        $failures += ('{0}: a GUI run must not hand the launcher a parameter that caps it at one patch round ({1})' -f $guiLauncherPath, $guiVerdict)
+    }
+}
+
+# --- the AST checks above, checked against mutated text held only in memory ------------------
+# A rule that cannot tell a comment from a violation is worse than no rule: it fails on harmless
+# edits and passes on real ones, and people learn to work around it. These probes prove the four
+# replacements distinguish the two. Nothing is written to disk.
+
+function Assert-ProbeResult {
+    param($Actual, $Expected, [string]$Message)
+
+    if ($Actual -ne $Expected) {
+        $script:failures += ('{0}: expected {1}, got {2}' -f $Message, $Expected, $Actual)
+    }
+}
+
+function Test-AstRuleOnText {
+    param([string]$Text, [scriptblock]$Rule)
+
+    $probeErrors = $null
+    $probeAst = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$null, [ref]$probeErrors)
+    if ($null -ne $probeErrors -and @($probeErrors).Count -gt 0) {
+        return 'parse-error'
+    }
+
+    return (& $Rule $probeAst)
+}
+
+# Every probe calls the same function the gate calls. A probe with its own copy of the rule
+# would keep reporting that the rule works after the rule had been weakened - which is exactly
+# the failure mode these probes exist to prevent.
+$resumeRule = {
+    param($Ast)
+    return (Test-ScriptTailHasReturn -Ast $Ast)
+}
+
+$resumeSource = @'
+if (-not [string]::IsNullOrWhiteSpace($PatchPlanPath)) {
+    $scriptExitCode = 0
+}
+function Get-Something { return 1 }
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $resumeSource -Rule $resumeRule) -Expected $false -Message 'a return inside an unrelated function does not trip the script-tail rule'
+
+$resumeCommentSource = @'
+if (-not [string]::IsNullOrWhiteSpace($PatchPlanPath)) {
+    # deliberately no return here - the computed exit code is the only way out
+    $scriptExitCode = 0
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $resumeCommentSource -Rule $resumeRule) -Expected $false -Message 'the word return in a comment does not trip the script-tail rule'
+
+$resumeViolationSource = @'
+if (-not [string]::IsNullOrWhiteSpace($PatchPlanPath)) {
+    $scriptExitCode = 0
+    return
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $resumeViolationSource -Rule $resumeRule) -Expected $true -Message 'an actual return in the resume branch trips the script-tail rule'
+
+# The round loop sits below the resume branch and leaves via break. A return written there is
+# the live risk: it skips the run summary and the computed exit code, and the old text needle
+# reached it while a rule scoped to the resume branch alone would not.
+$tailViolationSource = @'
+if (-not [string]::IsNullOrWhiteSpace($PatchPlanPath)) {
+    $scriptExitCode = 0
+}
+while ($true) {
+    $scriptExitCode = 1
+    return
+}
+exit $scriptExitCode
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $tailViolationSource -Rule $resumeRule) -Expected $true -Message 'a return in the round loop below the resume branch trips the script-tail rule'
+
+$tailScriptblockSource = @'
+if (-not [string]::IsNullOrWhiteSpace($PatchPlanPath)) {
+    $scriptExitCode = 0
+}
+$decision = {
+    param($Message)
+    return 'CONTINUE'
+}
+exit $scriptExitCode
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $tailScriptblockSource -Rule $resumeRule) -Expected $false -Message 'a return inside a scriptblock below the resume branch does not trip the script-tail rule'
+
+# Restructuring the branch as an elseif must not quietly move it out of scope.
+$elseifSource = @'
+if ($SearchOnly) {
+    throw 'nope'
+}
+elseif (-not [string]::IsNullOrWhiteSpace($PatchPlanPath)) {
+    $scriptExitCode = 0
+    return
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $elseifSource -Rule $resumeRule) -Expected $true -Message 'a resume branch written as an elseif is still examined'
+
+$exitRule = {
+    param($Ast)
+    return (Test-ScriptExitsWithComputedCode -Ast $Ast)
+}
+
+$exitSource = @'
+$scriptExitCode = 1
+exit $scriptExitCode
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $exitSource -Rule $exitRule) -Expected $true -Message 'a script ending on the computed exit code satisfies the exit rule'
+
+$exitLiteralSource = @'
+$scriptExitCode = 1
+exit 0
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $exitLiteralSource -Rule $exitRule) -Expected $false -Message 'a script ending on a literal exit code trips the exit rule'
+
+# The resume branch has an exit of its own, so a rule that merely looked for one anywhere would
+# stay green after the final exit - the one every other run leaves through - became a literal.
+$exitEarlierSource = @'
+if ($resume) {
+    exit $scriptExitCode
+}
+$scriptExitCode = 1
+exit 0
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $exitEarlierSource -Rule $exitRule) -Expected $false -Message 'an earlier exit with the computed code does not excuse a literal final exit'
+
+$finalReportRule = {
+    param($Ast)
+    return (Test-FinalReportContract -Ast $Ast)
+}
+
+$finalReportSource = @'
+Write-FinalReport -PatchPlanRecords $anythingAtAll -ApplyResults $results -CycleOutputDirectory $dir -RebootTargets $targets
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $finalReportSource -Rule $finalReportRule) -Expected 'ok' -Message 'renaming the variables passed to Write-FinalReport does not trip the rule'
+
+$finalReportMissingSource = @'
+Write-FinalReport -PatchPlanRecords $records -ApplyResults $results -CycleOutputDirectory $dir
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $finalReportMissingSource -Rule $finalReportRule) -Expected 'missing-RebootTargets' -Message 'dropping a required Write-FinalReport argument trips the rule'
+
+# An empty literal satisfies "the parameter is present" while passing nothing, which is how the
+# reboot targets would silently vanish from the report.
+$finalReportEmptySource = @'
+Write-FinalReport -PatchPlanRecords $records -ApplyResults $results -CycleOutputDirectory $dir -RebootTargets @()
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $finalReportEmptySource -Rule $finalReportRule) -Expected 'empty-argument-PatchPlanRecords' -Message 'passing an empty literal to Write-FinalReport trips the rule'
+
+# A splatted call carries its arguments where the AST cannot see them; demanding named
+# parameters there would be a false positive, not a finding.
+$finalReportSplatSource = @'
+Write-FinalReport @finalReportArgs
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $finalReportSplatSource -Rule $finalReportRule) -Expected 'ok' -Message 'a splatted Write-FinalReport call is not reported as missing arguments'
+
+$guiRule = {
+    param($Ast)
+    return (Test-GuiForbiddenLauncherParameter -Ast $Ast)
+}
+
+$guiCommentSource = @'
+# SelectedUpdateKeys is deliberately not passed; the provider returns the selection instead.
+$selectedKeys = @()
+& $launcher @launcherParams
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $guiCommentSource -Rule $guiRule) -Expected 'ok' -Message 'a comment naming the parameter does not trip the GUI rule'
+
+$guiParameterSource = @'
+& $launcher -VIServer $vc -SelectedUpdateKeys $keys
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $guiParameterSource -Rule $guiRule) -Expected 'parameter-SelectedUpdateKeys' -Message 'passing the parameter to the launcher trips the GUI rule'
+
+$guiAbbreviationSource = @'
+& $launcher -VIServer $vc -SkipConfirm
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $guiAbbreviationSource -Rule $guiRule) -Expected 'parameter-SkipConfirmation' -Message 'an abbreviated parameter still binds and still trips the GUI rule'
+
+$guiSplatSource = @'
+$launcherParams = @{ VIServer = $vc; SkipConfirmation = $true }
+& $launcher @launcherParams
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $guiSplatSource -Rule $guiRule) -Expected 'splat-SkipConfirmation' -Message 'splatting the parameter into the launcher trips the GUI rule'
+
+# This is how the GUI adds most of its launcher options, so it is the likeliest way the
+# parameter would arrive - and the way a parameter-only scan would miss entirely.
+$guiMemberSource = @'
+$launcherParams = @{ VIServer = $vc }
+$launcherParams.SkipConfirmation = $true
+& $launcher @launcherParams
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $guiMemberSource -Rule $guiRule) -Expected 'assignment-SkipConfirmation' -Message 'assigning the parameter onto the splat hashtable trips the GUI rule'
+
+$guiIndexSource = @'
+$launcherParams = @{ VIServer = $vc }
+$launcherParams['SelectedUpdateKeys'] = $keys
+& $launcher @launcherParams
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $guiIndexSource -Rule $guiRule) -Expected 'assignment-SelectedUpdateKeys' -Message 'indexing the parameter onto the splat hashtable trips the GUI rule'
 
 if ($failures.Count -gt 0) {
     Write-Host 'Static checks failed:'

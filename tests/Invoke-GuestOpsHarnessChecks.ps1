@@ -479,6 +479,20 @@ try {
     Assert-Equal -Actual ([string]::IsNullOrWhiteSpace([string]@($results | Where-Object { $_.VMName -eq 'VM01' })[0].Payload.AgentCompletionReason)) -Expected $false -Message 'harness: completion confirmation carries a reason'
     Assert-Equal -Actual (Test-Path -LiteralPath (Join-Path (Join-Path $workspace 'VM01') 'status.json')) -Expected $true -Message 'harness: status.json lands in the per-VM output directory'
 
+    # The orchestrator no longer computes a guest selection path, because Start-VMAgentCycle
+    # overwrites it whenever LocalSelectionPath is supplied - which it always was. The parameter
+    # itself still has a caller contract: without LocalSelectionPath, the supplied path is used
+    # verbatim and nothing is uploaded to it.
+    New-FakeGuest -VMName 'VM-selection' -PollsBeforeFinish 1 -StatusJson '{"outcome":"SearchOnly","finishedAt":"2026-08-22T10:00:00.0000000Z"}'
+    $selectionManagers = New-FakeManagers -VMName 'VM-selection'
+    $script:guestState['VM-selection'].Client = New-ClientBoundFakeClient -VMName 'VM-selection' -Managers $selectionManagers
+    $suppliedSelectionPath = 'C:\synthetic\preset-selection.json'
+    $selectionHandle = Start-VMAgentCycle -VMName 'VM-selection' -Managers $selectionManagers -GuestAuth (New-GuestAuthentication -Credential $harnessCredential) -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -VMOutputDirectory (Join-Path $workspace 'VM-selection') -MaxUpdates 1 -SelectionPath $suppliedSelectionPath
+    Assert-Equal -Actual ($null -ne $selectionHandle) -Expected $true -Message 'harness: a cycle without a local selection still starts'
+    $selectionArguments = [string]$script:guestState['VM-selection'].AgentSpec.Arguments
+    Assert-Equal -Actual ($selectionArguments.Contains($suppliedSelectionPath)) -Expected $true -Message 'harness: without LocalSelectionPath the supplied guest selection path is used verbatim'
+    Assert-Equal -Actual (@($script:guestState['VM-selection'].UploadedPaths | Where-Object { ([string]$_).EndsWith('selection.json') }).Count) -Expected 0 -Message 'harness: a supplied selection path is not uploaded, only referenced'
+
     # The whole cleanup contract against the real Start-VMAgentCycle, which is the only place
     # that builds the directory pair the removal validates against.
     Assert-Equal -Actual ([string]@($results | Where-Object { $_.VMName -eq 'VM01' })[0].Payload.CleanupStatus) -Expected 'Removed' -Message 'harness: a completed cycle removes its guest directory'

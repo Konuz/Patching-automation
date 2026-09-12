@@ -1378,6 +1378,100 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
     }
 }
 
+# F9: discovery.json, apply-results.json and patch-plan.json are always JSON arrays. Driving the
+# real phases rather than ConvertTo-Json is the point: the defect was a production call site
+# piping its collection, which unrolls it, so zero records wrote nothing and one record wrote a
+# bare object. Anything reading these back - the resume path most of all - then meets two shapes
+# it cannot anticipate.
+& {
+    function Assert-JsonArrayArtifact {
+        param([string]$Path, [int]$ExpectedCount, [string]$Label)
+
+        Assert-Equal -Actual (Test-Path -LiteralPath $Path -PathType Leaf) -Expected $true -Message ('F9: {0} exists for {1} record(s)' -f $Label, $ExpectedCount)
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            return
+        }
+
+        $raw = [string](Get-Content -LiteralPath $Path -Raw)
+        Assert-Equal -Actual ($raw.TrimStart().StartsWith('[')) -Expected $true -Message ('F9: {0} is a JSON array for {1} record(s)' -f $Label, $ExpectedCount)
+        # Assign before wrapping: ConvertFrom-Json emits the whole array as ONE pipeline object
+        # in PowerShell 5.1, so @($raw | ConvertFrom-Json) would count the array, not its items.
+        $parsed = $raw | ConvertFrom-Json
+        Assert-Equal -Actual @($parsed).Count -Expected $ExpectedCount -Message ('F9: {0} reads back as {1} element(s)' -f $Label, $ExpectedCount)
+    }
+
+    $artifactRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-f9-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $artifactRoot | Out-Null
+
+    $script:f9FleetResults = @()
+    function Invoke-GuestAgentFleet {
+        param($FleetItems, $Managers, $GuestCredentialMap, $CurlPath, $AgentPath, $IdentityHelperPath, $GuestWorkingDirectory, $TimeoutSeconds, $PollSeconds, $MaxInFlight, $CredentialContext, $CredentialDecisionScript, $CredentialValidatedScript, $CredentialInteractive)
+        return @($script:f9FleetResults)
+    }
+    function New-GuestAuthentication { param([pscredential]$Credential) [pscustomobject]@{ UserName = $Credential.UserName } }
+
+    function New-F9FleetResult {
+        param([int]$Sequence, [string]$VMName, [string]$Outcome)
+        return [pscustomobject]@{
+            Sequence = $Sequence
+            VMName = $VMName
+            Error = $null
+            ResultKind = $null
+            Payload = [pscustomobject]@{
+                RunId = ('f9-' + $VMName)
+                Mode = 'Apply'
+                AgentCompletionConfirmed = $true
+                AgentCompletionReason = 'synthetic terminal status'
+                AgentResult = [pscustomobject]@{ Completed = $true; ExitCode = 0 }
+                Status = [pscustomobject]@{
+                    runId = ('f9-' + $VMName)
+                    outcome = $Outcome
+                    finishedAt = '2026-09-11T10:00:00Z'
+                    installResult = [pscustomobject]@{ result = 'Succeeded'; rebootRequired = $false }
+                    pendingRebootAfter = [pscustomobject]@{ isPending = $false }
+                    pendingRebootBefore = [pscustomobject]@{ isPending = $false }
+                    roleFlags = [pscustomobject]@{ failoverCluster = $false }
+                    updates = @()
+                    errors = @()
+                }
+            }
+        }
+    }
+
+    $f9Credential = New-Object System.Management.Automation.PSCredential('Administrator', (ConvertTo-SecureString 'synthetic' -AsPlainText -Force))
+
+    try {
+        foreach ($count in @(0, 1, 2)) {
+            $names = @(1..2 | Select-Object -First $count | ForEach-Object { 'VM0{0}' -f $_ })
+            $script:f9FleetResults = @(1..2 | Select-Object -First $count | ForEach-Object { New-F9FleetResult -Sequence $_ -VMName ('VM0{0}' -f $_) -Outcome 'SearchOnly' })
+
+            $discoveryDir = Join-Path $artifactRoot ('discovery-' + $count)
+            New-Item -ItemType Directory -Force -Path $discoveryDir | Out-Null
+            $credentialMap = @{}
+            foreach ($name in $names) { $credentialMap[$name] = $f9Credential }
+            $null = Invoke-DiscoveryPhase -TargetVMNames $names -Managers $null -GuestCredentialMap $credentialMap -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -MaxUpdates 1 -TimeoutSeconds 60 -PollSeconds 1 -CycleOutputDirectory $discoveryDir -MaxInFlight 2
+            Assert-JsonArrayArtifact -Path (Join-Path $discoveryDir 'discovery.json') -ExpectedCount $count -Label 'discovery.json'
+
+            $applyDir = Join-Path $artifactRoot ('apply-' + $count)
+            New-Item -ItemType Directory -Force -Path $applyDir | Out-Null
+            $script:f9FleetResults = @(1..2 | Select-Object -First $count | ForEach-Object { New-F9FleetResult -Sequence $_ -VMName ('VM0{0}' -f $_) -Outcome 'InstallSucceeded' })
+            $planRecords = @(1..2 | Select-Object -First $count | ForEach-Object {
+                [pscustomobject]@{
+                    vmName = ('VM0{0}' -f $_)
+                    action = 'Install'
+                    roleFlags = [pscustomobject]@{ failoverCluster = $false }
+                    selectedUpdates = @([pscustomobject]@{ identityKey = 'aaaa|1'; updateId = 'aaaa'; revisionNumber = 1; title = 'Security Update'; kbArticleIds = @() })
+                }
+            })
+            $null = Invoke-ApplyPhase -PatchPlanRecords $planRecords -Managers $null -GuestCredentialMap $credentialMap -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -TimeoutSeconds 60 -PollSeconds 1 -CycleOutputDirectory $applyDir -MaxInFlight 2
+            Assert-JsonArrayArtifact -Path (Join-Path $applyDir 'apply-results.json') -ExpectedCount $count -Label 'apply-results.json'
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $artifactRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 if ($failures.Count -gt 0) {
     foreach ($failure in $failures) { Write-Host ('FAIL: ' + $failure) }
     exit 1

@@ -408,6 +408,30 @@ $normalizedKeylessPlan = @(ConvertTo-PatchPlanRecords -InputObject $keylessPlanI
 Assert-Equal -Actual @($normalizedKeylessPlan[0].selectedUpdates).Count -Expected 1 -Message 'resume plan normalization drops a selected update without an identity key'
 Assert-Equal -Actual $normalizedKeylessPlan[0].selectedUpdates[0].identityKey -Expected '99999999-9999-9999-9999-999999999999|3' -Message 'resume plan normalization keeps the keyed selected update'
 
+# A plan written before collection artifacts became arrays is a bare JSON object, not a
+# one-element array. Those files are on disk in customers' out\ directories and -PatchPlanPath
+# has to keep loading them; the fix to the writer must not strand them.
+$legacyPlanJson = '{"vmName":"vm01","action":"Install","roleFlags":null,"selectedUpdates":[{"identityKey":"99999999-9999-9999-9999-999999999999|3","updateId":"99999999-9999-9999-9999-999999999999","revisionNumber":3,"title":"Security Update","kbArticleIds":["5000001"]}]}'
+# Through the file, the way -PatchPlanPath reads it: Get-Content -Raw then ConvertFrom-Json.
+# Handing ConvertTo-PatchPlanRecords a PSCustomObject directly would pass on the scalar path it
+# has always had and prove nothing about loading what is actually on disk.
+$legacyPlanDir = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-legacy-plan-' + [guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $legacyPlanDir)
+$legacyPlanPath = Join-Path $legacyPlanDir 'patch-plan.json'
+try {
+    Set-Content -LiteralPath $legacyPlanPath -Value $legacyPlanJson -Encoding UTF8
+    $legacyPlanRaw = [string](Get-Content -LiteralPath $legacyPlanPath -Raw)
+    Assert-Equal -Actual ($legacyPlanRaw.TrimStart().StartsWith('{')) -Expected $true -Message 'the legacy fixture really is a bare object, not an array'
+    $legacyPlanObject = $legacyPlanRaw | ConvertFrom-Json
+    $legacyPlanRecords = @(ConvertTo-PatchPlanRecords -InputObject $legacyPlanObject 3>$null)
+    Assert-Equal -Actual $legacyPlanRecords.Count -Expected 1 -Message 'a single-object patch plan written before the array fix still loads'
+    Assert-Equal -Actual ([string]$legacyPlanRecords[0].vmName) -Expected 'vm01' -Message 'the legacy plan keeps the VM it was written for'
+    Assert-Equal -Actual @($legacyPlanRecords[0].selectedUpdates).Count -Expected 1 -Message 'the legacy plan keeps its selected update'
+}
+finally {
+    Remove-Item -LiteralPath $legacyPlanDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 # --- patch completion state (round loop) ---
 
 $greenDiscovery = @(

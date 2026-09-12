@@ -133,6 +133,64 @@ $roundLoop = $ast.Find({ param($n) $n -is [System.Management.Automation.Language
     Assert-Equal (Test-PatchRunAllGreen $finalStateMap) $true 'operator choice does not produce a false failure exit'
 }
 
+# F9: patch-plan.json is written by the round loop itself, not by a function, so it is exercised
+# through the same loop extraction - with the real New-Item and Set-Content this time. One record
+# is the dangerous count: piping the collection serialises a bare object, and the resume path
+# reads this file back expecting a collection.
+# Both write sites: the round loop's and the -PlanOnly branch's. They are separate statements
+# in the same loop, so fixing one and missing the other is exactly the kind of gap a test that
+# only exercised the default path would not see.
+foreach ($planOnlyCase in @($false, $true)) {
+    $planRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-plan-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $planRoot | Out-Null
+    try {
+        function Write-Step { }
+        function Show-UpdateGroups { }
+        function Show-PatchPlan { }
+        function Confirm-PatchPlan { $true }
+        function Read-UpdateGroupSelection { [pscustomobject]@{ Aborted = $false; Keys = @('11111111-1111-1111-1111-111111111111|1') } }
+        function Invoke-DiscoveryPhase { $planDiscovery }
+        function Invoke-ApplyAndOptionalReboot { [pscustomobject]@{ ExitCode = 0; RebootRan = $false; RebootActions = @() } }
+        $planDiscovery = [pscustomobject]@{
+            vmName = 'vm01'; computerName = 'vm01'; outcome = 'SearchOnly'; errors = @()
+            roleFlags = [pscustomobject]@{ failoverCluster = $false }
+            pendingRebootBefore = [pscustomobject]@{ isPending = $false }
+            updates = @([pscustomobject]@{ updateId = '11111111-1111-1111-1111-111111111111'; revisionNumber = 1; title = 'Security Update'; kbArticleIds = @(); categories = @('Security Updates'); msrcSeverity = 'Critical'; updateType = 'Software' })
+        }
+        $roundNumber = 0; $roundTargetVMNames = @('vm01'); $roundSummaries = @(); $finalStateMap = @{}
+        $deselectedUpdateKeys = @(); $sawApplyFailure = $false; $stoppedByRoundCap = $false
+        $guestCredentialContext = $null; $guestCredentialDecisionScript = $null
+        $guestCredentialValidatedScript = $null; $guestCredentialInteractive = $false
+        $runOutputDirectory = $planRoot; $MaxPatchRounds = 1; $SearchOnly = $false; $PlanOnly = $planOnlyCase
+        $hasExplicitSelectedUpdateKeys = $false; $SkipConfirmation = $true; $PromptProvider = $null
+        $managers = $null; $guestCredentialMap = @{}; $resolvedVIServers = @(); $viserverCredentialMap = @{}
+        $IgnoreVCenterCertificate = $false; $guestOpsLibPath = ''; $curlPath = ''; $AgentPath = ''; $identityHelperPath = ''
+        $GuestWorkingDirectory = ''; $TimeoutMinutes = 1; $RebootTimeoutMinutes = 1; $PollSeconds = 1; $ThrottleLimit = 1
+        $resolvedRebootBatchSize = 1; $MaxUpdates = 1
+        . ([scriptblock]::Create($roundLoop.Extent.Text))
+
+        $planLabel = if ($planOnlyCase) { 'PlanOnly' } else { 'apply' }
+        $planFiles = @(Get-ChildItem -LiteralPath $planRoot -Recurse -Filter 'patch-plan.json' -File)
+        Assert-Equal $planFiles.Count 1 ('F9: the {0} path writes exactly one patch plan' -f $planLabel)
+        if ($planFiles.Count -eq 1) {
+            $planRaw = [string](Get-Content -LiteralPath $planFiles[0].FullName -Raw)
+            Assert-Equal ($planRaw.TrimStart().StartsWith('[')) $true ('F9: a one-record {0} patch plan is a JSON array' -f $planLabel)
+            # Assign before wrapping: ConvertFrom-Json emits the whole array as ONE pipeline
+            # object in PowerShell 5.1, so @($raw | ConvertFrom-Json) would count the array.
+            $planParsed = $planRaw | ConvertFrom-Json
+            Assert-Equal @($planParsed).Count 1 ('F9: a one-record {0} patch plan reads back as one element' -f $planLabel)
+
+            # The resume path is the reason the shape matters: it must load what was written.
+            $resumed = @(ConvertTo-PatchPlanRecords -InputObject $planParsed 3>$null)
+            Assert-Equal $resumed.Count 1 ('F9: the resume path loads the {0} plan it wrote' -f $planLabel)
+            Assert-Equal ([string]$resumed[0].vmName) 'vm01' ('F9: the resumed {0} plan names the VM it was written for' -f $planLabel)
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $planRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 if ($failures.Count -gt 0) {
     foreach ($failure in $failures) { Write-Host ('FAIL: ' + $failure) }
     exit 1
