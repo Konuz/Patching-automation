@@ -20,6 +20,9 @@ jednoelementowa.
 - [Workflow administratora](#workflow-administratora)
 - [Najważniejsze parametry](#najważniejsze-parametry)
 - [Jak wybierane są aktualizacje](#jak-wybierane-są-aktualizacje)
+- [Gdy poświadczenia gościa zostaną odrzucone](#gdy-poświadczenia-gościa-zostaną-odrzucone)
+- [Katalogi cyklu na gościach](#katalogi-cyklu-na-gościach)
+- [Certyfikaty i transfer plików](#certyfikaty-i-transfer-plików)
 - [Co powstaje po uruchomieniu](#co-powstaje-po-uruchomieniu)
 - [Jak to działa pod spodem](#jak-to-działa-pod-spodem)
 - [Struktura repozytorium](#struktura-repozytorium)
@@ -34,7 +37,10 @@ Na maszynie sterującej (stepping stone):
 
 - **Windows PowerShell 5.1** (domyślny w Windows; PS7 nie jest potrzebny). Launcher GUI wymaga standardowego wątku STA (domyślny w `powershell.exe`).
 - Moduł **VMware.PowerCLI** (`Install-Module VMware.PowerCLI`). Faktycznie wymagany jest tylko **VMware.VimAutomation.Core** — tylko on jest importowany i tylko o niego pyta kontrola wymagań, więc lekka instalacja samego tego modułu też wystarczy.
-- **`curl.exe`** — standardowy składnik Windows (używany do transferu plików; nic nie instalujesz).
+- **`curl.exe`** w `PATH` **maszyny sterującej** — to on przenosi bajty plików do i z ESXi.
+  Windows dostarcza go od Windows 10 1803 / Server 2019; na starszych systemach trzeba go
+  doinstalować. Skrypt sprawdza jego obecność na starcie i przerywa, jeśli go nie znajdzie.
+  Na gościach curl **nie** jest potrzebny.
 - Sieciowy dostęp do **vCenter (:443)** i do hostów **ESXi (:443)**.
 
 Po stronie maszyn docelowych (gości):
@@ -237,6 +243,119 @@ brak — na tytuł/kategorię. Z automatu:
 - **pomija**: sterowniki, aktualizacje *preview*, *feature update* oraz *optional*.
 
 Każdą grupę możesz ręcznie dozaznaczyć lub odznaczyć w kroku wyboru.
+
+---
+
+## Gdy poświadczenia gościa zostaną odrzucone
+
+Gdy gość odrzuci hasło w trakcie przebiegu, narzędzie nie przerywa całej pracy i nie ponawia
+w kółko tego samego hasła. Pyta o decyzję dla **konta**, nie dla pojedynczej maszyny.
+
+Konta są grupowane tak samo, jak przy pytaniu o hasła na starcie: jedno konto na sufiks domeny
+(wszystko po pierwszej kropce w FQDN) i osobne konto dla każdej maszyny bez kropki w nazwie.
+Dlatego dwie maszyny robocze z własnymi lokalnymi kontami `Administrator` to **dwa różne konta**.
+
+### Przykład: VM01 i VM02 z osobnymi lokalnymi kontami
+
+Lista celów to `VM01` i `VM02` — obie bez domeny, obie z lokalnym `Administrator`, ale z różnymi
+hasłami. Skrypt pyta o hasło osobno dla `VM01` i osobno dla `VM02`.
+
+Załóżmy, że hasło do `VM01` jest nieaktualne. W trakcie przebiegu:
+
+```
+Guest credentials for VM01 were rejected: The guest rejected the supplied credential.
+Account local:VM01 applies to: VM01
+Actions:
+  - RETRY  provide replacement guest credentials and validate them before retrying.
+  - SKIP   skip this account for the rest of this run.
+  - ABORT  do not start further guest operations.
+Choose RETRY, SKIP, or ABORT (Enter aborts):
+```
+
+- **RETRY** — podajesz nowe dane. Zanim cokolwiek zostanie ponowione, narzędzie **sprawdza je na
+  tej maszynie** (`ValidateCredentialsInGuest`). Dopiero zweryfikowane dane wchodzą do użycia
+  w tym i kolejnych etapach: discovery, apply, odczyt czasu rozruchu, inicjacja restartu.
+  Ponowne podanie tego samego hasła nie doprowadzi do ponowienia operacji — przy pierwszym
+  pytaniu trafi jeszcze raz do walidacji na gościu i tam zostanie odrzucone, przy kolejnym jest
+  odrzucane od razu, bez sięgania do gościa.
+- **SKIP** — `VM01` wypada z tego przebiegu. **`VM02` pracuje dalej normalnie**, bo to inne konto.
+  Pominięta maszyna nie jest łatana, nie jest restartowana i nie wchodzi do kolejnej rundy.
+- **ABORT** (także samo Enter) — nie rozpoczynają się kolejne operacje na gościach.
+
+Pusty Enter to **przerwanie**, nie zgoda na ponowienie — wciśnięcie Enter „na odczepnego" nigdy
+nie spowoduje próby z tym samym hasłem.
+
+### Kod wyjścia
+
+Pominięcie konta to jawna porażka, nie cichy sukces. `VM01` kończy przebieg w stanie `Failed`
+z podanym powodem, trafia do `summary.md`, a **cały przebieg kończy się kodem 1** — nawet jeśli
+`VM02` została załatana bez zarzutu. Kod 0 wymaga, żeby każda maszyna skończyła jako
+`Green`/`GreenByOperatorChoice`/`Excluded`.
+
+### Zapamiętywanie poprawionych danych (GUI)
+
+W trybie GUI okno z nowymi danymi ma **domyślnie zaznaczone** „Remember on this machine" — tak
+samo jak przy pytaniu o hasła na starcie. Po udanej walidacji poprawione hasło trafia do
+`credentials.json` pod klucz tego konta, więc następnym razem nie trzeba go wpisywać ponownie.
+
+Odznaczenie „Remember" oznacza, że dane posłużą **tylko temu przebiegowi** — plik zostaje z tym,
+co już w nim było, a jawna odmowa ma pierwszeństwo do końca przebiegu (kolejna maszyna z tego
+samego konta nie zapisze go „przy okazji"). Hasła, które już były zapisane, nigdy nie są kasowane,
+a poprawka jednego vCenter zapisuje się pod kluczem tego jednego serwera, nie pod wspólnym kluczem
+domeny.
+
+### Uruchomienie bez interakcji
+
+`-SkipConfirmation` oznacza, że nie ma komu odpowiedzieć na pytanie, więc **żadne pytanie o nowe
+hasło się nie pojawi**. Odrzucone poświadczenia kończą się jawną porażką tej maszyny i kodem 1 —
+przebieg nie zawiesza się na promptcie i nie zgaduje.
+
+---
+
+## Katalogi cyklu na gościach
+
+Każdy cykl agenta pracuje we własnym podkatalogu `C:\ProgramData\PatchingGuestOps\<runId>`.
+Narzędzie kasuje ten katalog **tylko wtedy**, gdy potrafi udowodnić, że cykl się zakończył:
+terminalny status agenta, wynik procesu mówiący „zakończony", oba artefakty pobrane **w tej**
+kolekcji i oba pliki obecne na maszynie sterującej. W przeciwnym razie katalog zostaje, a powód
+trafia do logu i do rekordu maszyny (`cleanupStatus`, `cleanupReason`).
+
+**Część katalogów zostanie na stałe — i tak ma być.** vSphere pamięta zakończony proces tylko
+przez krótką chwilę. Gość, który skończy pracę zanim pętla odpytywania do niego wróci, wypada
+z listy procesów, więc narzędzie nie ma dowodu zakończenia procesu i katalog zachowuje. Przy
+większych flotach to sytuacja zwyczajna, nie awaria.
+
+Nie ma automatycznego sprzątacza po wieku plików i **nie będzie** — katalog, którego to narzędzie
+nie potrafi uznać za zakończony, jest dokładnie tym, którego nie wolno mu ruszyć. Przy dużych,
+regularnie łatanych flotach warto co jakiś czas przejrzeć `C:\ProgramData\PatchingGuestOps`
+i usunąć stare katalogi poza przebiegiem narzędzia.
+
+---
+
+## Certyfikaty i transfer plików
+
+Narzędzie rozmawia z dwoma różnymi punktami końcowymi i **każdy ma osobne wymagania wobec
+certyfikatów**:
+
+| Kanał | Czym idzie | Czego wymaga |
+|---|---|---|
+| Sterowanie (SOAP) | PowerCLI / .NET → **vCenter:443** | zaufanie do certyfikatu vCenter **albo** `-IgnoreVCenterCertificate` |
+| Dane (bajty plików) | **`curl.exe`** → **ESXi:443** | zaufanie do certyfikatu ESXi — **zawsze**, bez wyjątku |
+
+**`-IgnoreVCenterCertificate` dotyczy wyłącznie sesji PowerCLI do vCenter.** Ustawia
+`Set-PowerCLIConfiguration -InvalidCertificateAction Ignore` i nie ma żadnego wpływu na curl —
+to osobny proces z własnym magazynem zaufania (Schannel, czyli magazyn certyfikatów Windows).
+Transfery nie są uruchamiane z `--insecure`, więc **niezaufany certyfikat ESXi zatrzyma transfer
+plików, nawet jeśli połączenie z vCenter przeszło**.
+
+**Nazwa też musi się zgadzać.** vSphere zwraca adres transferu z gwiazdką (`https://*/...`),
+a narzędzie podstawia w jej miejsce **nazwę hosta ESXi z inwentarza vCenter**. Certyfikat ESXi
+musi być ważny dokładnie dla tej nazwy. Jeśli vCenter ma host wpisany po adresie IP albo po
+nazwie krótkiej, a certyfikat wystawiono na FQDN — curl odrzuci połączenie, mimo że sam
+certyfikat jest zaufany.
+
+W praktyce: zaimportuj na maszynie sterującej certyfikat CA, który podpisał certyfikaty ESXi,
+i upewnij się, że hosty figurują w vCenter pod nazwami zgodnymi z tymi certyfikatami.
 
 ---
 

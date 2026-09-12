@@ -1575,9 +1575,9 @@ if ($resolvedVIServers.Count -eq 0) {
 }
 
 # Checked here rather than only at the deletion point, because failing there is silent: the run
-# succeeds on every VM and the cycle directories simply accumulate, which is the symptom the
-# cleanup exists to remove. A path written with forward slashes works for every other part of
-# the run, so nothing else would ever tell the operator.
+# succeeds on every VM and every cycle directory is kept, on top of the ones cleanup legitimately
+# keeps when a process result was lost. A path written with forward slashes works for every other
+# part of the run, so nothing else would ever tell the operator.
 $workingDirectoryVerdict = Test-GuestDirectoryCanonical -Path $GuestWorkingDirectory
 if (-not $workingDirectoryVerdict.IsCanonical) {
     throw ('GuestWorkingDirectory "{0}" cannot be used: {1}' -f $GuestWorkingDirectory, $workingDirectoryVerdict.Reason)

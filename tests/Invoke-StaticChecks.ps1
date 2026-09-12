@@ -732,6 +732,39 @@ function Test-CommandAstSplats {
 
 # Returns 'ok', 'missing', or the first shortfall. The gate and the in-memory probes both call
 # this, so a probe can never report that a rule works after the rule has been weakened.
+# Returns the argument written for one parameter, or $null when the parameter is absent. Needed
+# because "the parameter appears somewhere on the call" is not the same fact as "the parameter
+# was given something" - and a rule that cannot tell them apart is the one this replaces.
+function Get-CommandAstArgument {
+    param($CommandAst, [string]$ParameterName)
+
+    $elements = @($CommandAst.CommandElements)
+    for ($index = 0; $index -lt $elements.Count; $index++) {
+        $element = $elements[$index]
+        if ($element -isnot [System.Management.Automation.Language.CommandParameterAst]) {
+            continue
+        }
+
+        $written = [string]$element.ParameterName
+        if ([string]::IsNullOrWhiteSpace($written) -or -not $ParameterName.StartsWith($written, [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+
+        # -Param:value keeps the argument on the parameter node; -Param value puts it next.
+        if ($null -ne $element.Argument) {
+            return $element.Argument
+        }
+
+        if ($index + 1 -lt $elements.Count -and $elements[$index + 1] -isnot [System.Management.Automation.Language.CommandParameterAst]) {
+            return $elements[$index + 1]
+        }
+
+        return 'present-without-argument'
+    }
+
+    return $null
+}
+
 function Test-FinalReportContract {
     param($Ast)
 
@@ -748,17 +781,25 @@ function Test-FinalReportContract {
         }
 
         foreach ($requiredParameter in @('PatchPlanRecords', 'ApplyResults', 'CycleOutputDirectory', 'RebootTargets')) {
-            if (-not (Test-CommandAstHasParameter -CommandAst $call -ParameterName $requiredParameter)) {
+            $argument = Get-CommandAstArgument -CommandAst $call -ParameterName $requiredParameter
+            if ($null -eq $argument -or ($argument -is [string] -and $argument -eq 'present-without-argument')) {
                 return ('missing-' + $requiredParameter)
             }
 
-            # An empty literal satisfies "the parameter is present" while passing nothing. The
-            # report would then omit the reboot targets or the results it exists to show.
-            foreach ($element in @($call.CommandElements)) {
-                if ($element -is [System.Management.Automation.Language.ArrayExpressionAst] -and
-                    @($element.SubExpression.Statements).Count -eq 0) {
-                    return ('empty-argument-' + $requiredParameter)
-                }
+            # $null is the dangerous one, not a typo: Write-FinalReport treats a null RebootTargets
+            # as "work them out yourself" and recomputes them from the apply results alone, without
+            # the discovery records - so every VM that is a reboot target only because discovery
+            # reported pendingRebootBefore silently vanishes from the report's reboot section.
+            if ($argument -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                [string]::Equals([string]$argument.VariablePath.UserPath, 'null', [System.StringComparison]::OrdinalIgnoreCase)) {
+                return ('null-argument-' + $requiredParameter)
+            }
+
+            # An empty literal satisfies "the parameter is present" while passing nothing. Matched
+            # against THIS parameter's own argument, so the reason names the right one.
+            if ($argument -is [System.Management.Automation.Language.ArrayExpressionAst] -and
+                @($argument.SubExpression.Statements).Count -eq 0) {
+                return ('empty-argument-' + $requiredParameter)
             }
         }
     }
@@ -941,12 +982,16 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
 # NonInteractive guards of Get-PatchRoundDecision, so a GUI run that passed one would silently
 # collapse to a single round. The check is on the arguments the GUI actually passes to the
 # launcher - a comment or a local variable of the same name is nobody's problem.
-if ($existingScripts.ContainsKey($guiLauncherPath)) {
-    $guiLauncherAstForChecks = Get-ScriptAst -RelativePath $guiLauncherPath -Path $existingScripts[$guiLauncherPath]
+# All three GUI files, as the text rule this replaces covered. Only the launcher invokes the
+# console entry point today, but a settings field forwarded generically would arrive the same way.
+foreach ($guiForbiddenPath in @($guiLauncherPath, $guiPromptsPath, $settingsStorePath)) {
+    if (-not $existingScripts.ContainsKey($guiForbiddenPath)) {
+        continue
+    }
 
-    $guiVerdict = Test-GuiForbiddenLauncherParameter -Ast $guiLauncherAstForChecks
+    $guiVerdict = Test-GuiForbiddenLauncherParameter -Ast (Get-ScriptAst -RelativePath $guiForbiddenPath -Path $existingScripts[$guiForbiddenPath])
     if ($guiVerdict -ne 'ok') {
-        $failures += ('{0}: a GUI run must not hand the launcher a parameter that caps it at one patch round ({1})' -f $guiLauncherPath, $guiVerdict)
+        $failures += ('{0}: a GUI run must not hand the launcher a parameter that caps it at one patch round ({1})' -f $guiForbiddenPath, $guiVerdict)
     }
 }
 
@@ -1094,7 +1139,19 @@ Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $finalReportMissingSource -
 $finalReportEmptySource = @'
 Write-FinalReport -PatchPlanRecords $records -ApplyResults $results -CycleOutputDirectory $dir -RebootTargets @()
 '@
-Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $finalReportEmptySource -Rule $finalReportRule) -Expected 'empty-argument-PatchPlanRecords' -Message 'passing an empty literal to Write-FinalReport trips the rule'
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $finalReportEmptySource -Rule $finalReportRule) -Expected 'empty-argument-RebootTargets' -Message 'an empty literal trips the rule and names the parameter it was written for'
+
+# $null is the one that does real damage: Write-FinalReport reads it as "recompute the reboot
+# targets from the apply results alone", dropping every VM that only discovery knew needed one.
+$finalReportNullSource = @'
+Write-FinalReport -PatchPlanRecords $records -ApplyResults $results -CycleOutputDirectory $dir -RebootTargets $null
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $finalReportNullSource -Rule $finalReportRule) -Expected 'null-argument-RebootTargets' -Message 'passing $null for the reboot targets trips the rule'
+
+$finalReportColonSource = @'
+Write-FinalReport -PatchPlanRecords:$records -ApplyResults:$results -CycleOutputDirectory:$dir -RebootTargets:$targets
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $finalReportColonSource -Rule $finalReportRule) -Expected 'ok' -Message 'colon-form arguments are read as arguments, not as a missing parameter'
 
 # A splatted call carries its arguments where the AST cannot see them; demanding named
 # parameters there would be a false positive, not a finding.

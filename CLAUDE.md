@@ -106,6 +106,86 @@ foreign IDs fail the cycle; timestamps alone do not establish ownership. Each cy
 its agent, identity helper and selection into a separate guest directory under the configured
 working directory, so later cycles cannot overwrite a still-running agent's files.
 
+### Guest-side cleanup: the only destructive operation
+
+`Remove-CompletedVMAgentCycleArtifacts` deletes the cycle directory inside the guest, recursively,
+through the single call `FileManager.DeleteDirectoryInGuest`. The static gate pins it to exactly
+one call site, requires it to stay inside that function, and forbids reaching it from a `finally`.
+The asymmetry is deliberate: a wrong delete is unrecoverable customer data, a wrong retain is a
+leftover directory, so everything is an allow-list and every failure answers "retain".
+
+Removal requires, together: `AgentCompletionConfirmed`, an `AgentResult` that says `Completed`,
+**both** artifacts downloaded during *this* collection (`StatusDownloaded`/`LogDownloaded`), and
+both local files actually present. Those last two are separate questions - a transfer can exit 0
+and leave nothing on disk, and a status carried over from an earlier read says nothing about what
+is on the guest now. A process result vSphere has already forgotten is not evidence of completion.
+
+The path is validated through `Test-GuestDirectoryCanonical`, shared with the orchestrator's
+preflight so both agree on what "canonical" means. Absoluteness is settled **before**
+`GetFullPath` - that call resolves a relative path against the stepping stone's current directory
+and would hand back something absolute that never was. UNC paths, drive roots, the working
+directory itself and anything not directly under it are refused; the directory's name must equal
+the run id, compared ordinally, and the run id must have the generated GUID `N` form. Comparing
+the immediate **parent** rather than a string prefix is what makes a sibling like
+`PatchingGuestOpsOld` unreachable.
+
+**Retention is the normal outcome whenever the process result was lost, not an error.** When the
+poll finds an empty process list but a terminal `status.json`, `Test-VMAgentCycleComplete` caches
+the status on the handle and returns `Completed = $false`. That blocks cleanup twice over: the
+process never reported completion, and because the status is already on the handle
+`Complete-VMAgentCycle` skips the download, so `StatusDownloaded` stays false. At fleet scale this
+is common - a guest that finishes before the poll loop reaches it falls out of vSphere's
+short-lived process list - so those cycle directories stay on the guest **permanently**. There is
+no reaper: age-based cleanup is deliberately out of scope, because a directory this tool cannot
+prove is finished is one it must not touch. Operators should expect `C:\ProgramData\PatchingGuestOps`
+to accumulate directories on busy fleets and clear them out of band.
+
+Cleanup runs after the downloads and the parse, never from a `finally`: a cycle that failed half
+way through is exactly the one whose guest-side files someone will want to read. A refused delete
+is a `Warning` that never touches the WUA result, and a `Retained` directory says why - in the log
+and in the per-VM apply record (`cleanupStatus`/`cleanupReason`), because that is the outcome this
+feature's own failure modes produce.
+
+`-GuestWorkingDirectory` is validated at the orchestrator's preflight through the same function.
+A path written with forward slashes works for the mkdir, every upload, the agent and the boot-time
+helper, so without that check cleanup would fail silently on every VM in every round, forever.
+
+### Guest credential recovery
+
+A guest that rejects a login does not end the run and is never retried with the same password.
+`scripts/CredentialRecovery.ps1` holds one session-local context for the whole run, grouped the
+same way the startup prompts are: one account per FQDN domain suffix, one per no-dot machine.
+`Resolve-GuestCredentialForTarget` validates a replacement through
+`AuthManager.ValidateCredentialsInGuest` **before** anything is retried, and the decision contract
+(`Retry`/`SkipAccount`/`Abort`) is identical for the console prompt and the GUI dialog.
+
+Recovery is wired into start, poll, artifact collection, boot-time read and reboot submission.
+Two rules are load-bearing there:
+
+- **Reboot submission may be re-sent only for a rejection the guest made before `shutdown.exe`
+  started**, once, and only with a credential that is actually different from the one refused.
+  Validation succeeding is not permission to re-send: `ValidateCredentialsInGuest` and
+  `StartProgramInGuest` are different calls, so the guest can accept the credential at validation
+  and still have refused the reboot with it. The child job classifies and never prompts;
+  `Invoke-VMGuestReboot` marks the failures it raises before its one guest-touching call, so an
+  inventory or `GetView` timeout is not mistaken for a command that may already be running.
+- **Only an operator decision counts as a refusal.** `Test-CredentialRefusalErrorKind` accepts
+  `CredentialsSkipped`/`CredentialsAborted` and nothing else. A validation attempt that merely
+  *failed* - VMware Tools down mid-reboot is the ordinary case, and `Assert-VMReadyForGuestOps`
+  throws on exactly that - keeps its transient handling and still reaches the operator prompt.
+  Treating it as a refusal would record a guest that rebooted correctly as a credential failure.
+
+A skipped account becomes `Failed` with a reason, is filtered out of discovery, apply, reboot and
+the next round, and makes the run exit 1. `-SkipConfirmation` and a missing prompt provider never
+open a dialog; the result is an explicit failure instead.
+
+The GUI keeps the working credential map separate from the map destined for disk, because they
+genuinely diverge: a replacement entered with Remember unticked serves the run while
+`credentials.json` keeps the password already there. An explicit refusal outranks the startup
+preference for the rest of the run. A corrected vCenter password is written under
+`vcenter:target:<name>`, never the shared domain key, so the other servers behind that suffix do
+not inherit a credential nobody validated against them. `Remember` still defaults to ticked.
+
 ### Patch rounds
 
 A run repeats **discovery → group selection → plan → confirm → apply → reboot** until every VM is
@@ -136,6 +216,15 @@ the verification of round N.
   verification discovery and then stops.
 - Each round writes to `<run>\round-NN\` with the existing artifact names; the run root gets
   `rounds.json` and an aggregate `summary.md`. This applies to single-round runs too.
+- **Every collection artifact is a JSON array at the root**, for 0, 1 and 2+ records alike:
+  `discovery.json`, `patch-plan.json` (both write sites), `apply-results.json`,
+  `reboot-actions.json`, `rounds.json`. Piping a collection into `ConvertTo-Json` unrolls it, so
+  zero records wrote nothing at all and one record wrote a bare object - two shapes the resume
+  path could not anticipate. Pass the whole collection: `ConvertTo-Json -InputObject @($records)`.
+  Single-document JSON (`selection.json`, the settings and credential stores) is deliberately not
+  an array. When asserting on these files in a test, assign before wrapping: `ConvertFrom-Json`
+  emits an array as a **single** pipeline object on 5.1, so `@($raw | ConvertFrom-Json).Count`
+  counts the array rather than its elements.
 - **Exit code** is 0 only when every VM ends `Green`/`GreenByOperatorChoice`/`Excluded` in the
   state map **merged across rounds**, every apply succeeded and every reboot was confirmed. The
   merge matters: later rounds only target VMs that were still pending, so a VM that failed
