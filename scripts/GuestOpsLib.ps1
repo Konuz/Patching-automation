@@ -914,6 +914,10 @@ function Complete-VMAgentCycle {
     )
 
     $artifactErrors = @()
+    # The first artifact failure is kept, not just its message: a credential that expired
+    # mid-cycle shows up here as an InvalidGuestLogin, and re-throwing a bare string below
+    # would erase the one piece of information that lets the caller offer recovery.
+    $artifactException = $null
     $status = Get-ObjectPropertyValue -InputObject $Handle -Path @('Status')
     if ($null -eq $status) {
         try {
@@ -921,6 +925,7 @@ function Complete-VMAgentCycle {
         }
         catch {
             $artifactErrors += ('status.json download failed: {0}' -f $_.Exception.Message)
+            if ($null -eq $artifactException) { $artifactException = $_.Exception }
         }
     }
 
@@ -929,6 +934,7 @@ function Complete-VMAgentCycle {
     }
     catch {
         $artifactErrors += ('agent.log download failed: {0}' -f $_.Exception.Message)
+        if ($null -eq $artifactException) { $artifactException = $_.Exception }
     }
 
     if ($artifactErrors.Count -gt 0) {
@@ -938,7 +944,11 @@ function Complete-VMAgentCycle {
     }
 
     if ($null -eq $status -or -not (Test-Path -LiteralPath $Handle.LocalStatusPath -PathType Leaf)) {
-        throw ('status.json was not downloaded. Output directory: {0}' -f (Split-Path -Parent $Handle.LocalStatusPath))
+        $missingStatusMessage = 'status.json was not downloaded. Output directory: {0}' -f (Split-Path -Parent $Handle.LocalStatusPath)
+        if ($null -ne $artifactException) {
+            throw (New-Object System.InvalidOperationException -ArgumentList $missingStatusMessage, $artifactException)
+        }
+        throw $missingStatusMessage
     }
 
     $statusRunId = [string](Get-ObjectPropertyValue -InputObject $status -Path @('runId'))
@@ -973,12 +983,21 @@ function Invoke-VMGuestReboot {
     )
 
     Write-Step -Message ('Resolving VM {0} for guest reboot.' -f $VMName)
-    $vm = Get-ExactVM -Name $VMName
-    Assert-VMReadyForGuestOps -VM $vm
+    # Start-GuestReboot is the only call here that can leave shutdown.exe running, so every
+    # failure before it is unambiguously "never sent". Saying so spares the caller a full
+    # reboot-timeout wait observing a guest that was never told to restart.
+    try {
+        $vm = Get-ExactVM -Name $VMName
+        Assert-VMReadyForGuestOps -VM $vm
 
-    $vmView = $vm.ExtensionData
-    if ($null -eq $Managers) {
-        $Managers = Get-GuestOpsManagers -VMView $vmView
+        $vmView = $vm.ExtensionData
+        if ($null -eq $Managers) {
+            $Managers = Get-GuestOpsManagers -VMView $vmView
+        }
+    }
+    catch {
+        try { $_.Exception.Data['RejectedBeforeStart'] = $true } catch { }
+        throw
     }
     Write-Step -Message ('Initiating guest reboot for VM {0}.' -f $VMName)
     $rebootProcessId = Start-GuestReboot -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth

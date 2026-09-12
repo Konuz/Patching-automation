@@ -2,6 +2,8 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'scripts/GuestOpsLib.ps1')
+. (Join-Path $repoRoot 'scripts/VMTargetLib.ps1')
+. (Join-Path $repoRoot 'scripts/CredentialRecovery.ps1')
 . (Join-Path $repoRoot 'scripts/PatchPlanModel.ps1')
 . (Join-Path $repoRoot 'scripts/OrchestratorRuntime.ps1')
 $failures = @()
@@ -311,7 +313,10 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
             Remove-Item -LiteralPath $caseDirectory -Recurse -Force -ErrorAction SilentlyContinue
         }
 
-        function Invoke-GuestAgentFleet { $script:failedFleet }
+        function Invoke-GuestAgentFleet {
+            param($FleetItems, $Managers, $GuestCredentialMap, $CurlPath, $AgentPath, $IdentityHelperPath, $GuestWorkingDirectory, $TimeoutSeconds, $PollSeconds, $MaxInFlight, $CredentialContext, $CredentialDecisionScript, $CredentialValidatedScript, $CredentialInteractive)
+            return $script:failedFleet
+        }
         function Write-PatchingSummary { param($ApplyResults) }
         function Write-FinalReport { param($PatchPlanRecords, $ApplyResults, $CycleOutputDirectory, $RebootTargets) }
         function Confirm-GuestReboot { param($RebootTargets) $true }
@@ -494,11 +499,11 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $script:rebootDispatchNames = @()
 
         function Invoke-GuestAgentFleet {
-            param($FleetItems, $Managers, $GuestCredentialMap, $CurlPath, $AgentPath, $IdentityHelperPath, $GuestWorkingDirectory, $TimeoutSeconds, $PollSeconds, $MaxInFlight)
+            param($FleetItems, $Managers, $GuestCredentialMap, $CurlPath, $AgentPath, $IdentityHelperPath, $GuestWorkingDirectory, $TimeoutSeconds, $PollSeconds, $MaxInFlight, $CredentialContext, $CredentialDecisionScript, $CredentialValidatedScript, $CredentialInteractive)
             return @($script:mixedFleet)
         }
         function Invoke-DiscoveryPhase {
-            param($TargetVMNames, $Managers, $GuestCredentialMap, $CurlPath, $AgentPath, $IdentityHelperPath, $GuestWorkingDirectory, $MaxUpdates, $TimeoutSeconds, $PollSeconds, $CycleOutputDirectory, $MaxInFlight)
+            param($TargetVMNames, $Managers, $GuestCredentialMap, $CurlPath, $AgentPath, $IdentityHelperPath, $GuestWorkingDirectory, $MaxUpdates, $TimeoutSeconds, $PollSeconds, $CycleOutputDirectory, $MaxInFlight, $CredentialContext, $CredentialDecisionScript, $CredentialValidatedScript, $CredentialInteractive)
             $script:roundDiscoveryCall++
             $script:roundDiscoveryTargets += [pscustomobject]@{ Names = @($TargetVMNames) }
             if ($script:roundDiscoveryCall -eq 1) {
@@ -541,6 +546,10 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $PromptProvider = $null
         $managers = $null
         $guestCredentialMap = @{}
+        $guestCredentialContext = $null
+        $guestCredentialDecisionScript = $null
+        $guestCredentialValidatedScript = $null
+        $guestCredentialInteractive = $false
         $resolvedVIServers = @()
         $viserverCredentialMap = @{}
         $IgnoreVCenterCertificate = $false
@@ -593,6 +602,611 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         Remove-Item Function:\Write-RebootActionArtifacts -ErrorAction SilentlyContinue
         Remove-Item Function:\Invoke-GuestRebootPhase -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $cycleDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# F5: the real fleet adapter must validate credentials before starting a VM and let a
+# skipped local account fail without stopping an unrelated account or entering a new round.
+& {
+    $cycleDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-f5-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $cycleDirectory | Out-Null
+
+    $f5RoundLoop = $orchestratorAst.Find({ param($node)
+        $node -is [System.Management.Automation.Language.WhileStatementAst] -and $node.Extent.Text.Contains('$roundNumber++')
+    }, $true)
+    $f5RoundFinalization = $orchestratorAst.Find({ param($node)
+        $node -is [System.Management.Automation.Language.IfStatementAst] -and $node.Extent.Text.Contains('Write-PatchRunSummary -RunOutputDirectory')
+    }, $true)
+    Assert-Equal ($null -ne $f5RoundLoop) $true 'F5: the production round loop is available to the credential recovery regression'
+    Assert-Equal ($null -ne $f5RoundFinalization) $true 'F5: the production final exit-code block is available to the credential recovery regression'
+
+    $script:vm01AgentStarts = 0
+    $script:vm02AgentStarts = 0
+    $script:vm01Reboots = 0
+    $script:vm02Reboots = 0
+    $script:f5CredentialPrompts = 0
+    $script:f5DiscoveryCall = 0
+    $script:f5DiscoveryTargets = @()
+
+    $f5UpdateId = '33333333-3333-3333-3333-333333333333'
+    $f5Update = [pscustomobject]@{
+        updateId = $f5UpdateId
+        revisionNumber = 1
+        title = 'Security Update'
+        kbArticleIds = @()
+        categories = @()
+        msrcSeverity = 'Critical'
+        updateType = 'Software'
+    }
+    $f5RoleFlags = [pscustomobject]@{ failoverCluster = $false }
+    $script:f5RoundOneDiscovery = @(
+        [pscustomobject]@{ vmName = 'VM01'; computerName = 'VM01'; outcome = 'SearchOnly'; errors = @(); roleFlags = $f5RoleFlags; pendingRebootBefore = [pscustomobject]@{ isPending = $false }; updates = @($f5Update) },
+        [pscustomobject]@{ vmName = 'VM02'; computerName = 'VM02'; outcome = 'SearchOnly'; errors = @(); roleFlags = $f5RoleFlags; pendingRebootBefore = [pscustomobject]@{ isPending = $false }; updates = @($f5Update) }
+    )
+    $script:f5RoundTwoDiscovery = @([pscustomobject]@{ vmName = 'VM02'; computerName = 'VM02'; outcome = 'NoApplicableUpdates'; errors = @(); roleFlags = $f5RoleFlags; pendingRebootBefore = [pscustomobject]@{ isPending = $false }; updates = @() })
+
+    function New-GuestAuthentication {
+        param([pscredential]$Credential)
+        return [pscustomobject]@{ UserName = $Credential.UserName }
+    }
+    function Test-GuestCredentialForTarget {
+        param([string]$VMName, [pscredential]$Credential)
+        if ($VMName -eq 'VM01') {
+            return [pscustomobject]@{ Status = 'Invalid'; ErrorKind = 'InvalidGuestLogin'; Error = 'synthetic rejected local credential' }
+        }
+        return [pscustomobject]@{ Status = 'Valid'; ErrorKind = $null; Error = $null }
+    }
+    function Start-VMAgentCycle {
+        param($VMName, $Managers, $GuestAuth, $CurlPath, $AgentPath, $IdentityHelperPath, $GuestWorkingDirectory, $VMOutputDirectory, $MaxUpdates, $LocalSelectionPath, $SelectionPath, [switch]$SearchOnly)
+        if ($VMName -eq 'VM01') {
+            $script:vm01AgentStarts++
+        }
+        else {
+            $script:vm02AgentStarts++
+        }
+        return [pscustomobject]@{ VMName = $VMName; GuestAuth = $GuestAuth; AgentResult = $null }
+    }
+    function Test-VMAgentCycleComplete {
+        param($Handle)
+        return [pscustomobject]@{ Completed = $true; ExitCode = 0 }
+    }
+    function Complete-VMAgentCycle {
+        param($Handle, $AgentResult)
+        return [pscustomobject]@{
+            RunId = ('f5-' + $Handle.VMName)
+            Mode = 'Apply'
+            AgentCompletionConfirmed = $true
+            AgentCompletionReason = 'synthetic terminal status'
+            AgentResult = $AgentResult
+            Status = [pscustomobject]@{
+                runId = ('f5-' + $Handle.VMName)
+                outcome = 'InstallSucceeded'
+                finishedAt = '2026-09-11T10:00:00Z'
+                installResult = [pscustomobject]@{ rebootRequired = $true }
+                pendingRebootAfter = [pscustomobject]@{ isPending = $false }
+                roleFlags = $f5RoleFlags
+                errors = @()
+            }
+        }
+    }
+    function Invoke-DiscoveryPhase {
+        param($TargetVMNames, $Managers, $GuestCredentialMap, $CurlPath, $AgentPath, $IdentityHelperPath, $GuestWorkingDirectory, $MaxUpdates, $TimeoutSeconds, $PollSeconds, $CycleOutputDirectory, $MaxInFlight, $CredentialContext, $CredentialDecisionScript, $CredentialValidatedScript, $CredentialInteractive)
+        $script:f5DiscoveryCall++
+        $script:f5DiscoveryTargets += [pscustomobject]@{ Names = @($TargetVMNames) }
+        if ($script:f5DiscoveryCall -eq 1) {
+            return @($script:f5RoundOneDiscovery)
+        }
+        return @($script:f5RoundTwoDiscovery)
+    }
+    function Read-UpdateGroupSelection {
+        param($UpdateGroups, $PromptProvider)
+        return [pscustomobject]@{ Aborted = $false; Keys = @('{0}|1' -f $f5UpdateId) }
+    }
+    function Confirm-PatchPlan { param($SkipConfirmation) $true }
+    function Write-PatchRoundVerification { param($CompletionStates, $Round) }
+    function Write-PatchRunSummary { param($RunOutputDirectory, $RoundSummaries, $FinalStateMap) }
+    function Write-PatchingSummary { param($ApplyResults) }
+    function Write-FinalReport { param($PatchPlanRecords, $ApplyResults, $CycleOutputDirectory, $RebootTargets) }
+    function Confirm-GuestReboot { param($RebootTargets) $true }
+    function Write-RebootActionArtifacts { param($CycleOutputDirectory, $RebootActions) }
+    function Invoke-GuestRebootPhase {
+        param($RebootTargets, $GuestCredentialMap, [string[]]$VIServers, $VIServerCredentialMap, [switch]$IgnoreVCenterCertificate, [string]$GuestOpsLibPath, [string]$CurlPath, [string]$GuestWorkingDirectory, [int]$RebootTimeoutSeconds, [int]$PollSeconds, [int]$RebootBatchSize)
+        foreach ($target in @($RebootTargets)) {
+            if ($target.vmName -eq 'VM01') {
+                $script:vm01Reboots++
+            }
+            else {
+                $script:vm02Reboots++
+            }
+        }
+        return @($RebootTargets | ForEach-Object { [pscustomobject]@{ vmName = $_.vmName; action = 'Initiated'; validationStatus = 'Confirmed' } })
+    }
+
+    try {
+        $f5Credential = New-Object System.Management.Automation.PSCredential('Administrator', (ConvertTo-SecureString 'synthetic' -AsPlainText -Force))
+        $guestCredentialMap = @{ VM01 = $f5Credential; VM02 = $f5Credential }
+        $guestCredentialContext = New-GuestCredentialContext -TargetNames @('VM01', 'VM02') -CredentialMap $guestCredentialMap
+        $guestCredentialDecisionScript = {
+            param($VMName, $AccountKey, $Members, $Reason)
+            $script:f5CredentialPrompts++
+            return [pscustomobject]@{ Action = 'SkipAccount'; Credential = $null; Remember = $false }
+        }
+        $guestCredentialValidatedScript = $null
+        $guestCredentialInteractive = $true
+        $roundNumber = 0
+        $roundTargetVMNames = @('VM01', 'VM02')
+        $roundSummaries = @()
+        $finalStateMap = @{}
+        $deselectedUpdateKeys = @()
+        $stoppedByRoundCap = $false
+        $sawApplyFailure = $false
+        $scriptExitCode = 0
+        $runOutputDirectory = $cycleDirectory
+        $MaxPatchRounds = 2
+        $SearchOnly = $false
+        $PlanOnly = $false
+        $hasExplicitSelectedUpdateKeys = $false
+        $SkipConfirmation = $true
+        $PromptProvider = $null
+        $managers = $null
+        $resolvedVIServers = @()
+        $viserverCredentialMap = @{}
+        $IgnoreVCenterCertificate = $false
+        $guestOpsLibPath = 'unused'
+        $curlPath = 'unused'
+        $AgentPath = 'unused'
+        $identityHelperPath = 'unused'
+        $GuestWorkingDirectory = 'C:\unused'
+        $TimeoutMinutes = 1
+        $RebootTimeoutMinutes = 1
+        $PollSeconds = 1
+        $ThrottleLimit = 2
+        $resolvedRebootBatchSize = 1
+        $MaxUpdates = 1
+        . ([scriptblock]::Create(($f5RoundLoop.Extent.Text + "`n" + $f5RoundFinalization.Extent.Text)))
+
+        Assert-Equal -Actual $script:vm01AgentStarts -Expected 0 -Message 'F5: skipped account never starts an agent'
+        Assert-Equal -Actual $script:vm02AgentStarts -Expected 1 -Message 'F5: another account continues'
+        Assert-Equal -Actual $script:vm01Reboots -Expected 0 -Message 'F5: skipped account never reboots'
+        Assert-Equal -Actual $script:f5CredentialPrompts -Expected 1 -Message 'F5: rejected account asks once before it is skipped'
+        $nextTargets = if ($script:f5DiscoveryTargets.Count -gt 1) { @($script:f5DiscoveryTargets[1].Names) } else { @() }
+        Assert-Equal -Actual ($nextTargets -contains 'VM01') -Expected $false -Message 'F5: skipped target cannot enter another round'
+        Assert-Equal -Actual $scriptExitCode -Expected 1 -Message 'F5: skipping is not an all-green run'
+        Assert-Equal -Actual $finalStateMap['VM01'].state -Expected 'Failed' -Message 'F5: skipped account remains failed in the final state map'
+    }
+    finally {
+        Remove-Item -LiteralPath $cycleDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# F5: the production reboot adapter recovers a typed child-job rejection in the parent and
+# retries a boot-time read with replacement credentials without a generic reboot prompt.
+& {
+    $baseBootTime = [datetime]::Parse('2026-09-11T10:00:00Z').ToUniversalTime()
+    $newBootTime = [datetime]::Parse('2026-09-11T10:05:00Z').ToUniversalTime()
+    $oldCredential = New-Object System.Management.Automation.PSCredential('OLD\adm', (ConvertTo-SecureString 'synthetic-old' -AsPlainText -Force))
+    $replacementCredential = New-Object System.Management.Automation.PSCredential('NEW\adm', (ConvertTo-SecureString 'synthetic-new' -AsPlainText -Force))
+
+    $script:f5RebootMode = ''
+    $script:f5RebootJobCalls = 0
+    $script:f5RebootCredentialUsers = @()
+    $script:f5BootReadCalls = 0
+    $script:f5RecoveryPrompts = 0
+    $script:f5GenericRebootPrompts = 0
+
+    function New-GuestAuthentication {
+        param([pscredential]$Credential)
+        return [pscustomobject]@{ UserName = $Credential.UserName }
+    }
+    function Test-GuestCredentialForTarget {
+        param([string]$VMName, [pscredential]$Credential)
+        # ChildRejected and BootReadRejected both model a password rotated mid-run: still valid
+        # when this phase checked it, refused by the guest moments later. ValidationUnavailable
+        # models VMware Tools being down mid-reboot - an error, not a refusal, and the one the
+        # coordinator must not mistake for an operator who skipped the account.
+        if ($script:f5RebootMode -eq 'ValidationUnavailable') {
+            return [pscustomobject]@{ Status = 'Error'; ErrorKind = 'Transient'; Error = 'synthetic VMware Tools are not running' }
+        }
+        return [pscustomobject]@{ Status = 'Valid'; ErrorKind = $null; Error = $null }
+    }
+    function Get-GuestRebootJobScript { return { param($JobInput) $null = $JobInput } }
+    function Invoke-ThrottledJobs {
+        param($Items, $ThrottleLimit, $JobTimeoutSeconds, $ScriptBlock)
+        $script:f5RebootJobCalls++
+        $script:f5RebootCredentialUsers += @($Items | ForEach-Object { $_.GuestCredential.UserName })
+        if ($script:f5RebootMode -eq 'Ambiguous') {
+            return @($Items | ForEach-Object {
+                    [pscustomobject]@{
+                        Sequence = $_.Sequence
+                        VMName = $_.VMName
+                        ProcessId = $null
+                        Error = 'Synthetic transport failure after shutdown.exe may have started.'
+                        ErrorKind = 'Transient'
+                        RejectedBeforeStart = $false
+                    }
+                })
+        }
+        if ($script:f5RebootMode -eq 'ChildRejected' -and $script:f5RebootJobCalls -eq 1) {
+            return @($Items | ForEach-Object {
+                    [pscustomobject]@{
+                        Sequence = $_.Sequence
+                        VMName = $_.VMName
+                        ProcessId = $null
+                        Error = 'Synthetic InvalidGuestLogin before shutdown.exe started.'
+                        ErrorKind = 'InvalidCredentials'
+                        RejectedBeforeStart = $true
+                    }
+                })
+        }
+        return @($Items | ForEach-Object {
+                [pscustomobject]@{
+                    Sequence = $_.Sequence
+                    VMName = $_.VMName
+                    ProcessId = 700
+                    Error = $null
+                    ErrorKind = $null
+                    RejectedBeforeStart = $false
+                }
+            })
+    }
+    function Invoke-VMGuestBootTimeRead {
+        param($VMName, $Managers, $GuestAuth, $CurlPath, $GuestWorkingDirectory, $BootTimeHelperPath, $TimeoutSeconds, $PollSeconds, [switch]$SkipHelperUpload)
+        $script:f5BootReadCalls++
+        if ($script:f5RebootMode -eq 'BootReadRejected' -and $script:f5BootReadCalls -eq 1) {
+            $invalidLogin = New-Object System.Exception('Synthetic InvalidGuestLogin during boot-time read.')
+            $invalidLogin.PSTypeNames.Insert(0, 'VMware.Vim.InvalidGuestLogin')
+            throw $invalidLogin
+        }
+        $bootTime = if ($script:f5BootReadCalls -le 2) { $baseBootTime } else { $newBootTime }
+        return [pscustomobject]@{ VMName = $VMName; BootTimeUtc = $bootTime; UptimeSeconds = 60 }
+    }
+    function Read-RebootDecision {
+        param($Context)
+        $script:f5GenericRebootPrompts++
+        return 'CONTINUE'
+    }
+    function Start-Sleep { param($Seconds, $Milliseconds) $null = $Seconds; $null = $Milliseconds }
+
+    $recoveryDecision = {
+        param($VMName, $AccountKey, $Members, $Reason)
+        $script:f5RecoveryPrompts++
+        return [pscustomobject]@{ Action = 'Retry'; Credential = $replacementCredential; Remember = $false }
+    }
+    $target = [pscustomobject]@{ vmName = 'VM-reboot-recovery'; rebootReason = 'Reported after apply' }
+
+    $script:f5RebootMode = 'ChildRejected'
+    $script:f5RebootJobCalls = 0
+    $script:f5RebootCredentialUsers = @()
+    $script:f5BootReadCalls = 0
+    $script:f5RecoveryPrompts = 0
+    $script:f5GenericRebootPrompts = 0
+    $childRejectedMap = @{ 'VM-reboot-recovery' = $oldCredential }
+    $childRejectedContext = New-GuestCredentialContext -TargetNames @('VM-reboot-recovery') -CredentialMap $childRejectedMap
+    $childRejectedActions = @(Invoke-GuestRebootPhase -RebootTargets @($target) -GuestCredentialMap $childRejectedMap -VIServers @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 60 -PollSeconds 1 -RebootBatchSize 1 -CredentialContext $childRejectedContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $true)
+    Assert-Equal -Actual $script:f5RebootJobCalls -Expected 2 -Message 'F5: an explicitly rejected reboot is submitted once more after credential recovery'
+    Assert-Equal -Actual ($script:f5RebootCredentialUsers -join ';') -Expected 'OLD\adm;NEW\adm' -Message 'F5: retrying a rejected reboot uses the replacement credential'
+    Assert-Equal -Actual $script:f5RecoveryPrompts -Expected 1 -Message 'F5: rejected reboot asks for one replacement credential'
+    Assert-Equal -Actual $script:f5GenericRebootPrompts -Expected 0 -Message 'F5: credential recovery does not fall through to generic reboot prompting'
+    Assert-Equal -Actual $childRejectedActions[0].validationStatus -Expected 'Confirmed' -Message 'F5: recovered reboot still waits for a newer boot time'
+
+    $script:f5RebootMode = 'BootReadRejected'
+    $script:f5RebootJobCalls = 0
+    $script:f5RebootCredentialUsers = @()
+    $script:f5BootReadCalls = 0
+    $script:f5RecoveryPrompts = 0
+    $script:f5GenericRebootPrompts = 0
+    $bootReadMap = @{ 'VM-reboot-recovery' = $oldCredential }
+    $bootReadContext = New-GuestCredentialContext -TargetNames @('VM-reboot-recovery') -CredentialMap $bootReadMap
+    $bootReadActions = @(Invoke-GuestRebootPhase -RebootTargets @($target) -GuestCredentialMap $bootReadMap -VIServers @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 60 -PollSeconds 1 -RebootBatchSize 1 -CredentialContext $bootReadContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $true)
+    Assert-Equal -Actual $script:f5RecoveryPrompts -Expected 1 -Message 'F5: InvalidGuestLogin during boot-time read asks for a replacement credential'
+    Assert-Equal -Actual $script:f5RebootJobCalls -Expected 1 -Message 'F5: recovered boot-time read does not duplicate reboot submission'
+    Assert-Equal -Actual $script:f5GenericRebootPrompts -Expected 0 -Message 'F5: recovered boot-time read does not reach a generic reboot prompt'
+    Assert-Equal -Actual $bootReadActions[0].validationStatus -Expected 'Confirmed' -Message 'F5: recovered boot-time read confirms the reboot normally'
+
+    # An ambiguous transport failure may have left shutdown.exe running, so it must never be
+    # re-sent: a second submission would be a second reboot. The coordinator observes instead.
+    $script:f5RebootMode = 'Ambiguous'
+    $script:f5RebootJobCalls = 0
+    $script:f5RebootCredentialUsers = @()
+    $script:f5BootReadCalls = 0
+    $script:f5RecoveryPrompts = 0
+    $script:f5GenericRebootPrompts = 0
+    $ambiguousMap = @{ 'VM-reboot-recovery' = $oldCredential }
+    $ambiguousContext = New-GuestCredentialContext -TargetNames @('VM-reboot-recovery') -CredentialMap $ambiguousMap
+    $ambiguousActions = @(Invoke-GuestRebootPhase -RebootTargets @($target) -GuestCredentialMap $ambiguousMap -VIServers @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 60 -PollSeconds 1 -RebootBatchSize 1 -CredentialContext $ambiguousContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $true)
+    Assert-Equal -Actual $script:f5RebootJobCalls -Expected 1 -Message 'F5: an ambiguous initiation error is never re-sent'
+    Assert-Equal -Actual $script:f5RecoveryPrompts -Expected 0 -Message 'F5: an ambiguous initiation error asks for no replacement credential'
+    Assert-Equal -Actual ($script:f5RebootCredentialUsers -join ';') -Expected 'OLD\adm' -Message 'F5: an ambiguous initiation error keeps the original credential'
+    Assert-Equal -Actual $ambiguousActions[0].validationStatus -Expected 'Confirmed' -Message 'F5: an ambiguous initiation error is resolved by observing the boot time'
+
+    # Two guests in one AD domain share one account. A rotated domain password rejects both, but
+    # the operator must be asked once - and the VM that did not open the dialog must still end up
+    # on the replacement, not on the credential the guest already refused.
+    $script:f5RebootMode = 'ChildRejected'
+    $script:f5RebootJobCalls = 0
+    $script:f5RebootCredentialUsers = @()
+    $script:f5BootReadCalls = 0
+    $script:f5RecoveryPrompts = 0
+    $script:f5GenericRebootPrompts = 0
+    $groupTargets = @(
+        [pscustomobject]@{ vmName = 'vm-a.corp.test'; rebootReason = 'Reported after apply' },
+        [pscustomobject]@{ vmName = 'vm-b.corp.test'; rebootReason = 'Reported after apply' }
+    )
+    $groupMap = @{ 'vm-a.corp.test' = $oldCredential; 'vm-b.corp.test' = $oldCredential }
+    $groupContext = New-GuestCredentialContext -TargetNames @('vm-a.corp.test', 'vm-b.corp.test') -CredentialMap $groupMap
+    $groupActions = @(Invoke-GuestRebootPhase -RebootTargets $groupTargets -GuestCredentialMap $groupMap -VIServers @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 60 -PollSeconds 1 -RebootBatchSize 2 -CredentialContext $groupContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $true)
+    Assert-Equal -Actual $script:f5RecoveryPrompts -Expected 1 -Message 'F5: two guests sharing one account ask for one replacement credential'
+    Assert-Equal -Actual (@($script:f5RebootCredentialUsers | Where-Object { $_ -eq 'NEW\adm' }).Count) -Expected 2 -Message 'F5: both guests in the account are re-sent with the replacement credential'
+    Assert-Equal -Actual $script:f5GenericRebootPrompts -Expected 0 -Message 'F5: a shared-account recovery does not reach a generic reboot prompt'
+    Assert-Equal -Actual (@($groupActions | Where-Object { $_.validationStatus -eq 'Confirmed' }).Count) -Expected 2 -Message 'F5: both recovered guests confirm a newer boot time'
+
+    # A non-interactive run cannot answer a dialog, so the account's recovery fails outright. No
+    # member of it may then be handed the refused credential back out of an earlier validation
+    # and re-submitted with it: that is extra failed logons against an account already failing,
+    # which is lockout pressure on a large run.
+    $script:f5RebootMode = 'ChildRejected'
+    $script:f5RebootJobCalls = 0
+    $script:f5RebootCredentialUsers = @()
+    $script:f5BootReadCalls = 0
+    $script:f5RecoveryPrompts = 0
+    $script:f5GenericRebootPrompts = 0
+    $lockoutTargets = @(
+        [pscustomobject]@{ vmName = 'vm-c.corp.test'; rebootReason = 'Reported after apply' },
+        [pscustomobject]@{ vmName = 'vm-d.corp.test'; rebootReason = 'Reported after apply' }
+    )
+    $lockoutMap = @{ 'vm-c.corp.test' = $oldCredential; 'vm-d.corp.test' = $oldCredential }
+    $lockoutContext = New-GuestCredentialContext -TargetNames @('vm-c.corp.test', 'vm-d.corp.test') -CredentialMap $lockoutMap
+    $lockoutActions = @(Invoke-GuestRebootPhase -RebootTargets $lockoutTargets -GuestCredentialMap $lockoutMap -VIServers @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 1 -PollSeconds 1 -RebootBatchSize 2 -CredentialContext $lockoutContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $false)
+    Assert-Equal -Actual $script:f5RecoveryPrompts -Expected 0 -Message 'F5: a non-interactive run never opens a credential dialog'
+    Assert-Equal -Actual (@($script:f5RebootCredentialUsers | Where-Object { $_ -eq 'OLD\adm' }).Count) -Expected 2 -Message 'F5: a refused account is not re-submitted with the credential the guest already refused'
+    Assert-Equal -Actual $script:f5RebootJobCalls -Expected 1 -Message 'F5: a refused account that cannot be recovered submits once'
+    Assert-Equal -Actual (@($lockoutActions | Where-Object { $_.action -eq 'Initiated' -and $_.validationStatus -eq 'Confirmed' }).Count) -Expected 0 -Message 'F5: a refused account confirms no reboot'
+
+    # VMware Tools are down while the guest reboots, so credential validation cannot run. That is
+    # an error, not an operator refusal: the boot-time gate must keep waiting and then ask the
+    # operator, instead of silently recording the VM as a credential failure it can never answer.
+    $script:f5RebootMode = 'ValidationUnavailable'
+    $script:f5RebootJobCalls = 0
+    $script:f5RebootCredentialUsers = @()
+    $script:f5BootReadCalls = 0
+    $script:f5RecoveryPrompts = 0
+    $script:f5GenericRebootPrompts = 0
+    $unavailableMap = @{ 'VM-reboot-recovery' = $oldCredential }
+    $unavailableContext = New-GuestCredentialContext -TargetNames @('VM-reboot-recovery') -CredentialMap $unavailableMap
+    $unavailableActions = @(Invoke-GuestRebootPhase -RebootTargets @($target) -GuestCredentialMap $unavailableMap -VIServers @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 1 -PollSeconds 1 -RebootBatchSize 1 -CredentialContext $unavailableContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $true)
+    Assert-Equal -Actual $script:f5RecoveryPrompts -Expected 0 -Message 'F5: a validation error is never treated as a rejected credential'
+    Assert-Equal -Actual $script:f5GenericRebootPrompts -Expected 1 -Message 'F5: a validation error still reaches the operator decision it can answer'
+    Assert-Equal -Actual ($unavailableActions[0].validationStatus -eq 'CredentialRecovery') -Expected $false -Message 'F5: a validation error is not recorded as a credential refusal'
+}
+
+# F5: the reboot child job must say whether shutdown.exe could already be running. Everything
+# before Invoke-VMGuestReboot - the module import, the child's own vCenter login - is
+# unambiguously "never sent", and reporting those as ambiguous cost a full reboot timeout and
+# recorded action=Initiated for a guest that was never told to restart.
+& {
+    $jobLibPath = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-job-lib-' + [guid]::NewGuid().ToString('N') + '.ps1')
+    $jobLibBody = @'
+. '__REPO_ROOT__/scripts/GuestOpsLib.ps1'
+function Connect-VIServersWithCredentialMap {
+    param($VIServers, $CredentialMap, $CredentialPromptScript, [switch]$RetryOnFailure, [switch]$ReuseExisting)
+    if ($env:F5_JOB_MODE -eq 'ConnectFails') {
+        throw (New-Object System.TimeoutException -ArgumentList 'synthetic vCenter login timeout')
+    }
+    return [pscustomobject]@{ OpenedConnections = @() }
+}
+function New-GuestAuthentication {
+    param([pscredential]$Credential)
+    return [pscustomobject]@{ UserName = $Credential.UserName }
+}
+function Invoke-VMGuestReboot {
+    param([string]$VMName, $Managers, $GuestAuth)
+    if ($env:F5_JOB_MODE -eq 'RebootPreflightFails') {
+        # What Invoke-VMGuestReboot does for a Get-ExactVM/GetView failure: the guest was never
+        # touched, so the caller must not spend a reboot timeout observing it.
+        $preflight = New-Object System.TimeoutException -ArgumentList 'synthetic inventory lookup timeout'
+        $preflight.Data['RejectedBeforeStart'] = $true
+        throw $preflight
+    }
+    if ($env:F5_JOB_MODE -eq 'RebootTransient') {
+        throw (New-Object System.TimeoutException -ArgumentList 'synthetic transport failure sending shutdown')
+    }
+    if ($env:F5_JOB_MODE -eq 'RebootRejected') {
+        $invalidLogin = New-Object System.Exception -ArgumentList 'synthetic rejected login sending shutdown'
+        $invalidLogin.PSTypeNames.Insert(0, 'VMware.Vim.InvalidGuestLogin')
+        throw $invalidLogin
+    }
+    return [pscustomobject]@{ ProcessId = 4242 }
+}
+function Disconnect-VIServer { param($Server, [switch]$Confirm) }
+'@
+    $jobLibBody = $jobLibBody.Replace('__REPO_ROOT__', $repoRoot.Replace('\\', '/'))
+    Set-Content -LiteralPath $jobLibPath -Value $jobLibBody -Encoding UTF8
+
+    function Import-Module { param($Name, [switch]$ErrorAction) }
+    $jobCredential = New-Object System.Management.Automation.PSCredential('CORP\job', (ConvertTo-SecureString 'synthetic-job' -AsPlainText -Force))
+    $jobScript = Get-GuestRebootJobScript
+    $jobInput = [pscustomobject]@{
+        Sequence = 1
+        VMName = 'vm-job.corp.test'
+        RebootReason = 'Reported after apply'
+        VIServers = @('vc.synthetic.invalid')
+        VIServerCredentialMap = @{}
+        GuestCredential = $jobCredential
+        IgnoreVCenterCertificate = $false
+        GuestOpsLibPath = $jobLibPath
+    }
+
+    try {
+        $env:F5_JOB_MODE = 'ConnectFails'
+        $connectResult = & $jobScript $jobInput
+        Assert-Equal -Actual ([string]$connectResult.ErrorKind) -Expected 'Transient' -Message 'F5: a child vCenter login timeout classifies as transient'
+        Assert-Equal -Actual ([bool]$connectResult.RejectedBeforeStart) -Expected $true -Message 'F5: a failure before Invoke-VMGuestReboot is never ambiguous'
+        Assert-Equal -Actual ($null -eq $connectResult.ProcessId) -Expected $true -Message 'F5: a child that never reached the guest reports no process id'
+
+        $env:F5_JOB_MODE = 'RebootTransient'
+        $transientResult = & $jobScript $jobInput
+        Assert-Equal -Actual ([string]$transientResult.ErrorKind) -Expected 'Transient' -Message 'F5: a transport failure sending shutdown classifies as transient'
+        Assert-Equal -Actual ([bool]$transientResult.RejectedBeforeStart) -Expected $false -Message 'F5: a transport failure sending shutdown stays ambiguous and is never re-sent'
+
+        $env:F5_JOB_MODE = 'RebootPreflightFails'
+        $preflightResult = & $jobScript $jobInput
+        Assert-Equal -Actual ([string]$preflightResult.ErrorKind) -Expected 'Transient' -Message 'F5: a pre-flight lookup timeout still classifies as transient'
+        Assert-Equal -Actual ([bool]$preflightResult.RejectedBeforeStart) -Expected $true -Message 'F5: a failure raised before the guest was touched is never ambiguous'
+
+        $env:F5_JOB_MODE = 'RebootRejected'
+        $rejectedResult = & $jobScript $jobInput
+        Assert-Equal -Actual ([string]$rejectedResult.ErrorKind) -Expected 'InvalidCredentials' -Message 'F5: a guest refusing the credential classifies as invalid credentials'
+        Assert-Equal -Actual ([bool]$rejectedResult.RejectedBeforeStart) -Expected $true -Message 'F5: a refused login means shutdown.exe never started'
+
+        $env:F5_JOB_MODE = 'Succeeds'
+        $okResult = & $jobScript $jobInput
+        Assert-Equal -Actual ([string]$okResult.Error) -Expected '' -Message 'F5: a successful reboot submission reports no error'
+        Assert-Equal -Actual ([bool]$okResult.RejectedBeforeStart) -Expected $false -Message 'F5: a successful reboot submission is not a rejection'
+        Assert-Equal -Actual $okResult.ProcessId -Expected 4242 -Message 'F5: a successful reboot submission carries the guest process id'
+    }
+    finally {
+        Remove-Item Env:F5_JOB_MODE -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $jobLibPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# F5: Complete-VMAgentCycle must not erase why the artifacts could not be downloaded. It used
+# to re-throw a bare string, which classifies as Permanent, so a credential that expired
+# mid-cycle produced "status.json was not downloaded" and no recovery was ever offered.
+& {
+    function Read-VMAgentCycleStatus {
+        param($Handle)
+        $invalidLogin = New-Object System.Exception -ArgumentList 'synthetic rejected login during status download'
+        $invalidLogin.PSTypeNames.Insert(0, 'VMware.Vim.InvalidGuestLogin')
+        throw $invalidLogin
+    }
+    function Receive-GuestFile {
+        param($FileManager, $VMView, $GuestAuth, $HostName, $CurlPath, $GuestPath, $LocalPath, $TimeoutSeconds)
+        throw 'synthetic agent.log download failure'
+    }
+
+    $collectHandle = [pscustomobject]@{
+        VMName = 'vm-collect.corp.test'
+        RunId = 'collect-run'
+        Mode = 'Apply'
+        Status = $null
+        Managers = [pscustomobject]@{ FileManager = $null }
+        VMView = $null
+        GuestAuth = $null
+        HostName = 'synthetic'
+        CurlPath = 'unused'
+        GuestLogPath = 'C:\synthetic\agent.log'
+        LocalLogPath = (Join-Path ([System.IO.Path]::GetTempPath()) 'guestops-collect-agent.log')
+        LocalStatusPath = (Join-Path ([System.IO.Path]::GetTempPath()) 'guestops-collect-missing-status.json')
+        TransferTimeoutSeconds = 5
+    }
+    Remove-Item -LiteralPath $collectHandle.LocalStatusPath -Force -ErrorAction SilentlyContinue
+
+    $collectErrorKind = 'not thrown'
+    try {
+        Complete-VMAgentCycle -Handle $collectHandle -AgentResult $null | Out-Null
+    }
+    catch {
+        $collectErrorKind = Get-GuestOperationErrorKind -ErrorRecord $_
+    }
+    Assert-Equal -Actual $collectErrorKind -Expected 'InvalidCredentials' -Message 'F5: a rejected login during artifact collection keeps its classification'
+}
+
+# F5: a guest that rejects the credential at start, at poll, or while the artifacts are
+# collected must be recovered on that same stage - and recovering a poll or a collect must not
+# start a second agent, because the first one is still installing updates.
+& {
+    $stageOld = New-Object System.Management.Automation.PSCredential('CORP\adm-old', (ConvertTo-SecureString 'synthetic-stage-old' -AsPlainText -Force))
+    $stageNew = New-Object System.Management.Automation.PSCredential('CORP\adm-new', (ConvertTo-SecureString 'synthetic-stage-new' -AsPlainText -Force))
+
+    $script:f5StageMode = ''
+    $script:f5StageStarts = 0
+    $script:f5StagePolls = 0
+    $script:f5StageCompletes = 0
+    $script:f5StagePrompts = 0
+
+    function New-InvalidGuestLoginError {
+        param([string]$Message)
+        $invalidLogin = New-Object System.Exception -ArgumentList $Message
+        $invalidLogin.PSTypeNames.Insert(0, 'VMware.Vim.InvalidGuestLogin')
+        return $invalidLogin
+    }
+    function New-GuestAuthentication {
+        param([pscredential]$Credential)
+        return [pscustomobject]@{ UserName = $Credential.UserName }
+    }
+    function Test-GuestCredentialForTarget {
+        param([string]$VMName, [pscredential]$Credential)
+        # The password rotated mid-run, so it still validates; only the guest operation refuses
+        # it. That is the case requirement 3 names, and the only one where the stage matters.
+        return [pscustomobject]@{ Status = 'Valid'; ErrorKind = $null; Error = $null }
+    }
+    function Start-VMAgentCycle {
+        param($VMName, $Managers, $GuestAuth, $CurlPath, $AgentPath, $IdentityHelperPath, $GuestWorkingDirectory, $VMOutputDirectory, $MaxUpdates, $LocalSelectionPath, $SelectionPath, [switch]$SearchOnly)
+        $script:f5StageStarts++
+        if ($script:f5StageMode -eq 'Start' -and $script:f5StageStarts -eq 1) {
+            throw (New-InvalidGuestLoginError -Message 'synthetic rejected login at start')
+        }
+        return [pscustomobject]@{ VMName = $VMName; GuestAuth = $GuestAuth; AgentResult = $null }
+    }
+    function Test-VMAgentCycleComplete {
+        param($Handle)
+        $script:f5StagePolls++
+        if ($script:f5StageMode -eq 'Poll' -and $script:f5StagePolls -eq 1) {
+            throw (New-InvalidGuestLoginError -Message 'synthetic rejected login at poll')
+        }
+        return [pscustomobject]@{ Completed = $true; ExitCode = 0 }
+    }
+    function Complete-VMAgentCycle {
+        param($Handle, $AgentResult)
+        $script:f5StageCompletes++
+        if ($script:f5StageMode -eq 'Collect' -and $script:f5StageCompletes -eq 1) {
+            # GuestOpsLib wraps a failed artifact download in an InvalidOperationException and
+            # keeps the original as InnerException; without that the login type is lost here and
+            # no recovery is ever offered.
+            throw (New-Object System.InvalidOperationException -ArgumentList 'status.json was not downloaded.', (New-InvalidGuestLoginError -Message 'synthetic rejected login at collect'))
+        }
+        return [pscustomobject]@{
+            RunId = 'stage-run'
+            Mode = 'Apply'
+            AgentCompletionConfirmed = $true
+            AgentCompletionReason = 'synthetic terminal status'
+            AgentResult = $AgentResult
+            Status = [pscustomobject]@{ runId = 'stage-run'; outcome = 'InstallSucceeded'; finishedAt = '2026-09-11T10:00:00Z' }
+        }
+    }
+
+    $stageDecision = {
+        param($VMName, $AccountKey, $Members, $Reason)
+        $script:f5StagePrompts++
+        return [pscustomobject]@{ Action = 'Retry'; Credential = $stageNew; Remember = $false }
+    }
+    $stageItem = [pscustomobject]@{
+        Sequence = 1
+        VMName = 'vm-stage.corp.test'
+        VMOutputDirectory = 'C:\synthetic\out'
+        MaxUpdates = 1
+        LocalSelectionPath = ''
+        GuestSelectionPath = ''
+        SearchOnly = $true
+    }
+
+    foreach ($stage in @('Start', 'Poll', 'Collect')) {
+        $script:f5StageMode = $stage
+        $script:f5StageStarts = 0
+        $script:f5StagePolls = 0
+        $script:f5StageCompletes = 0
+        $script:f5StagePrompts = 0
+        $stageMap = @{ 'vm-stage.corp.test' = $stageOld }
+        $stageContext = New-GuestCredentialContext -TargetNames @('vm-stage.corp.test') -CredentialMap $stageMap
+        $stageResults = @(Invoke-GuestAgentFleet -FleetItems @($stageItem) -Managers $null -GuestCredentialMap $stageMap -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -TimeoutSeconds 60 -PollSeconds 1 -MaxInFlight 1 -CredentialContext $stageContext -CredentialDecisionScript $stageDecision -CredentialInteractive $true)
+
+        Assert-Equal -Actual $script:f5StagePrompts -Expected 1 -Message ('F5: a rejected login during {0} asks for one replacement credential' -f $stage)
+        Assert-Equal -Actual ([string]$stageResults[0].Error) -Expected '' -Message ('F5: a rejected login during {0} recovers instead of failing the VM' -f $stage)
+        Assert-Equal -Actual ([bool]$stageResults[0].Payload.AgentCompletionConfirmed) -Expected $true -Message ('F5: a rejected login during {0} still yields a confirmed cycle' -f $stage)
+        Assert-Equal -Actual $stageMap['vm-stage.corp.test'].UserName -Expected 'CORP\adm-new' -Message ('F5: a rejected login during {0} leaves the replacement credential in the map' -f $stage)
+        $expectedStarts = if ($stage -eq 'Start') { 2 } else { 1 }
+        Assert-Equal -Actual $script:f5StageStarts -Expected $expectedStarts -Message ('F5: recovering a rejected login during {0} starts the agent the expected number of times' -f $stage)
     }
 }
 

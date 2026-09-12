@@ -162,7 +162,16 @@ function New-FakeManagers {
         return [pscustomobject]@{ Url = 'https://*/guestFile?id=1&token=download'; Size = 10 }
     }
 
-    return [pscustomobject]@{ ProcessManager = $processManager; FileManager = $fileManager }
+    # Get-GuestOpsManagers resolves an AuthManager through the VM's own client, so a fixture
+    # without one fails every cycle before it starts. The harness never validates a credential
+    # itself - the invalid-login paths are covered offline in Invoke-SafetyRegressionChecks.ps1.
+    $authManager = New-Object psobject
+    $authManager | Add-Member -MemberType ScriptMethod -Name ValidateCredentialsInGuest -Value {
+        param($MoRef, $Auth)
+        return $null
+    }
+
+    return [pscustomobject]@{ ProcessManager = $processManager; FileManager = $fileManager; AuthManager = $authManager }
 }
 
 function New-FakeVMView {
@@ -237,14 +246,17 @@ function New-ClientBoundFakeClient {
     $guestOperationsReference = 'guest-ops-{0}' -f $VMName
     $processReference = 'process-manager-{0}' -f $VMName
     $fileReference = 'file-manager-{0}' -f $VMName
+    $authReference = 'auth-manager-{0}' -f $VMName
     $guestOperationsView = [pscustomobject]@{
         ProcessManager = $processReference
         FileManager = $fileReference
+        AuthManager = $authReference
     }
     $viewMap = @{
         $guestOperationsReference = $guestOperationsView
         $processReference = $Managers.ProcessManager
         $fileReference = $Managers.FileManager
+        $authReference = $Managers.AuthManager
     }
     $client = New-Object psobject
     $client | Add-Member -MemberType NoteProperty -Name ServiceContent -Value ([pscustomobject]@{ GuestOperationsManager = $guestOperationsReference })

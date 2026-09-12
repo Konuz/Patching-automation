@@ -1102,6 +1102,84 @@ $firstReadIndex = $script:readCallLog.IndexOf('readtime:VM03:0')
 $firstConfirmIndex = $script:readCallLog.IndexOf('readtime:VM01:1')
 Assert-Equal -Actual ($firstReadIndex -lt $firstConfirmIndex) -Expected $true -Message 'a single batch reads every baseline before any confirmation'
 
+# F5: typed credential failures must never be sent to shutdown.exe, while an ambiguous
+# network failure after a single send must be observed rather than sent again.
+Reset-RebootTestState
+$credentialFailureDecisionCalls = 0
+$credentialFailureInitiateCalls = 0
+$credentialFailureRecords = @(Invoke-RebootBatchCoordinator -RebootTargets @((New-RebootTestTarget -Sequence 1 -VMName 'VM-credential-failure')) -BatchSize 1 -WaitTimeoutSeconds 60 -PollSeconds 1 -ReadBootTimeScript {
+        param($Items)
+        return @($Items | ForEach-Object {
+                [pscustomobject]@{
+                    VMName = $_.VMName
+                    BootTimeUtc = $null
+                    Error = 'Guest credential was skipped.'
+                    ErrorKind = 'CredentialsSkipped'
+                    RejectedBeforeStart = $true
+                }
+            })
+    } -InitiateRebootScript {
+        param($Items)
+        $script:credentialFailureInitiateCalls += @($Items).Count
+        return @()
+    } -DecisionPromptScript {
+        param($Context)
+        $script:credentialFailureDecisionCalls++
+        return 'CONTINUE'
+    } -SleepScript { param($Seconds) $null = $Seconds })
+$credentialFailureRecord = @($credentialFailureRecords)[0]
+Assert-Equal -Actual $credentialFailureInitiateCalls -Expected 0 -Message 'credential-skipped reboot target never sends shutdown.exe'
+Assert-Equal -Actual $credentialFailureDecisionCalls -Expected 0 -Message 'credential-skipped reboot target never reaches a generic reboot prompt'
+Assert-Equal -Actual $credentialFailureRecord.action -Expected 'Failed' -Message 'credential-skipped reboot target is an explicit failure'
+Assert-Equal -Actual (Get-RuntimePropertyValue -InputObject $credentialFailureRecord -Name 'errorKind') -Expected 'CredentialsSkipped' -Message 'credential-skipped reboot record preserves its typed error'
+Assert-Equal -Actual (Get-RuntimePropertyValue -InputObject $credentialFailureRecord -Name 'rejectedBeforeStart') -Expected $true -Message 'credential-skipped reboot record preserves pre-start rejection'
+
+Reset-RebootTestState
+$ambiguousRestartDecisionCalls = 0
+$ambiguousRestartSendCalls = 0
+$ambiguousRestartReadScript = {
+    param($Items)
+    $results = @()
+    foreach ($item in @($Items)) {
+        $vmName = [string]$item.VMName
+        if (-not $script:readAttempts.ContainsKey($vmName)) {
+            $script:readAttempts[$vmName] = 0
+        }
+        $attempt = $script:readAttempts[$vmName]
+        $script:readAttempts[$vmName]++
+        $results += [pscustomobject]@{
+            VMName = $vmName
+            BootTimeUtc = if ($attempt -eq 0) { $baseTime } else { $newTime }
+            Error = $null
+        }
+    }
+    return @($results)
+}
+$ambiguousRestartRecords = @(Invoke-RebootBatchCoordinator -RebootTargets @((New-RebootTestTarget -Sequence 1 -VMName 'VM-ambiguous-restart')) -BatchSize 1 -WaitTimeoutSeconds 60 -PollSeconds 1 -GraceSeconds 0 -ReadBootTimeScript $ambiguousRestartReadScript -InitiateRebootScript {
+        param($Items)
+        $script:ambiguousRestartSendCalls += @($Items).Count
+        return @($Items | ForEach-Object {
+                [pscustomobject]@{
+                    VMName = $_.VMName
+                    ProcessId = $null
+                    Error = 'Synthetic connection reset after reboot submission.'
+                    ErrorKind = 'Transient'
+                    RejectedBeforeStart = $false
+                }
+            })
+    } -DecisionPromptScript {
+        param($Context)
+        $script:ambiguousRestartDecisionCalls++
+        return 'ABORT'
+    } -SleepScript { param($Seconds) $null = $Seconds })
+$ambiguousRestartRecord = @($ambiguousRestartRecords)[0]
+Assert-Equal -Actual $ambiguousRestartSendCalls -Expected 1 -Message 'ambiguous reboot initiation sends shutdown.exe exactly once'
+Assert-Equal -Actual $ambiguousRestartDecisionCalls -Expected 0 -Message 'ambiguous reboot initiation is observed without an initiation retry prompt'
+Assert-Equal -Actual $ambiguousRestartRecord.action -Expected 'Initiated' -Message 'ambiguous reboot initiation remains an observed reboot'
+Assert-Equal -Actual $ambiguousRestartRecord.validationStatus -Expected 'Confirmed' -Message 'ambiguous reboot is confirmed from the later boot time'
+Assert-Equal -Actual (Get-RuntimePropertyValue -InputObject $ambiguousRestartRecord -Name 'errorKind') -Expected 'Transient' -Message 'ambiguous reboot record preserves its typed error'
+Assert-Equal -Actual (Get-RuntimePropertyValue -InputObject $ambiguousRestartRecord -Name 'rejectedBeforeStart') -Expected $false -Message 'ambiguous reboot record preserves non-rejection'
+
 
 # --- Shared VM-target parsing (scripts/VMTargetLib.ps1 + launcher prompt wrapper) ---
 # The pure helpers live in a dot-sourceable lib; the launcher's Resolve-VMTargetNames adds

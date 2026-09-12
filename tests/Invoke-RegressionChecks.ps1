@@ -120,6 +120,8 @@ $roundLoop = $ast.Find({ param($n) $n -is [System.Management.Automation.Language
     }
     $roundNumber = 0; $roundTargetVMNames = @('vm01'); $roundSummaries = @(); $finalStateMap = @{}
     $deselectedUpdateKeys = @(); $sawApplyFailure = $false; $stoppedByRoundCap = $false
+    $guestCredentialContext = $null; $guestCredentialDecisionScript = $null
+    $guestCredentialValidatedScript = $null; $guestCredentialInteractive = $false
     $runOutputDirectory = Join-Path $repoRoot 'out'; $MaxPatchRounds = 3; $SearchOnly = $false; $PlanOnly = $false
     $hasExplicitSelectedUpdateKeys = $false; $SkipConfirmation = $false; $PromptProvider = $null
     $managers = $null; $guestCredentialMap = @{}; $resolvedVIServers = @(); $viserverCredentialMap = @{}

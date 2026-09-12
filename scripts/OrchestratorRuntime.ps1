@@ -141,7 +141,8 @@ function New-FleetErrorResult {
         $InputObject,
         [string]$ErrorMessage,
         $Payload = $null,
-        [string]$ResultKind = $null
+        [string]$ResultKind = $null,
+        $ErrorMetadata = $null
     )
 
     return [pscustomobject]@{
@@ -150,6 +151,8 @@ function New-FleetErrorResult {
         Payload = $Payload
         Error = $ErrorMessage
         ResultKind = $ResultKind
+        ErrorKind = Get-RuntimePropertyValue -InputObject $ErrorMetadata -Name 'ErrorKind'
+        RejectedBeforeStart = [bool](Get-RuntimePropertyValue -InputObject $ErrorMetadata -Name 'RejectedBeforeStart' -DefaultValue $false)
     }
 }
 
@@ -164,8 +167,21 @@ function Invoke-InProcessAgentFleet {
         [scriptblock]$CompleteScript,
         [scriptblock]$SleepScript = { param([int]$Seconds) Start-Sleep -Seconds $Seconds },
         [scriptblock]$NowScript = { Get-Date },
-        [scriptblock]$IsTransientErrorScript = { param($ErrorRecord) $false }
+        [scriptblock]$IsTransientErrorScript = { param($ErrorRecord) $false },
+        [scriptblock]$GetErrorMetadataScript = { param($ErrorRecord, $Stage) [pscustomobject]@{ ErrorKind = $null; RejectedBeforeStart = $false } }
     )
+
+    $getErrorMetadata = {
+        param($ErrorRecord, $Stage)
+        try {
+            $metadata = & $GetErrorMetadataScript $ErrorRecord $Stage
+            if ($null -ne $metadata) {
+                return $metadata
+            }
+        }
+        catch { }
+        return [pscustomobject]@{ ErrorKind = $null; RejectedBeforeStart = $false }
+    }
 
     if ($MaxInFlight -lt 1) {
         throw 'MaxInFlight must be greater than or equal to 1.'
@@ -186,14 +202,19 @@ function Invoke-InProcessAgentFleet {
         param($Entry)
 
         $payload = $null
+        $errorRecord = $null
         try {
             $payload = & $CompleteScript $Entry.Handle
         }
         catch {
+            $errorRecord = $_
             Write-Warning ('Could not collect artifacts for {0}: {1}' -f (Get-RuntimePropertyValue -InputObject $Entry.Item -Name 'VMName'), $_.Exception.Message)
         }
 
-        return $payload
+        return [pscustomobject]@{
+            Payload = $payload
+            ErrorRecord = $errorRecord
+        }
     }
 
     while ($pending.Count -gt 0 -or $inFlight.Count -gt 0) {
@@ -213,7 +234,8 @@ function Invoke-InProcessAgentFleet {
             catch {
                 # There is no job boundary around a start, so a throwing guest would end the
                 # whole phase. Every failure has to become this VM's error instead.
-                $results += New-FleetErrorResult -InputObject $item -ErrorMessage ('Agent start failed: {0}' -f $_.Exception.Message) -ResultKind 'StartError'
+                $errorMetadata = & $getErrorMetadata $_ 'Start'
+                $results += New-FleetErrorResult -InputObject $item -ErrorMessage ('Agent start failed: {0}' -f $_.Exception.Message) -ResultKind 'StartError' -ErrorMetadata $errorMetadata
             }
         }
 
@@ -226,9 +248,16 @@ function Invoke-InProcessAgentFleet {
                 # process result timed out. Dropping them here would turn a guest run that
                 # actually finished into a reported failure and throw away the only per-VM
                 # diagnostics. The timeout error stands regardless of what the harvest finds.
-                $timeoutPayload = & $collectEntry $entry
-
-                $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage ('Agent run timed out after {0} seconds.' -f $ItemTimeoutSeconds) -Payload $timeoutPayload -ResultKind 'Timeout'
+                $timeoutCollection = & $collectEntry $entry
+                $timeoutPayload = $timeoutCollection.Payload
+                $collectionError = $timeoutCollection.ErrorRecord
+                $collectionMetadata = if ($null -eq $collectionError) { $null } else { & $getErrorMetadata $collectionError 'Collect' }
+                if ($null -ne $collectionMetadata -and (Test-CredentialRefusalErrorKind -ErrorKind ([string](Get-RuntimePropertyValue -InputObject $collectionMetadata -Name 'ErrorKind')))) {
+                    $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage $collectionError.Exception.Message -Payload $timeoutPayload -ResultKind 'CredentialRecovery' -ErrorMetadata $collectionMetadata
+                }
+                else {
+                    $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage ('Agent run timed out after {0} seconds.' -f $ItemTimeoutSeconds) -Payload $timeoutPayload -ResultKind 'Timeout'
+                }
                 continue
             }
 
@@ -256,8 +285,9 @@ function Invoke-InProcessAgentFleet {
                 # A permanent poll error ends this VM, but its artifacts are still the best
                 # available evidence. The collection helper deliberately cannot replace the
                 # original poll error in the result.
-                $errorPayload = & $collectEntry $entry
-                $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage $pollError.Exception.Message -Payload $errorPayload -ResultKind 'PermanentPoll'
+                $errorCollection = & $collectEntry $entry
+                $errorMetadata = & $getErrorMetadata $pollError 'Poll'
+                $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage $pollError.Exception.Message -Payload $errorCollection.Payload -ResultKind 'PermanentPoll' -ErrorMetadata $errorMetadata
                 continue
             }
 
@@ -271,7 +301,8 @@ function Invoke-InProcessAgentFleet {
                     }
                 }
                 catch {
-                    $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage $_.Exception.Message -ResultKind 'CompletionError'
+                    $errorMetadata = & $getErrorMetadata $_ 'Completion'
+                    $results += New-FleetErrorResult -InputObject $entry.Item -ErrorMessage $_.Exception.Message -ResultKind 'CompletionError' -ErrorMetadata $errorMetadata
                 }
                 continue
             }
@@ -454,6 +485,16 @@ function Test-ApplyResultsSuccessful {
     $errors = @($ApplyResults | Where-Object { Test-IsApplyResultError -ApplyResult $_ })
     return ($errors.Count -eq 0)
 }
+function Test-CredentialRefusalErrorKind {
+    param([string]$ErrorKind)
+
+    # Only an operator decision counts as a refusal. A validation attempt that merely FAILED -
+    # VMware Tools down mid-reboot is the common case, and Assert-VMReadyForGuestOps throws on
+    # exactly that - must keep its ordinary transient handling, or a guest that rebooted
+    # correctly gets recorded as a credential failure with no prompt the operator could answer.
+    return ($ErrorKind -eq 'CredentialsSkipped' -or $ErrorKind -eq 'CredentialsAborted')
+}
+
 function Get-RuntimePropertyValue {
     param(
         $InputObject,
@@ -612,7 +653,9 @@ function New-RebootActionRecord {
         [string]$OperatorDecision = $null,
         [int]$AttemptCount = 0,
         [int]$TimeoutCount = 0,
-        [string]$LastErrorMessage = $null
+        [string]$LastErrorMessage = $null,
+        [string]$ErrorKind = $null,
+        [bool]$RejectedBeforeStart = $false
     )
 
     $bootTimeBaselineText = if ($null -eq $BootTimeBaseline) { $null } else { ([datetime]$BootTimeBaseline).ToUniversalTime().ToString('o') }
@@ -641,6 +684,8 @@ function New-RebootActionRecord {
         attemptCount = $AttemptCount
         timeoutCount = $TimeoutCount
         lastError = $lastErrorText
+        errorKind = if ([string]::IsNullOrWhiteSpace($ErrorKind)) { $null } else { $ErrorKind }
+        rejectedBeforeStart = $RejectedBeforeStart
     }
 }
 
@@ -1011,12 +1056,22 @@ function Wait-RebootBatchBootTimes {
         $kept = @()
         foreach ($pendingItem in $pending) {
             $readResult = $readByVm[[string]$pendingItem.VMName]
+            $errorKind = [string](Get-RuntimePropertyValue -InputObject $readResult -Name 'ErrorKind')
+            $rejectedBeforeStart = [bool](Get-RuntimePropertyValue -InputObject $readResult -Name 'RejectedBeforeStart' -DefaultValue $false)
             if ($null -eq $readResult) {
                 $pendingItem.LastErrorMessage = 'No boot time result was returned.'
             }
             elseif (-not [string]::IsNullOrWhiteSpace([string]$readResult.Error)) {
                 $pendingItem.LastErrorMessage = [string]$readResult.Error
             }
+
+            if (Test-CredentialRefusalErrorKind -ErrorKind $errorKind) {
+                $pendingItem | Add-Member -MemberType NoteProperty -Name ErrorKind -Value $errorKind -Force
+                $pendingItem | Add-Member -MemberType NoteProperty -Name RejectedBeforeStart -Value $rejectedBeforeStart -Force
+                $records += New-RebootActionRecord -VMName $pendingItem.VMName -Action 'Failed' -ProcessId $pendingItem.ProcessId -ErrorMessage $pendingItem.LastErrorMessage -RebootReason $pendingItem.RebootReason -BatchNumber $pendingItem.BatchNumber -Sequence $pendingItem.Sequence -BootTimeBaseline $pendingItem.BootTimeBaseline -BootTimeObserved $pendingItem.BootTimeObserved -UptimeBaselineSeconds $pendingItem.UptimeBaselineSeconds -UptimeObservedSeconds $pendingItem.UptimeObservedSeconds -ValidationStatus 'CredentialRecovery' -AttemptCount $pendingItem.AttemptCount -TimeoutCount $pendingItem.TimeoutCount -LastErrorMessage $pendingItem.LastErrorMessage -ErrorKind $errorKind -RejectedBeforeStart $rejectedBeforeStart
+                continue
+            }
+
             $confirmed = $false
             if ($newBootByVm.ContainsKey([string]$pendingItem.VMName)) {
                 $observed = $newBootByVm[[string]$pendingItem.VMName]
@@ -1024,7 +1079,7 @@ function Wait-RebootBatchBootTimes {
                 $pendingItem.UptimeObservedSeconds = Get-RuntimePropertyValue -InputObject $readResult -Name 'UptimeSeconds'
                 if (Test-BootTimeNewer -Baseline $pendingItem.BootTimeBaseline -Observed $observed) {
                     $confirmed = $true
-                    $records += New-RebootActionRecord -VMName $pendingItem.VMName -Action 'Initiated' -ProcessId $pendingItem.ProcessId -RebootReason $pendingItem.RebootReason -BatchNumber $pendingItem.BatchNumber -Sequence $pendingItem.Sequence -BootTimeBaseline $pendingItem.BootTimeBaseline -BootTimeObserved $observed -UptimeBaselineSeconds $pendingItem.UptimeBaselineSeconds -UptimeObservedSeconds $pendingItem.UptimeObservedSeconds -ValidationStatus 'Confirmed' -WaitSeconds ([int](Get-Date).Subtract($windowStart).TotalSeconds) -AttemptCount $pendingItem.AttemptCount -TimeoutCount $pendingItem.TimeoutCount -LastErrorMessage $pendingItem.LastErrorMessage
+                    $records += New-RebootActionRecord -VMName $pendingItem.VMName -Action 'Initiated' -ProcessId $pendingItem.ProcessId -RebootReason $pendingItem.RebootReason -BatchNumber $pendingItem.BatchNumber -Sequence $pendingItem.Sequence -BootTimeBaseline $pendingItem.BootTimeBaseline -BootTimeObserved $observed -UptimeBaselineSeconds $pendingItem.UptimeBaselineSeconds -UptimeObservedSeconds $pendingItem.UptimeObservedSeconds -ValidationStatus 'Confirmed' -WaitSeconds ([int](Get-Date).Subtract($windowStart).TotalSeconds) -AttemptCount $pendingItem.AttemptCount -TimeoutCount $pendingItem.TimeoutCount -LastErrorMessage $pendingItem.LastErrorMessage -ErrorKind ([string](Get-RuntimePropertyValue -InputObject $pendingItem -Name 'ErrorKind')) -RejectedBeforeStart ([bool](Get-RuntimePropertyValue -InputObject $pendingItem -Name 'RejectedBeforeStart' -DefaultValue $false))
                 }
             }
 
@@ -1106,6 +1161,9 @@ function Invoke-RebootBatchCoordinator {
                 TimeoutCount = 0
                 LastErrorMessage = $null
                 ReadTimeoutSeconds = $null
+                ErrorKind = $null
+                RejectedBeforeStart = $false
+                SkipInitiation = $false
             }
         }
 
@@ -1130,6 +1188,13 @@ function Invoke-RebootBatchCoordinator {
                     $matchingItem = @($missing | Where-Object { $_.VMName -eq $readResult.VMName })[0]
                     if ($null -ne $matchingItem) {
                         $matchingItem.LastErrorMessage = [string]$readResult.Error
+                        $errorKind = [string](Get-RuntimePropertyValue -InputObject $readResult -Name 'ErrorKind')
+                        if (Test-CredentialRefusalErrorKind -ErrorKind $errorKind) {
+                            $matchingItem.ErrorKind = $errorKind
+                            $matchingItem.RejectedBeforeStart = [bool](Get-RuntimePropertyValue -InputObject $readResult -Name 'RejectedBeforeStart' -DefaultValue $false)
+                            $matchingItem.SkipInitiation = $true
+                            $matchingItem.ValidationRequired = $false
+                        }
                     }
                 }
                 if ([string]::IsNullOrWhiteSpace([string]$readResult.Error) -and $null -ne $readResult.BootTimeUtc) {
@@ -1188,8 +1253,13 @@ function Invoke-RebootBatchCoordinator {
             continue
         }
 
+        foreach ($item in @($batchItems | Where-Object { $_.SkipInitiation })) {
+            $records += New-RebootActionRecord -VMName $item.VMName -Action 'Failed' -ErrorMessage $item.LastErrorMessage -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -ValidationStatus 'CredentialRecovery' -AttemptCount $item.AttemptCount -TimeoutCount $item.TimeoutCount -LastErrorMessage $item.LastErrorMessage -ErrorKind $item.ErrorKind -RejectedBeforeStart $item.RejectedBeforeStart
+        }
+
         # --- initiate reboots for the whole batch ---
-        $restartResults = @(& $InitiateRebootScript $batchItems)
+        $restartCandidates = @($batchItems | Where-Object { -not $_.SkipInitiation })
+        $restartResults = if ($restartCandidates.Count -gt 0) { @(& $InitiateRebootScript $restartCandidates) } else { @() }
         $restartByVm = @{}
         foreach ($restartResult in @($restartResults)) {
             if (-not $restartByVm.ContainsKey([string]$restartResult.VMName)) {
@@ -1199,10 +1269,38 @@ function Invoke-RebootBatchCoordinator {
 
         # A missing result counts as a failed initiation: silently dropping the VM here would
         # leave it out of reboot-actions.json and let the run exit 0 without ever rebooting it.
-        $initFailed = @($batchItems | Where-Object {
-            $result = $restartByVm[[string]$_.VMName]
-            $null -eq $result -or -not [string]::IsNullOrWhiteSpace([string]$result.Error)
-        })
+        $credentialInitFailures = @()
+        $ambiguousInitiations = @()
+        $initFailed = @()
+        foreach ($item in @($restartCandidates)) {
+            $result = $restartByVm[[string]$item.VMName]
+            if ($null -eq $result) {
+                $initFailed += $item
+                continue
+            }
+            if ([string]::IsNullOrWhiteSpace([string]$result.Error)) {
+                continue
+            }
+
+            $errorKind = [string](Get-RuntimePropertyValue -InputObject $result -Name 'ErrorKind')
+            if (Test-CredentialRefusalErrorKind -ErrorKind $errorKind) {
+                $credentialInitFailures += $item
+            }
+            elseif ($errorKind -eq 'Transient' -and -not [bool](Get-RuntimePropertyValue -InputObject $result -Name 'RejectedBeforeStart' -DefaultValue $false)) {
+                $ambiguousInitiations += $item
+            }
+            else {
+                $initFailed += $item
+            }
+        }
+
+        foreach ($item in $credentialInitFailures) {
+            $result = $restartByVm[[string]$item.VMName]
+            $item.LastErrorMessage = [string]$result.Error
+            $item.ErrorKind = [string](Get-RuntimePropertyValue -InputObject $result -Name 'ErrorKind')
+            $item.RejectedBeforeStart = [bool](Get-RuntimePropertyValue -InputObject $result -Name 'RejectedBeforeStart' -DefaultValue $false)
+            $records += New-RebootActionRecord -VMName $item.VMName -Action 'Failed' -ErrorMessage $item.LastErrorMessage -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -ValidationStatus 'CredentialRecovery' -AttemptCount $item.AttemptCount -TimeoutCount $item.TimeoutCount -LastErrorMessage $item.LastErrorMessage -ErrorKind $item.ErrorKind -RejectedBeforeStart $item.RejectedBeforeStart
+        }
 
         if ($initFailed.Count -gt 0) {
             $context = [pscustomobject]@{
@@ -1218,23 +1316,31 @@ function Invoke-RebootBatchCoordinator {
                 $result = $restartByVm[[string]$item.VMName]
                 $initErrorMessage = if ($null -eq $result) { 'No reboot initiation result was returned.' } else { [string]$result.Error }
                 $operatorDecision = if ($aborted) { 'ABORT' } else { 'CONTINUE' }
-                $records += New-RebootActionRecord -VMName $item.VMName -Action 'Failed' -ErrorMessage $initErrorMessage -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -ValidationStatus 'InitiationError' -OperatorDecision $operatorDecision -AttemptCount $item.AttemptCount -LastErrorMessage $initErrorMessage
+                $errorKind = [string](Get-RuntimePropertyValue -InputObject $result -Name 'ErrorKind')
+                $rejectedBeforeStart = [bool](Get-RuntimePropertyValue -InputObject $result -Name 'RejectedBeforeStart' -DefaultValue $false)
+                $records += New-RebootActionRecord -VMName $item.VMName -Action 'Failed' -ErrorMessage $initErrorMessage -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -ValidationStatus 'InitiationError' -OperatorDecision $operatorDecision -AttemptCount $item.AttemptCount -LastErrorMessage $initErrorMessage -ErrorKind $errorKind -RejectedBeforeStart $rejectedBeforeStart
                 $item.Initiated = $false
             }
         }
 
-        foreach ($item in $batchItems) {
+        foreach ($item in @($restartCandidates)) {
             $restartResult = $restartByVm[[string]$item.VMName]
             $restartSucceeded = ($null -ne $restartResult -and [string]::IsNullOrWhiteSpace([string]$restartResult.Error))
-            if ($restartSucceeded) {
+            $ambiguous = (@($ambiguousInitiations | Where-Object { $_.VMName -eq $item.VMName }).Count -gt 0)
+            if ($restartSucceeded -or $ambiguous) {
                 $item.Initiated = $true
-                $item.ProcessId = $restartResult.ProcessId
+                $item.ProcessId = Get-RuntimePropertyValue -InputObject $restartResult -Name 'ProcessId'
+                if ($ambiguous) {
+                    $item.LastErrorMessage = [string]$restartResult.Error
+                    $item.ErrorKind = [string](Get-RuntimePropertyValue -InputObject $restartResult -Name 'ErrorKind')
+                    $item.RejectedBeforeStart = [bool](Get-RuntimePropertyValue -InputObject $restartResult -Name 'RejectedBeforeStart' -DefaultValue $false)
+                }
             }
         }
 
         # --- validation / boot-time gate ---
         foreach ($item in @($batchItems | Where-Object { $_.Initiated -and -not $_.ValidationRequired })) {
-            $records += New-RebootActionRecord -VMName $item.VMName -Action 'Initiated' -ProcessId $item.ProcessId -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -BootTimeBaseline $null -BootTimeObserved $null -ValidationStatus 'Unverified' -OperatorDecision 'CONTINUE' -AttemptCount $item.AttemptCount -TimeoutCount $item.TimeoutCount -LastErrorMessage $item.LastErrorMessage
+            $records += New-RebootActionRecord -VMName $item.VMName -Action 'Initiated' -ProcessId $item.ProcessId -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -BootTimeBaseline $null -BootTimeObserved $null -ValidationStatus 'Unverified' -OperatorDecision 'CONTINUE' -AttemptCount $item.AttemptCount -TimeoutCount $item.TimeoutCount -LastErrorMessage $item.LastErrorMessage -ErrorKind $item.ErrorKind -RejectedBeforeStart $item.RejectedBeforeStart
         }
 
         $pendingItems = @($batchItems | Where-Object { $_.Initiated -and $_.ValidationRequired })
@@ -1271,13 +1377,13 @@ function Invoke-RebootBatchCoordinator {
                 }
                 elseif ($decision -eq 'CONTINUE') {
                     foreach ($item in $pendingItems) {
-                        $records += New-RebootActionRecord -VMName $item.VMName -Action 'Initiated' -ProcessId $item.ProcessId -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -BootTimeBaseline $item.BootTimeBaseline -BootTimeObserved $item.BootTimeObserved -UptimeBaselineSeconds $item.UptimeBaselineSeconds -UptimeObservedSeconds $item.UptimeObservedSeconds -ValidationStatus 'Unverified' -OperatorDecision 'CONTINUE' -AttemptCount $item.AttemptCount -TimeoutCount $item.TimeoutCount -LastErrorMessage $item.LastErrorMessage
+                        $records += New-RebootActionRecord -VMName $item.VMName -Action 'Initiated' -ProcessId $item.ProcessId -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -BootTimeBaseline $item.BootTimeBaseline -BootTimeObserved $item.BootTimeObserved -UptimeBaselineSeconds $item.UptimeBaselineSeconds -UptimeObservedSeconds $item.UptimeObservedSeconds -ValidationStatus 'Unverified' -OperatorDecision 'CONTINUE' -AttemptCount $item.AttemptCount -TimeoutCount $item.TimeoutCount -LastErrorMessage $item.LastErrorMessage -ErrorKind $item.ErrorKind -RejectedBeforeStart $item.RejectedBeforeStart
                     }
                     break
                 }
                 else {
                     foreach ($item in $pendingItems) {
-                        $records += New-RebootActionRecord -VMName $item.VMName -Action 'Initiated' -ProcessId $item.ProcessId -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -BootTimeBaseline $item.BootTimeBaseline -BootTimeObserved $item.BootTimeObserved -UptimeBaselineSeconds $item.UptimeBaselineSeconds -UptimeObservedSeconds $item.UptimeObservedSeconds -ValidationStatus 'Timeout' -OperatorDecision 'ABORT' -AttemptCount $item.AttemptCount -TimeoutCount $item.TimeoutCount -LastErrorMessage $item.LastErrorMessage
+                        $records += New-RebootActionRecord -VMName $item.VMName -Action 'Initiated' -ProcessId $item.ProcessId -RebootReason $item.RebootReason -BatchNumber $batchNumber -Sequence $item.Sequence -BootTimeBaseline $item.BootTimeBaseline -BootTimeObserved $item.BootTimeObserved -UptimeBaselineSeconds $item.UptimeBaselineSeconds -UptimeObservedSeconds $item.UptimeObservedSeconds -ValidationStatus 'Timeout' -OperatorDecision 'ABORT' -AttemptCount $item.AttemptCount -TimeoutCount $item.TimeoutCount -LastErrorMessage $item.LastErrorMessage -ErrorKind $item.ErrorKind -RejectedBeforeStart $item.RejectedBeforeStart
                     }
                     $validationAborted = $true
                     break

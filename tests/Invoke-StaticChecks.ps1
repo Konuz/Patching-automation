@@ -369,6 +369,10 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'catch { }'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'GuestOpsLib.ps1'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'VMTargetLib.ps1'
+    # Credential recovery is resolved per VM inside the orchestrator's own phases, so the
+    # module has to be loaded here; without it every recovery call is a CommandNotFoundException
+    # at the exact moment a guest rejects a login.
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'CredentialRecovery.ps1'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$JobInput.GuestOpsLibPath'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '-Managers $null'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'PlanOnly'

@@ -70,6 +70,7 @@ $guestOpsLibPath = Join-Path $PSScriptRoot 'GuestOpsLib.ps1'
 . $guestOpsLibPath
 
 . (Join-Path $PSScriptRoot 'VMTargetLib.ps1')
+. (Join-Path $PSScriptRoot 'CredentialRecovery.ps1')
 
 $identityHelperPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'guest\UpdateIdentity.ps1'
 
@@ -112,6 +113,121 @@ function Assert-LocalPrerequisites {
     return $curlCommand.Source
 }
 
+function Get-GuestCredentialResolutionErrorKind {
+    param([string]$Status)
+
+    switch ($Status) {
+        'Skipped' { 'CredentialsSkipped' }
+        'Aborted' { 'CredentialsAborted' }
+        default { 'CredentialsFailed' }
+    }
+}
+
+function New-GuestCredentialResolutionException {
+    param(
+        $Resolution,
+        [bool]$RejectedBeforeStart = $false
+    )
+
+    $errorKind = Get-GuestCredentialResolutionErrorKind -Status ([string]$Resolution.Status)
+    $exception = New-Object System.InvalidOperationException -ArgumentList ([string]$Resolution.Reason)
+    $exception.Data['ErrorKind'] = $errorKind
+    $exception.Data['RejectedBeforeStart'] = $RejectedBeforeStart
+    return $exception
+}
+
+function Get-GuestOperationFailureMetadata {
+    param(
+        $ErrorRecord,
+        [string]$Stage
+    )
+
+    $exception = Get-ObjectPropertyValue -InputObject $ErrorRecord -Path @('Exception')
+    $errorKind = $null
+    $rejectedBeforeStart = $false
+    try {
+        if ($null -ne $exception -and $null -ne $exception.Data) {
+            if ($exception.Data.Contains('ErrorKind')) {
+                $errorKind = [string]$exception.Data['ErrorKind']
+            }
+            if ($exception.Data.Contains('RejectedBeforeStart')) {
+                $rejectedBeforeStart = [bool]$exception.Data['RejectedBeforeStart']
+            }
+        }
+    }
+    catch { }
+
+    if ([string]::IsNullOrWhiteSpace($errorKind)) {
+        $errorKind = Get-GuestOperationErrorKind -ErrorRecord $ErrorRecord
+        $rejectedBeforeStart = ($Stage -eq 'Start' -and $errorKind -eq 'InvalidCredentials')
+    }
+
+    return [pscustomobject]@{
+        ErrorKind = $errorKind
+        RejectedBeforeStart = $rejectedBeforeStart
+    }
+}
+
+function Test-GuestCredentialForTarget {
+    param(
+        [string]$VMName,
+        [pscredential]$Credential
+    )
+
+    try {
+        $vm = Get-ExactVM -Name $VMName
+        Assert-VMReadyForGuestOps -VM $vm
+        $managers = Get-GuestOpsManagers -VMView $vm.ExtensionData
+        return Test-GuestCredential -VMView $vm.ExtensionData -Managers $managers -Credential $Credential
+    }
+    catch {
+        return [pscustomobject]@{
+            Status = 'Error'
+            ErrorKind = Get-GuestCredentialExceptionKind -Exception $_.Exception
+            Error = $_.Exception.Message
+        }
+    }
+}
+
+function Invoke-GuestOperationWithCredentialRecovery {
+    param(
+        [string]$VMName,
+        [hashtable]$CredentialContext,
+        [scriptblock]$CredentialDecisionScript,
+        [scriptblock]$CredentialValidatedScript,
+        [bool]$CredentialInteractive,
+        [scriptblock]$OperationScript,
+        $Handle = $null
+    )
+
+    $forcePrompt = $false
+    while ($true) {
+        $resolution = Resolve-GuestCredentialForTarget -VMName $VMName -Context $CredentialContext -ValidateScript {
+            param($TargetName, $Credential)
+            return Test-GuestCredentialForTarget -VMName $TargetName -Credential $Credential
+        } -DecisionScript $CredentialDecisionScript -OnValidatedScript $CredentialValidatedScript -ForcePrompt:$forcePrompt -Interactive:$CredentialInteractive
+
+        if ($resolution.Status -ne 'Ready') {
+            throw (New-GuestCredentialResolutionException -Resolution $resolution -RejectedBeforeStart:($null -eq $Handle))
+        }
+
+        $guestAuth = New-GuestAuthentication -Credential $resolution.Credential
+        if ($null -ne $Handle) {
+            $Handle.GuestAuth = $guestAuth
+        }
+
+        try {
+            return & $OperationScript $guestAuth
+        }
+        catch {
+            if ((Get-GuestOperationErrorKind -ErrorRecord $_) -ne 'InvalidCredentials') {
+                throw
+            }
+            $forcePrompt = $true
+        }
+    }
+}
+
 function New-AgentFleetItem {
     param(
         [int]$Sequence,
@@ -147,14 +263,26 @@ function Invoke-GuestAgentFleet {
         [string]$GuestWorkingDirectory,
         [int]$TimeoutSeconds,
         [int]$PollSeconds,
-        [int]$MaxInFlight
+        [int]$MaxInFlight,
+        [hashtable]$CredentialContext = $null,
+        [scriptblock]$CredentialDecisionScript,
+        [scriptblock]$CredentialValidatedScript,
+        [bool]$CredentialInteractive = $false
     )
 
+    $credentialRecoveryEnabled = ($null -ne $CredentialContext)
     return @(Invoke-InProcessAgentFleet -Items $FleetItems -MaxInFlight $MaxInFlight -PollSeconds $PollSeconds -ItemTimeoutSeconds ($TimeoutSeconds + 300) `
         -StartScript {
             param($Item)
-            $itemAuth = New-GuestAuthentication -Credential $GuestCredentialMap[[string]$Item.VMName]
-            return Start-VMAgentCycle -VMName $Item.VMName -Managers $null -GuestAuth $itemAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $Item.VMOutputDirectory -MaxUpdates $Item.MaxUpdates -LocalSelectionPath $Item.LocalSelectionPath -SelectionPath $Item.GuestSelectionPath -SearchOnly:([bool]$Item.SearchOnly)
+            if (-not $credentialRecoveryEnabled) {
+                $itemAuth = New-GuestAuthentication -Credential $GuestCredentialMap[[string]$Item.VMName]
+                return Start-VMAgentCycle -VMName $Item.VMName -Managers $null -GuestAuth $itemAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $Item.VMOutputDirectory -MaxUpdates $Item.MaxUpdates -LocalSelectionPath $Item.LocalSelectionPath -SelectionPath $Item.GuestSelectionPath -SearchOnly:([bool]$Item.SearchOnly)
+            }
+
+            return Invoke-GuestOperationWithCredentialRecovery -VMName $Item.VMName -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive -OperationScript {
+                param($ItemAuth)
+                return Start-VMAgentCycle -VMName $Item.VMName -Managers $null -GuestAuth $ItemAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $Item.VMOutputDirectory -MaxUpdates $Item.MaxUpdates -LocalSelectionPath $Item.LocalSelectionPath -SelectionPath $Item.GuestSelectionPath -SearchOnly:([bool]$Item.SearchOnly)
+            }
         } `
         -PollScript {
             param($Handle)
@@ -162,20 +290,40 @@ function Invoke-GuestAgentFleet {
             # again from the completion script can come back as "ended, exit code lost" once
             # vSphere has forgotten the process, and the apply result builder would read that
             # second answer instead of the one that actually decided the poll.
-            $agentResult = Test-VMAgentCycleComplete -Handle $Handle
-            $Handle.AgentResult = $agentResult
-            return ($null -ne $agentResult)
+            if (-not $credentialRecoveryEnabled) {
+                $agentResult = Test-VMAgentCycleComplete -Handle $Handle
+                $Handle.AgentResult = $agentResult
+                return ($null -ne $agentResult)
+            }
+
+            return Invoke-GuestOperationWithCredentialRecovery -VMName $Handle.VMName -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive -Handle $Handle -OperationScript {
+                param($ItemAuth)
+                $agentResult = Test-VMAgentCycleComplete -Handle $Handle
+                $Handle.AgentResult = $agentResult
+                return ($null -ne $agentResult)
+            }
         } `
         -CompleteScript {
             param($Handle)
             # On the timeout path the poll script never returned true, so AgentResult is
             # whatever the last poll saw - possibly still $null. Both callers treat that as
             # "no process result, trust status.json".
-            return Complete-VMAgentCycle -Handle $Handle -AgentResult $Handle.AgentResult
+            if (-not $credentialRecoveryEnabled) {
+                return Complete-VMAgentCycle -Handle $Handle -AgentResult $Handle.AgentResult
+            }
+
+            return Invoke-GuestOperationWithCredentialRecovery -VMName $Handle.VMName -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive -Handle $Handle -OperationScript {
+                param($ItemAuth)
+                return Complete-VMAgentCycle -Handle $Handle -AgentResult $Handle.AgentResult
+            }
         } `
         -IsTransientErrorScript {
             param($ErrorRecord)
             return ((Get-GuestOperationErrorKind -ErrorRecord $ErrorRecord) -eq 'Transient')
+        } `
+        -GetErrorMetadataScript {
+            param($ErrorRecord, $Stage)
+            return Get-GuestOperationFailureMetadata -ErrorRecord $ErrorRecord -Stage $Stage
         })
 }
 
@@ -187,6 +335,11 @@ function Get-GuestRebootJobScript {
         $ErrorActionPreference = 'Stop'
 
         $connections = @()
+        # Only Invoke-VMGuestReboot can leave shutdown.exe running, so every failure before it -
+        # the module import, the child's own vCenter login - is unambiguously "never sent" no
+        # matter how it classifies. An InvalidGuestLogin inside it is unambiguous too: the guest
+        # refused the credential before running anything.
+        $rebootAttempted = $false
         try {
             Import-Module VMware.VimAutomation.Core -ErrorAction Stop
             if ($JobInput.IgnoreVCenterCertificate) {
@@ -199,6 +352,7 @@ function Get-GuestRebootJobScript {
             $connections = @((Connect-VIServersWithCredentialMap -VIServers @($JobInput.VIServers) -CredentialMap $JobInput.VIServerCredentialMap).OpenedConnections)
             $managers = $null
             $guestAuth = New-GuestAuthentication -Credential $JobInput.GuestCredential
+            $rebootAttempted = $true
             $rebootResult = Invoke-VMGuestReboot -VMName $JobInput.VMName -Managers $managers -GuestAuth $guestAuth
 
             return [pscustomobject]@{
@@ -207,15 +361,39 @@ function Get-GuestRebootJobScript {
                 RebootReason = $JobInput.RebootReason
                 ProcessId = $rebootResult.ProcessId
                 Error = $null
+                ErrorKind = $null
+                RejectedBeforeStart = $false
             }
         }
         catch {
+            # The child classifies and never prompts - every credential dialog belongs to the
+            # parent process. RejectedBeforeStart is what tells the parent whether re-sending
+            # shutdown.exe is safe: an invalid login is refused before the process starts, while
+            # a transport failure may well have left it running.
+            $rebootErrorKind = 'Permanent'
+            if ($null -ne (Get-Command -Name Get-GuestOperationErrorKind -ErrorAction SilentlyContinue)) {
+                $rebootErrorKind = Get-GuestOperationErrorKind -ErrorRecord $_
+            }
+            # Invoke-VMGuestReboot marks the failures it raises before the one guest-touching
+            # call, which is the only way the child can tell an inventory or GetView timeout
+            # from a transport failure that may have left shutdown.exe running.
+            $rebootRejectedBeforeStart = ((-not $rebootAttempted) -or $rebootErrorKind -eq 'InvalidCredentials')
+            if (-not $rebootRejectedBeforeStart) {
+                try {
+                    if ($null -ne $_.Exception.Data -and $_.Exception.Data.Contains('RejectedBeforeStart')) {
+                        $rebootRejectedBeforeStart = [bool]$_.Exception.Data['RejectedBeforeStart']
+                    }
+                }
+                catch { }
+            }
             return [pscustomobject]@{
                 Sequence = $JobInput.Sequence
                 VMName = $JobInput.VMName
                 RebootReason = $JobInput.RebootReason
                 ProcessId = $null
                 Error = $_.Exception.Message
+                ErrorKind = $rebootErrorKind
+                RejectedBeforeStart = $rebootRejectedBeforeStart
             }
         }
         finally {
@@ -332,6 +510,48 @@ function Invoke-OperatorPrompt {
     }
 
     return (& $FallbackScript $Arguments)
+}
+
+function Read-GuestCredentialRecoveryDecision {
+    param(
+        [string]$VMName,
+        [string]$AccountKey,
+        [string[]]$Members,
+        [string]$Reason
+    )
+
+    Write-Host ''
+    Write-Host ('Guest credentials for {0} were rejected: {1}' -f $VMName, $Reason)
+    Write-Host ('Account {0} applies to: {1}' -f $AccountKey, (@($Members) -join ', '))
+    Write-Host 'Actions:'
+    Write-Host '  - RETRY  provide replacement guest credentials and validate them before retrying.'
+    Write-Host '  - SKIP   skip this account for the rest of this run.'
+    Write-Host '  - ABORT  do not start further guest operations.'
+
+    while ($true) {
+        $choice = ([string](Read-Host 'Choose RETRY, SKIP, or ABORT (Enter aborts)')).Trim().ToUpperInvariant()
+        switch ($choice) {
+            'RETRY' {
+                $credential = Get-Credential -Message ('Replacement guest credentials for {0}' -f $VMName)
+                if ($null -eq $credential) {
+                    return [pscustomobject]@{ Action = 'Abort'; Credential = $null; Remember = $false }
+                }
+                return [pscustomobject]@{ Action = 'Retry'; Credential = $credential; Remember = $false }
+            }
+            'SKIP' {
+                return [pscustomobject]@{ Action = 'SkipAccount'; Credential = $null; Remember = $false }
+            }
+            'ABORT' {
+                return [pscustomobject]@{ Action = 'Abort'; Credential = $null; Remember = $false }
+            }
+            '' {
+                return [pscustomobject]@{ Action = 'Abort'; Credential = $null; Remember = $false }
+            }
+            default {
+                Write-Warning 'Invalid choice. Choose RETRY, SKIP, or ABORT.'
+            }
+        }
+    }
 }
 
 function Read-UpdateGroupSelection {
@@ -629,7 +849,11 @@ function Invoke-ApplyPhase {
         [int]$TimeoutSeconds,
         [int]$PollSeconds,
         [string]$CycleOutputDirectory,
-        [int]$MaxInFlight = 1
+        [int]$MaxInFlight = 1,
+        [hashtable]$CredentialContext = $null,
+        [scriptblock]$CredentialDecisionScript,
+        [scriptblock]$CredentialValidatedScript,
+        [bool]$CredentialInteractive = $false
     )
 
     $resultEntries = @()
@@ -696,7 +920,7 @@ function Invoke-ApplyPhase {
 
     if ($fleetItems.Count -gt 0) {
         Write-Step -Message ('Apply running with up to {0} VM(s) in flight.' -f $MaxInFlight)
-        $fleetResults = @(Invoke-GuestAgentFleet -FleetItems $fleetItems -Managers $Managers -GuestCredentialMap $GuestCredentialMap -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -MaxInFlight $MaxInFlight)
+        $fleetResults = @(Invoke-GuestAgentFleet -FleetItems $fleetItems -Managers $Managers -GuestCredentialMap $GuestCredentialMap -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -MaxInFlight $MaxInFlight -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive)
 
         $doneCount = 0
         foreach ($fleetResult in @($fleetResults | Sort-Object Sequence)) {
@@ -816,10 +1040,18 @@ function Invoke-GuestRebootPhase {
         [string]$GuestWorkingDirectory,
         [int]$RebootTimeoutSeconds,
         [int]$PollSeconds,
-        [int]$RebootBatchSize = 1
+        [int]$RebootBatchSize = 1,
+        # Every other path this phase needs is already a parameter; this one used to be derived
+        # from $PSScriptRoot inside the body, which is empty whenever the function is reloaded
+        # from its own source text rather than from the file.
+        [string]$BootTimeHelperPath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'guest\Read-BootTime.ps1'),
+        [hashtable]$CredentialContext = $null,
+        [scriptblock]$CredentialDecisionScript,
+        [scriptblock]$CredentialValidatedScript,
+        [bool]$CredentialInteractive = $false
     )
 
-    $bootTimeHelperPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'guest\Read-BootTime.ps1'
+    $credentialRecoveryEnabled = ($null -ne $CredentialContext)
 
     $targetInputs = @()
     $sequence = 0
@@ -847,8 +1079,16 @@ function Invoke-GuestRebootPhase {
             $vmName = [string]$item.VMName
             $timeoutSeconds = if ($null -eq $item.ReadTimeoutSeconds) { 120 } else { [int][math]::Max(1, [math]::Min(120, $item.ReadTimeoutSeconds)) }
             try {
-                $guestAuth = New-GuestAuthentication -Credential $GuestCredentialMap[$vmName]
-                $bootTime = Invoke-VMGuestBootTimeRead -VMName $vmName -Managers $null -GuestAuth $guestAuth -CurlPath $CurlPath -GuestWorkingDirectory $GuestWorkingDirectory -BootTimeHelperPath $bootTimeHelperPath -TimeoutSeconds $timeoutSeconds -PollSeconds $PollSeconds -SkipHelperUpload:([bool]$helperUploadedByVm[$vmName])
+                if ($credentialRecoveryEnabled) {
+                    $bootTime = Invoke-GuestOperationWithCredentialRecovery -VMName $vmName -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive -OperationScript {
+                        param($ReadAuth)
+                        return Invoke-VMGuestBootTimeRead -VMName $vmName -Managers $null -GuestAuth $ReadAuth -CurlPath $CurlPath -GuestWorkingDirectory $GuestWorkingDirectory -BootTimeHelperPath $BootTimeHelperPath -TimeoutSeconds $timeoutSeconds -PollSeconds $PollSeconds -SkipHelperUpload:([bool]$helperUploadedByVm[$vmName])
+                    }
+                }
+                else {
+                    $guestAuth = New-GuestAuthentication -Credential $GuestCredentialMap[$vmName]
+                    $bootTime = Invoke-VMGuestBootTimeRead -VMName $vmName -Managers $null -GuestAuth $guestAuth -CurlPath $CurlPath -GuestWorkingDirectory $GuestWorkingDirectory -BootTimeHelperPath $BootTimeHelperPath -TimeoutSeconds $timeoutSeconds -PollSeconds $PollSeconds -SkipHelperUpload:([bool]$helperUploadedByVm[$vmName])
+                }
                 $helperUploadedByVm[$vmName] = $true
                 $results += [pscustomobject]@{
                     Sequence = $item.Sequence
@@ -856,41 +1096,148 @@ function Invoke-GuestRebootPhase {
                     BootTimeUtc = $bootTime.BootTimeUtc
                     UptimeSeconds = $bootTime.UptimeSeconds
                     Error = $null
+                    ErrorKind = $null
+                    RejectedBeforeStart = $false
                 }
             }
             catch {
                 # Without a job around each read, one guest throwing would end the whole phase, so
                 # every failure has to become this VM's transient error instead. It also re-arms the
                 # upload: a guest that lost the helper must not stay locked into skipping it.
+                # The classification rides along so the coordinator can tell a guest that is still
+                # booting from an account the operator has already refused to fix.
                 $helperUploadedByVm[$vmName] = $false
+                $readFailure = Get-GuestOperationFailureMetadata -ErrorRecord $_ -Stage 'BootTimeRead'
                 $results += [pscustomobject]@{
                     Sequence = $item.Sequence
                     VMName = $vmName
                     BootTimeUtc = $null
                     UptimeSeconds = $null
                     Error = $_.Exception.Message
+                    ErrorKind = $readFailure.ErrorKind
+                    RejectedBeforeStart = $readFailure.RejectedBeforeStart
                 }
             }
         }
         return @($results)
     }
 
-    $initiateRebootScript = {
-        param($Items)
+    $submitRebootJobs = {
+        param($SubmitItems, $CredentialOverrides)
         $jobInputs = @()
-        foreach ($item in @($Items)) {
+        foreach ($item in @($SubmitItems)) {
+            $submitName = [string]$item.VMName
+            $submitCredential = if ($null -ne $CredentialOverrides -and $CredentialOverrides.ContainsKey($submitName)) { $CredentialOverrides[$submitName] } else { $GuestCredentialMap[$submitName] }
             $jobInputs += [pscustomobject]@{
                 Sequence = $item.Sequence
                 VMName = $item.VMName
                 RebootReason = $item.RebootReason
                 VIServers = @($VIServers)
                 VIServerCredentialMap = $VIServerCredentialMap
-                GuestCredential = $GuestCredentialMap[$item.VMName]
+                GuestCredential = $submitCredential
                 IgnoreVCenterCertificate = [bool]$IgnoreVCenterCertificate
                 GuestOpsLibPath = $GuestOpsLibPath
             }
         }
         return @(Invoke-ThrottledJobs -Items $jobInputs -ThrottleLimit $RebootBatchSize -JobTimeoutSeconds 300 -ScriptBlock $restartJobScript)
+    }
+
+    $initiateRebootScript = {
+        param($Items)
+        $submittedCredentials = @{}
+        foreach ($item in @($Items)) {
+            $submittedCredentials[[string]$item.VMName] = $GuestCredentialMap[[string]$item.VMName]
+        }
+
+        $results = @(& $submitRebootJobs @($Items) $null)
+        if (-not $credentialRecoveryEnabled) {
+            return @($results)
+        }
+
+        # Only a rejection the guest made BEFORE shutdown.exe started may be re-sent. An
+        # ambiguous transport failure could have left the command running, and a second
+        # shutdown would be a second reboot - which is exactly what the coordinator's
+        # ambiguous-initiation path exists to avoid.
+        $resultsByVm = @{}
+        foreach ($result in @($results)) {
+            $resultsByVm[[string]$result.VMName] = $result
+        }
+
+        $retryItems = @()
+        foreach ($item in @($Items)) {
+            $result = $resultsByVm[[string]$item.VMName]
+            if ($null -eq $result -or [string]::IsNullOrWhiteSpace([string]$result.Error)) {
+                continue
+            }
+            if ([string](Get-ObjectPropertyValue -InputObject $result -Path @('ErrorKind')) -ne 'InvalidCredentials') {
+                continue
+            }
+            if (-not [bool](Get-ObjectPropertyValue -InputObject $result -Path @('RejectedBeforeStart') -DefaultValue $false)) {
+                continue
+            }
+            $retryItems += $item
+        }
+
+        if ($retryItems.Count -eq 0) {
+            return @($results)
+        }
+
+        $replacementCredentials = @{}
+        $resolvedItems = @()
+        # The guest refused this credential, but validation cannot see that - it would happily
+        # accept the same credential and re-send it. So the first VM of each account forces the
+        # dialog, and the rest of that account resolve against whatever replacement it produced.
+        # Asking per VM instead would open one identical dialog per guest in a domain group, and
+        # a SKIP at the last one would retroactively poison the account the earlier ones fixed.
+        $promptedAccountKeys = @{}
+        foreach ($retryItem in @($retryItems)) {
+            $retryName = [string]$retryItem.VMName
+            $retryGroup = Get-GuestCredentialGroupForTarget -Context $CredentialContext -VMName $retryName
+            $retryAccountKey = if ($null -eq $retryGroup) { $retryName } else { Get-GuestCredentialAccountKey -Group $retryGroup }
+            $forceAccountPrompt = -not $promptedAccountKeys.ContainsKey($retryAccountKey)
+            $promptedAccountKeys[$retryAccountKey] = $true
+            $resolution = Resolve-GuestCredentialForTarget -VMName $retryName -Context $CredentialContext -ValidateScript {
+                param($TargetName, $Credential)
+                return Test-GuestCredentialForTarget -VMName $TargetName -Credential $Credential
+            } -DecisionScript $CredentialDecisionScript -OnValidatedScript $CredentialValidatedScript -ForcePrompt:$forceAccountPrompt -Interactive:$CredentialInteractive
+
+            # Validation succeeding is not permission to re-send. ValidateCredentialsInGuest and
+            # StartProgramInGuest are different calls, so the guest can accept the credential here
+            # and still have refused the reboot with it - and re-sending the SAME credential is
+            # then just another failed logon against an account that is already failing. Only a
+            # credential recovery actually replaced is worth a second submission.
+            if ($resolution.Status -eq 'Ready' -and -not (Test-GuestCredentialEquivalent -Left $resolution.Credential -Right $submittedCredentials[$retryName])) {
+                $replacementCredentials[$retryName] = $resolution.Credential
+                $resolvedItems += $retryItem
+                continue
+            }
+
+            # A skipped or aborted account is not an initiation error the operator can answer
+            # again, so it is reclassified here and the coordinator records it without a second
+            # prompt for the same decision.
+            $rejected = $resultsByVm[$retryName]
+            $unrecoveredReason = if ($resolution.Status -eq 'Ready') { 'The guest refused this credential and credential recovery did not replace it.' } else { [string]$resolution.Reason }
+            $unrecoveredKind = if ($resolution.Status -eq 'Ready') { 'CredentialsFailed' } else { Get-GuestCredentialResolutionErrorKind -Status ([string]$resolution.Status) }
+            $resultsByVm[$retryName] = [pscustomobject]@{
+                Sequence = $rejected.Sequence
+                VMName = $rejected.VMName
+                RebootReason = Get-ObjectPropertyValue -InputObject $rejected -Path @('RebootReason')
+                ProcessId = $null
+                Error = $unrecoveredReason
+                ErrorKind = $unrecoveredKind
+                RejectedBeforeStart = $true
+            }
+        }
+
+        if ($resolvedItems.Count -gt 0) {
+            foreach ($retryResult in @(& $submitRebootJobs @($resolvedItems) $replacementCredentials)) {
+                $resultsByVm[[string]$retryResult.VMName] = $retryResult
+            }
+        }
+
+        # A VM with no result at all stays absent: the coordinator counts a missing result as a
+        # failed initiation, and inventing one here would hide it.
+        return @(@($Items) | ForEach-Object { $resultsByVm[[string]$_.VMName] } | Where-Object { $null -ne $_ })
     }
 
     $decisionPromptScript = {
@@ -1004,10 +1351,14 @@ function Invoke-ApplyAndOptionalReboot {
         [string]$CycleOutputDirectory,
         [int]$ThrottleLimit,
         [int]$RebootBatchSize = 0,
-        $DiscoveryRecords = @()
+        $DiscoveryRecords = @(),
+        [hashtable]$CredentialContext = $null,
+        [scriptblock]$CredentialDecisionScript,
+        [scriptblock]$CredentialValidatedScript,
+        [bool]$CredentialInteractive = $false
     )
 
-    $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $PatchPlanRecords -Managers $Managers -GuestCredentialMap $GuestCredentialMap -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -CycleOutputDirectory $CycleOutputDirectory -MaxInFlight $ThrottleLimit)
+    $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $PatchPlanRecords -Managers $Managers -GuestCredentialMap $GuestCredentialMap -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -CycleOutputDirectory $CycleOutputDirectory -MaxInFlight $ThrottleLimit -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive)
     Write-PatchingSummary -ApplyResults $applyResults
 
     $rebootActions = @()
@@ -1023,7 +1374,7 @@ function Invoke-ApplyAndOptionalReboot {
                 $resolvedRebootBatchSize = Read-RebootBatchSize -TargetCount $rebootTargets.Count
             }
 
-            $rebootActions = @(Invoke-GuestRebootPhase -RebootTargets $rebootTargets -GuestCredentialMap $GuestCredentialMap -VIServers $VIServers -VIServerCredentialMap $VIServerCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $GuestOpsLibPath -CurlPath $CurlPath -GuestWorkingDirectory $GuestWorkingDirectory -RebootTimeoutSeconds $RebootTimeoutSeconds -PollSeconds $PollSeconds -RebootBatchSize $resolvedRebootBatchSize)
+            $rebootActions = @(Invoke-GuestRebootPhase -RebootTargets $rebootTargets -GuestCredentialMap $GuestCredentialMap -VIServers $VIServers -VIServerCredentialMap $VIServerCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $GuestOpsLibPath -CurlPath $CurlPath -GuestWorkingDirectory $GuestWorkingDirectory -RebootTimeoutSeconds $RebootTimeoutSeconds -PollSeconds $PollSeconds -RebootBatchSize $resolvedRebootBatchSize -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive)
         }
         else {
             Write-Warning 'Guest reboot was not approved. Reboot phase skipped.'
@@ -1103,7 +1454,11 @@ function Invoke-DiscoveryPhase {
         [int]$TimeoutSeconds,
         [int]$PollSeconds,
         [string]$CycleOutputDirectory,
-        [int]$MaxInFlight = 1
+        [int]$MaxInFlight = 1,
+        [hashtable]$CredentialContext = $null,
+        [scriptblock]$CredentialDecisionScript,
+        [scriptblock]$CredentialValidatedScript,
+        [bool]$CredentialInteractive = $false
     )
 
     $recordEntries = @()
@@ -1122,7 +1477,7 @@ function Invoke-DiscoveryPhase {
 
     if ($fleetItems.Count -gt 0) {
         Write-Host ('Discovery running with up to {0} VM(s) in flight.' -f $MaxInFlight)
-        $fleetResults = @(Invoke-GuestAgentFleet -FleetItems $fleetItems -Managers $Managers -GuestCredentialMap $GuestCredentialMap -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -MaxInFlight $MaxInFlight)
+        $fleetResults = @(Invoke-GuestAgentFleet -FleetItems $fleetItems -Managers $Managers -GuestCredentialMap $GuestCredentialMap -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -MaxInFlight $MaxInFlight -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive)
 
         $doneCount = 0
         foreach ($fleetResult in @($fleetResults | Sort-Object Sequence)) {
@@ -1263,6 +1618,26 @@ $credentialPromptScript = $null
 if ($null -ne $PromptProvider -and $PromptProvider.ContainsKey('PromptCredential')) {
     $credentialPromptScript = $PromptProvider['PromptCredential']
 }
+$guestCredentialDecisionScript = $null
+$guestCredentialValidatedScript = $null
+$guestCredentialInteractive = -not $SkipConfirmation
+if ($null -ne $PromptProvider -and $PromptProvider.ContainsKey('CredentialValidated')) {
+    $guestCredentialValidatedScript = $PromptProvider['CredentialValidated']
+}
+if ($guestCredentialInteractive) {
+    if ($null -ne $PromptProvider -and $PromptProvider.ContainsKey('RecoverGuestCredential')) {
+        $guestCredentialDecisionScript = $PromptProvider['RecoverGuestCredential']
+    }
+    else {
+        $guestCredentialDecisionScript = {
+            param($VMName, $AccountKey, $Members, $Reason)
+            # Deliberately no explicit result keyword here - the resume-branch needle in
+            # Assert-NoOrphanedBranchKeyword forbids one anywhere below it, even inside a
+            # comment, and a scriptblock's last expression is its result anyway.
+            Read-GuestCredentialRecoveryDecision -VMName $VMName -AccountKey $AccountKey -Members @($Members) -Reason $Reason
+        }
+    }
+}
 
 # The map is passed on WITHOUT copying. Connect-VIServersWithCredentialMap mutates it in
 # place on a login retry, and the corrected credential is consumed later by the reboot jobs,
@@ -1311,11 +1686,12 @@ try {
             else {
                 $guestCredentialMap = Resolve-GuestCredentialMap -TargetNames @(@($patchPlanRecords) | ForEach-Object { [string]$_.vmName }) -OverrideCredential $GuestCredential -CredentialPromptScript $credentialPromptScript
             }
+            $guestCredentialContext = New-GuestCredentialContext -TargetNames @(@($patchPlanRecords) | ForEach-Object { [string]$_.vmName }) -CredentialMap $guestCredentialMap
             # Resume stays a single round. There is no discovery to judge the starting state
             # from, the saved keys carry a RevisionNumber that will not match a later round's
             # groups, and resume is typically run non-interactively with -SkipConfirmation,
             # where a round-two group selection prompt would simply hang.
-            $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize
+            $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive
             $scriptExitCode = $applyOutcome.ExitCode
         }
 
@@ -1331,6 +1707,7 @@ try {
     else {
         $guestCredentialMap = Resolve-GuestCredentialMap -TargetNames $targetVMNames -OverrideCredential $GuestCredential -CredentialPromptScript $credentialPromptScript
     }
+    $guestCredentialContext = New-GuestCredentialContext -TargetNames $targetVMNames -CredentialMap $guestCredentialMap
 
     $roundTargetVMNames = @($targetVMNames)
     $roundNumber = 0
@@ -1348,7 +1725,7 @@ try {
         New-Item -ItemType Directory -Force -Path $roundOutputDirectory | Out-Null
 
         Write-Step -Message ('Patch round {0} over {1} VM(s).' -f $roundNumber, @($roundTargetVMNames).Count)
-        $discoveryRecords = Invoke-DiscoveryPhase -TargetVMNames $roundTargetVMNames -Managers $managers -GuestCredentialMap $guestCredentialMap -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -MaxInFlight $ThrottleLimit
+        $discoveryRecords = Invoke-DiscoveryPhase -TargetVMNames $roundTargetVMNames -Managers $managers -GuestCredentialMap $guestCredentialMap -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -MaxInFlight $ThrottleLimit -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive
         $failedDiscoveryRecords = @($discoveryRecords | Where-Object { @($_.errors).Count -gt 0 })
 
         $updateGroups = @(New-UpdateGroupRecords -DiscoveryRecords $discoveryRecords | Sort-Object kbText,title)
@@ -1481,7 +1858,7 @@ try {
         $completionStates = @(Get-VMPatchCompletionStates -DiscoveryRecords $discoveryRecords -UpdateGroups $updateGroups -DeselectedUpdateKeys $deselectedUpdateKeys)
         Merge-PatchRunStates -StateMap $finalStateMap -CompletionStates $completionStates
 
-        $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -DiscoveryRecords $discoveryRecords
+        $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -DiscoveryRecords $discoveryRecords -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive
         if ($applyOutcome.ExitCode -ne 0) {
             $sawApplyFailure = $true
         }
