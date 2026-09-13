@@ -71,6 +71,11 @@ function New-GuestRunGuardResult {
         [bool]$Acquired,
         [bool]$Conflict,
         [string]$Reason = $null,
+        # Which KIND of conflict, because the three call for different things: someone else is
+        # working on this guest right now (wait), a previous run never reported completion
+        # (reconcile by hand), the guest is restarting (wait, it clears itself). Without this the
+        # caller can only read the reason text, and a wait it cannot justify becomes a Failed.
+        [ValidateSet('', 'Held', 'Unconfirmed', 'RebootPending', 'Unreadable')][string]$ConflictKind = '',
         $Stream = $null,
         [string]$RunId = $null,
         [string]$Phase = $null,
@@ -81,6 +86,7 @@ function New-GuestRunGuardResult {
         Acquired = $Acquired
         Conflict = $Conflict
         Reason = $Reason
+        ConflictKind = $ConflictKind
         Stream = $Stream
         RunId = $RunId
         Phase = $Phase
@@ -174,18 +180,28 @@ function Test-GuestRunGuardRebootConfirmed {
     return ($current.ToUniversalTime() -gt $recorded.ToUniversalTime())
 }
 
+function New-GuestRunGuardConflict {
+    param(
+        [ValidateSet('Held', 'Unconfirmed', 'RebootPending', 'Unreadable')][string]$Kind,
+        [string]$Reason
+    )
+
+    return [pscustomobject]@{ Kind = $Kind; Reason = $Reason }
+}
+
 function Get-GuestRunGuardConflictReason {
     param($PreviousState)
 
-    # Returns the reason this guest is not available, or $null when it is. Called while the lock
-    # is held, so "still running" here means the previous holder died: the operating system
-    # released its handle, which says nothing about whether its WUA work finished.
+    # Returns Kind + Reason for why this guest is not available, or $null when it is. Called while
+    # the lock is held, so "still running" here means the previous holder died: the operating
+    # system released its handle, which says nothing about whether its WUA work finished. That is
+    # why the record - not the handle - decides, and why 'Running' is Unconfirmed rather than Held.
     if ($null -eq $PreviousState) {
         return $null
     }
 
     if ($PreviousState -is [string] -and $PreviousState -eq 'unreadable') {
-        return 'a previous run left a coordination record this tool cannot interpret; reconcile it by hand after checking Windows Update on the guest'
+        return (New-GuestRunGuardConflict -Kind 'Unreadable' -Reason 'a previous run left a coordination record this tool cannot interpret; reconcile it by hand after checking Windows Update on the guest')
     }
 
     $status = [string](& { try { [string]$PreviousState.status } catch { '' } })
@@ -194,16 +210,18 @@ function Get-GuestRunGuardConflictReason {
     switch ($status) {
         'Completed' { return $null }
         'Running' {
-            return ('a previous run ({0}) never reported completion on this guest; reconcile it by hand after checking Windows Update on the guest' -f $previousRunId)
+            return (New-GuestRunGuardConflict -Kind 'Unconfirmed' -Reason ('a previous run ({0}) never reported completion on this guest; reconcile it by hand after checking Windows Update on the guest' -f $previousRunId))
         }
         'RebootRequested' {
             if (Test-GuestRunGuardRebootConfirmed -PreviousState $PreviousState) {
                 return $null
             }
-            return ('a reboot requested by a previous run ({0}) has not been confirmed by a newer boot time on this guest' -f $previousRunId)
+            # The one kind that clears itself: the guest is on its way back up, and a newer boot
+            # time reconciles the marker with no operator action at all.
+            return (New-GuestRunGuardConflict -Kind 'RebootPending' -Reason ('a reboot requested by a previous run ({0}) has not been confirmed by a newer boot time on this guest' -f $previousRunId))
         }
         default {
-            return ('a previous run ({0}) left coordination status "{1}", which this tool does not recognise' -f $previousRunId, $status)
+            return (New-GuestRunGuardConflict -Kind 'Unreadable' -Reason ('a previous run ({0}) left coordination status "{1}", which this tool does not recognise' -f $previousRunId, $status))
         }
     }
 }
@@ -238,15 +256,15 @@ function Enter-GuestRunGuard {
     catch {
         # Another process on this guest holds it. That is a conflict, not an error to retry:
         # the other run may be installing updates right now.
-        return New-GuestRunGuardResult -Acquired $false -Conflict $true -Reason ('Another PatchingGuestOps run holds the guest run guard on this machine ({0}).' -f $_.Exception.Message) -RunId $RunId -Phase $Phase
+        return New-GuestRunGuardResult -Acquired $false -Conflict $true -ConflictKind 'Held' -Reason ('Another PatchingGuestOps run holds the guest run guard on this machine ({0}).' -f $_.Exception.Message) -RunId $RunId -Phase $Phase
     }
 
     try {
         $previousState = Read-GuestRunGuardState -Stream $stream
-        $conflictReason = Get-GuestRunGuardConflictReason -PreviousState $previousState
-        if ($null -ne $conflictReason) {
+        $conflict = Get-GuestRunGuardConflictReason -PreviousState $previousState
+        if ($null -ne $conflict) {
             $stream.Dispose()
-            return New-GuestRunGuardResult -Acquired $false -Conflict $true -Reason $conflictReason -RunId $RunId -Phase $Phase -PreviousState $previousState
+            return New-GuestRunGuardResult -Acquired $false -Conflict $true -ConflictKind ([string]$conflict.Kind) -Reason ([string]$conflict.Reason) -RunId $RunId -Phase $Phase -PreviousState $previousState
         }
 
         Write-GuestRunGuardState -Stream $stream -State (New-GuestRunGuardState -RunId $RunId -Phase $Phase -Status 'Running')

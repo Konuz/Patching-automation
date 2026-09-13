@@ -552,6 +552,11 @@ $status = [ordered]@{
     # for this VM in this run - even after the other process has ended.
     guestRunConflict = $false
     guestRunConflictReason = $null
+    # Which kind, because the orchestrator decides between waiting and stopping on it: 'Held'
+    # (another run is working here now), 'Unconfirmed' (a previous run never reported completion),
+    # 'RebootPending' (this guest is on its way back up), 'Unreadable' (a record nobody can read).
+    # Only RebootPending clears itself; the other two need a person.
+    guestRunConflictKind = $null
     # Approved keys that are no longer in the current search result. Not an error in itself and
     # not a reason to install nothing: WUA revises a package between the plan and the apply, and
     # the exact keys the operator approved are still the only ones this run may install.
@@ -596,6 +601,7 @@ try {
         if ($guestRunGuard.Conflict) {
             $status.guestRunConflict = $true
             $status.guestRunConflictReason = [string]$guestRunGuard.Reason
+            $status.guestRunConflictKind = [string]$guestRunGuard.ConflictKind
         }
         throw ('This guest is not available for a patching run: {0}' -f $guestRunGuard.Reason)
     }

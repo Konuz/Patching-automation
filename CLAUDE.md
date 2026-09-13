@@ -327,6 +327,33 @@ of reboot targets (`Select-RebootRequiredApplyResults`) and out of the next roun
 the run cannot exit 0 — even though the refused agent's own process has already ended, which is
 exactly what makes it look finished to everything else.
 
+#### Four kinds of refusal, one of which waits
+
+The refusal also carries a **kind** (`guestRunConflictKind`), because the four are not the same
+problem and the phase acts differently on one of them:
+
+| Kind | What it means | What the run does |
+| --- | --- | --- |
+| `Held` | The lock file itself could not be opened: another run of this tool is working on the guest **right now**. | Records it. Waiting and then starting is precisely the overlap the guard exists to prevent. |
+| `Unconfirmed` | The record says `Running`: the previous holder died without reporting completion. | Records it. Nothing changes without a person looking at Windows Update on that guest. |
+| `RebootPending` | The record says `RebootRequested` and no newer boot time has arrived yet. | **Waits once and tries again inside the same phase.** |
+| `Unreadable` | The record cannot be interpreted, or carries a status this tool does not know. | Records it. Same as `Unconfirmed`. |
+
+`RebootPending` is the only kind that **reconciles itself** — the marker clears the moment the
+boot time is newer — so failing the VM immediately would report a guest that was seconds from
+being available. `Invoke-GuestAgentFleet` therefore re-dispatches exactly those VMs after
+`$script:GuestRunConflictRetryWaitSeconds` (180s), once
+(`$script:GuestRunConflictRetryLimit` = 1), merging the second attempt's results over the first
+(`Select-RetryableGuestRunConflicts`, `Merge-RetriedFleetResults`). The budget is counted down
+through the recursive call, so a retry that hits the same conflict cannot renew it.
+
+Both halves of that are deliberate. **Neither the wait nor the retry is a CLI parameter**: this is
+a courtesy for an overlap measured in seconds, not a scheduling mechanism, and the phase is
+in-process, so a longer wait blocks every other VM in the fleet. A guest still restarting after
+the retry is recorded as it is and the run exits 1 — this tool has no way to know how long that
+guest's restart legitimately takes, and a conflict staying absolute is what keeps it out of the
+reboot phase and the next round.
+
 Reboot is the other holder. `shutdown.exe` is no longer started directly over GuestOps; instead
 `guest/Request-GuestReboot.ps1` (concatenated with the workspace guard and the run guard, and run
 through `-EncodedCommand`) takes the guard, writes `RebootRequested`, and invokes `shutdown.exe`

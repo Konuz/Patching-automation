@@ -820,6 +820,55 @@ Assert-Equal -Actual $rebootStateMap['VM-skipped'].state -Expected 'PendingReboo
 Assert-Equal -Actual $rebootStateMap['VM-reboot-only'].state -Expected 'Green' -Message 'a confirmed restart is not marked pending; the next discovery decides'
 Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $rebootStateMap) -Expected $false -Message 'a VM pending a reboot cannot produce exit 0'
 
+# --- a guest that is merely restarting is retried, not written off -------------------------------
+# The guard reports FOUR kinds of conflict and only one of them clears itself. A phase that treats
+# them alike either fails a VM that was seconds from being available, or waits for a record nobody
+# is going to reconcile while the rest of the fleet stands still.
+
+& {
+    $makeResult = {
+        param([string]$VMName, $ConflictKind)
+        $status = [pscustomobject]@{ guestRunConflict = ($null -ne $ConflictKind); guestRunConflictKind = $ConflictKind }
+        return [pscustomobject]@{ Sequence = 1; VMName = $VMName; Payload = [pscustomobject]@{ Status = $status }; Error = $null }
+    }
+
+    $rebooting = & $makeResult 'VM-rebooting' 'RebootPending'
+    $held = & $makeResult 'VM-held' 'Held'
+    $unconfirmed = & $makeResult 'VM-unconfirmed' 'Unconfirmed'
+    $unreadable = & $makeResult 'VM-unreadable' 'Unreadable'
+    $healthy = & $makeResult 'VM-healthy' $null
+    # A start error has no payload at all: reading a verdict off it must not throw under StrictMode
+    # and absence must not be mistaken for RebootPending.
+    $startError = New-FleetErrorResult -InputObject ([pscustomobject]@{ Sequence = 9; VMName = 'VM-start' }) -ErrorMessage 'preflight failed' -ResultKind 'StartError'
+
+    $all = @($rebooting, $held, $unconfirmed, $unreadable, $healthy, $startError)
+    $retryable = @(Select-RetryableGuestRunConflicts -FleetResults $all)
+    Assert-Equal -Actual (@($retryable | ForEach-Object { [string]$_.VMName }) -join ',') -Expected 'VM-rebooting' -Message 'only a guest on its way back up is retried within the phase'
+
+    Assert-Equal -Actual (Get-FleetResultGuestRunConflictKind -FleetResult $startError) -Expected '' -Message 'a result with no payload reports no conflict kind'
+    Assert-Equal -Actual (Get-FleetResultGuestRunConflictKind -FleetResult $healthy) -Expected '' -Message 'a healthy result reports no conflict kind'
+    Assert-Equal -Actual (Get-FleetResultGuestRunConflictKind -FleetResult $held) -Expected 'Held' -Message 'a live concurrent run is read back as Held'
+    Assert-Equal -Actual (@(Select-RetryableGuestRunConflicts -FleetResults @()).Count) -Expected 0 -Message 'an empty phase has nothing to retry'
+
+    # The retry replaces only the retried VM's result, keeps every other result untouched, and
+    # keeps the first attempt when the retry produced nothing for that VM.
+    $secondAttempt = & $makeResult 'VM-rebooting' $null
+    $merged = @(Merge-RetriedFleetResults -OriginalResults $all -RetriedResults @($secondAttempt) -RetriedVMNames @('VM-rebooting'))
+    Assert-Equal -Actual $merged.Count -Expected $all.Count -Message 'the retry changes no VM count'
+    Assert-Equal -Actual (@($merged | ForEach-Object { [string]$_.VMName }) -join ',') -Expected (@($all | ForEach-Object { [string]$_.VMName }) -join ',') -Message 'the retry keeps the phase order'
+    Assert-Equal -Actual (Get-FleetResultGuestRunConflictKind -FleetResult @($merged | Where-Object { $_.VMName -eq 'VM-rebooting' })[0]) -Expected '' -Message 'the second attempt replaces the refused first one'
+    Assert-Equal -Actual (Get-FleetResultGuestRunConflictKind -FleetResult @($merged | Where-Object { $_.VMName -eq 'VM-held' })[0]) -Expected 'Held' -Message 'a VM that was not retried keeps its own result'
+
+    $mergedWithoutAnswer = @(Merge-RetriedFleetResults -OriginalResults $all -RetriedResults @() -RetriedVMNames @('VM-rebooting'))
+    Assert-Equal -Actual $mergedWithoutAnswer.Count -Expected $all.Count -Message 'a retry that produced nothing leaves the VM in the phase'
+    Assert-Equal -Actual (Get-FleetResultGuestRunConflictKind -FleetResult @($mergedWithoutAnswer | Where-Object { $_.VMName -eq 'VM-rebooting' })[0]) -Expected 'RebootPending' -Message 'a retry that produced nothing keeps the first refusal'
+
+    # The budget is one retry, and it is spent even when the retry hits the same conflict. The
+    # second attempt below is the one that must NOT schedule a third.
+    Assert-Equal -Actual $script:GuestRunConflictRetryLimit -Expected 1 -Message 'the in-phase retry budget is one attempt'
+    Assert-Equal -Actual ($script:GuestRunConflictRetryWaitSeconds -gt 0) -Expected $true -Message 'the wait before the retry is bounded and non-zero'
+}
+
 # --- one shape for every apply branch, and one audit log (task 11) ------------------------------
 # Compared after a JSON round trip, because that is where a missing property actually bites: under
 # StrictMode, reading a field one branch happened not to set is a terminating error for whoever
@@ -829,8 +878,8 @@ Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $rebootStateMap) -Expected
     $requiredApplyFields = @(
         'vmName', 'action', 'outcome', 'installResult', 'reason', 'roleFlags', 'rebootRequired',
         'agentCompletionConfirmed', 'agentCompletionReason', 'cleanupStatus', 'cleanupReason',
-        'errors', 'guestRunConflict', 'workspaceSealVerified', 'missingUpdateKeys', 'selectionDrift',
-        'requiresVerification'
+        'errors', 'guestRunConflict', 'guestRunConflictKind', 'workspaceSealVerified',
+        'missingUpdateKeys', 'selectionDrift', 'requiresVerification'
     )
 
     $applyVariants = @(
@@ -838,7 +887,8 @@ Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $rebootStateMap) -Expected
         [pscustomobject]@{ Name = 'a start error'; Record = (New-ApplyResultRecord -VMName 'VM-start' -Outcome 'Failed' -Reason 'start failed' -Errors @('start failed')) },
         [pscustomobject]@{ Name = 'no payload at all'; Record = (New-ApplyResultRecord -VMName 'VM-nopayload' -Outcome 'Failed' -AgentCompletionConfirmed $false -AgentCompletionReason 'no completion record') },
         [pscustomobject]@{ Name = 'a timeout'; Record = (New-ApplyResultRecord -VMName 'VM-timeout' -Outcome 'Failed' -Reason 'timed out' -CleanupStatus 'Retained' -CleanupReason 'process result lost') },
-        [pscustomobject]@{ Name = 'a guest run conflict'; Record = (New-ApplyResultRecord -VMName 'VM-conflict' -Outcome 'Failed' -GuestRunConflict $true) },
+        [pscustomobject]@{ Name = 'a guest run conflict'; Record = (New-ApplyResultRecord -VMName 'VM-conflict' -Outcome 'Failed' -GuestRunConflict $true -GuestRunConflictKind 'Unconfirmed') },
+        [pscustomobject]@{ Name = 'a guest still restarting'; Record = (New-ApplyResultRecord -VMName 'VM-restarting' -Outcome 'Failed' -GuestRunConflict $true -GuestRunConflictKind 'RebootPending') },
         [pscustomobject]@{ Name = 'selection drift'; Record = (New-ApplyResultRecord -VMName 'VM-drift' -Outcome 'InstallSucceeded' -MissingUpdateKeys @('aaaa|1') -SelectionDrift $true -RequiresVerification $true) },
         [pscustomobject]@{ Name = 'a refused workspace seal'; Record = (New-ApplyResultRecord -VMName 'VM-seal' -Outcome 'Failed' -WorkspaceSealVerified $false -Errors @('seal refused')) },
         [pscustomobject]@{ Name = 'a success'; Record = (New-ApplyResultRecord -VMName 'VM-ok' -Outcome 'InstallSucceeded' -AgentCompletionConfirmed $true -RebootRequired $true) },
@@ -855,7 +905,7 @@ Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $rebootStateMap) -Expected
     $applyDir = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-applyshape-' + [guid]::NewGuid().ToString('N'))
     [void](New-Item -ItemType Directory -Path $applyDir)
     try {
-        foreach ($count in @(0, 1, 2, 9)) {
+        foreach ($count in @(0, 1, 2, 10)) {
             $subset = @($applyVariants | Select-Object -First $count | ForEach-Object { $_.Record })
             $shapePath = Join-Path $applyDir ('apply-{0}.json' -f $count)
             ConvertTo-Json -InputObject @($subset) -Depth 12 | Set-Content -LiteralPath $shapePath -Encoding UTF8

@@ -284,7 +284,12 @@ function Invoke-GuestAgentFleet {
         [hashtable]$CredentialContext = $null,
         [scriptblock]$CredentialDecisionScript,
         [scriptblock]$CredentialValidatedScript,
-        [bool]$CredentialInteractive = $false
+        [bool]$CredentialInteractive = $false,
+        # How many times a VM that refused the run *because it is restarting* may be tried again
+        # inside this phase. Counted down through the recursive call below, so the budget cannot be
+        # renewed by a retry that hits the same conflict.
+        [int]$GuestRunConflictRetriesRemaining = $script:GuestRunConflictRetryLimit,
+        [scriptblock]$SleepScript = { param($Seconds) Start-Sleep -Seconds $Seconds }
     )
 
     # Finish every endpoint check before the fleet creates directories or starts agents. A host
@@ -383,7 +388,37 @@ function Invoke-GuestAgentFleet {
             param($ErrorRecord, $Stage)
             return Get-GuestOperationFailureMetadata -ErrorRecord $ErrorRecord -Stage $Stage
         })
-    return @($preflightErrors) + @($fleetResults)
+    $phaseResults = @($preflightErrors) + @($fleetResults)
+
+    if ($GuestRunConflictRetriesRemaining -le 0) {
+        return $phaseResults
+    }
+
+    # A guest that refused because it is on its way back up reconciles itself the moment its boot
+    # time is newer, so one short wait here is the difference between riding out a restart someone
+    # else ordered and reporting the VM as failed. Every other conflict kind is left as it is - see
+    # Select-RetryableGuestRunConflicts for why waiting them out would be wrong rather than slow.
+    $retryResults = @(Select-RetryableGuestRunConflicts -FleetResults $phaseResults)
+    if (@($retryResults).Count -eq 0) {
+        return $phaseResults
+    }
+
+    $retryVMNames = @(@($retryResults) | ForEach-Object { [string]$_.VMName } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $retryItems = @(@($FleetItems) | Where-Object { $retryVMNames -contains [string]$_.VMName })
+    if (@($retryItems).Count -eq 0) {
+        return $phaseResults
+    }
+
+    Write-Warning ('{0} VM(s) are restarting and refused this phase; waiting {1}s and trying them once more: {2}' -f @($retryItems).Count, $script:GuestRunConflictRetryWaitSeconds, ($retryVMNames -join ', '))
+    & $SleepScript $script:GuestRunConflictRetryWaitSeconds
+
+    $retriedResults = @(Invoke-GuestAgentFleet -FleetItems $retryItems -VIServerScope $VIServerScope -Managers $Managers -GuestCredentialMap $GuestCredentialMap `
+            -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -WorkspaceScriptPath $WorkspaceScriptPath -RunGuardScriptPath $RunGuardScriptPath `
+            -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -MaxInFlight $MaxInFlight `
+            -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript `
+            -CredentialInteractive $CredentialInteractive -GuestRunConflictRetriesRemaining ($GuestRunConflictRetriesRemaining - 1) -SleepScript $SleepScript)
+
+    return @(Merge-RetriedFleetResults -OriginalResults $phaseResults -RetriedResults $retriedResults -RetriedVMNames $retryVMNames)
 }
 
 function Get-GuestRebootJobScript {
@@ -2071,7 +2106,10 @@ try {
             Write-RunEvent -State $runEventLog -Event 'VMApplied' -Phase 'Apply' -Round $roundNumber -VMName $applyEventVmName `
                 -Outcome ([string](Get-RuntimePropertyValue -InputObject $applyEventResult -Name 'outcome'))
             if ([bool](Get-RuntimePropertyValue -InputObject $applyEventResult -Name 'guestRunConflict' -DefaultValue $false)) {
-                Write-RunEvent -State $runEventLog -Event 'GuestRunConflict' -Phase 'Apply' -Round $roundNumber -VMName $applyEventVmName -ErrorKind 'GuestRunConflict'
+                # The kind, not just the fact: a run that ends 1 because two guests were restarting
+                # is a different conversation from one that ends 1 because two guests need a hand.
+                Write-RunEvent -State $runEventLog -Event 'GuestRunConflict' -Phase 'Apply' -Round $roundNumber -VMName $applyEventVmName -ErrorKind 'GuestRunConflict' `
+                    -Detail ([string](Get-RuntimePropertyValue -InputObject $applyEventResult -Name 'guestRunConflictKind' -DefaultValue ''))
             }
             if ([bool](Get-RuntimePropertyValue -InputObject $applyEventResult -Name 'selectionDrift' -DefaultValue $false)) {
                 Write-RunEvent -State $runEventLog -Event 'SelectionDrift' -Phase 'Apply' -Round $roundNumber -VMName $applyEventVmName `

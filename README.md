@@ -562,6 +562,28 @@ trafia do kolejnej rundy i przebieg nie może zakończyć się kodem 0 — nawet
 odrzuconego agenta już się zakończył. Restart także przechodzi przez tę blokadę: `shutdown.exe`
 jest uruchamiany z wnętrza gościa przez proces, który trzyma uchwyt.
 
+**Cztery rodzaje odmowy — i tylko jeden z nich warto przeczekać.** Odmowa niesie też pole
+`guestRunConflictKind`, bo to nie jest jeden problem:
+
+| Rodzaj | Co to znaczy | Co robi przebieg |
+| --- | --- | --- |
+| `Held` | Nie dało się otworzyć samego pliku blokady: na gościu **w tej chwili** pracuje inny przebieg tego narzędzia. | Zapisuje i kończy dla tej maszyny. Przeczekanie i start to dokładnie ta kolizja, której blokada ma zapobiegać. |
+| `Unconfirmed` | Zapis mówi `Running`: poprzedni właściciel zginął bez raportu o zakończeniu. | Zapisuje. Bez człowieka i wglądu w historię Windows Update nic się tu nie zmieni. |
+| `RebootPending` | Zapis mówi `RebootRequested`, a nowszy czas rozruchu jeszcze nie nadszedł. | **Czeka raz i próbuje ponownie w tej samej fazie.** |
+| `Unreadable` | Zapisu nie da się zinterpretować albo ma status, którego narzędzie nie zna. | Zapisuje. Tak jak `Unconfirmed`. |
+
+`RebootPending` jest jedynym rodzajem, który **rozstrzyga się sam** — znacznik zwalnia się w
+momencie, gdy czas rozruchu będzie nowszy. Natychmiastowe `Failed` oznaczałoby więc raportowanie
+maszyny, która była kilka sekund od dostępności. Dlatego faza czeka **180 sekund** i ponawia
+te maszyny **jeden raz**, a wynik drugiej próby zastępuje pierwszą.
+
+Ani czas oczekiwania, ani liczba prób **nie są parametrami wiersza poleceń** — to uprzejmość dla
+kolizji liczonej w sekundach, a nie mechanizm planowania: faza działa w jednym procesie, więc
+dłuższe czekanie blokuje wszystkie pozostałe maszyny we flocie. Maszyna, która po ponowieniu nadal
+się restartuje, jest raportowana tak jak jest i przebieg kończy się kodem 1 — narzędzie nie wie,
+ile ten konkretny restart ma prawo trwać, a to, że konflikt pozostaje bezwzględny, trzyma tę
+maszynę poza fazą restartu i poza kolejną rundą.
+
 **Ręczne uzgodnienie porzuconego przebiegu.** Nie ma przełącznika, który ignoruje blokadę. Na
 gościu sprawdź historię Windows Update i to, czy nie działa `Run-LocalPatch.ps1`. Dopiero gdy
 masz pewność, że poprzedni przebieg się zakończył, usuń plik
@@ -727,21 +749,23 @@ Na tej maszynie działa inny przebieg tego narzędzia albo został po nim niepot
 Maszyna nie jest łatana, nie jest restartowana i nie wchodzi do kolejnej rundy; przebieg kończy się
 kodem 1.
 
-Pole `guestRunConflictReason` w `apply-results.json` rozróżnia cztery różne sytuacje — i tylko
-jedna z nich wymaga interwencji.
+Pola `guestRunConflictKind` i `guestRunConflictReason` w `apply-results.json` rozróżniają cztery
+sytuacje — i tylko dwie z nich wymagają interwencji.
 
-1. **„Another PatchingGuestOps run holds the guest run guard”** — na maszynie *w tej chwili* pracuje
-   inny proces narzędzia (uchwyt pliku jest zajęty). Poczekaj na jego koniec i uruchom narzędzie
-   ponownie. Nic więcej nie trzeba robić.
-2. **„a reboot requested by a previous run … has not been confirmed by a newer boot time”** —
-   poprzedni przebieg zlecił restart, który się jeszcze nie potwierdził. Zrestartuj maszynę lub
-   poczekaj na okno restartu: blokada zwalnia się **sama**, gdy czas rozruchu będzie nowszy od
-   zapisanego. Nie usuwaj tu niczego ręcznie — skasowanie znacznika pozwoliłoby wysłać drugi
-   `shutdown.exe`.
-3. **„a previous run … never reported completion”** — porzucony przebieg: agent został przerwany albo
+1. **`Held`** („Another PatchingGuestOps run holds the guest run guard”) — na maszynie *w tej chwili*
+   pracuje inny proces narzędzia (uchwyt pliku jest zajęty). Poczekaj na jego koniec i uruchom
+   narzędzie ponownie. Nic więcej nie trzeba robić.
+2. **`RebootPending`** („a reboot requested by a previous run … has not been confirmed by a newer
+   boot time”) — poprzedni przebieg zlecił restart, który się jeszcze nie potwierdził. **Przebieg
+   próbuje to sam rozwiązać**: czeka 180 sekund i ponawia tę maszynę raz w tej samej fazie, więc
+   jeśli widzisz ten wynik w `apply-results.json`, ponowienie też się nie udało. Zrestartuj maszynę
+   lub poczekaj na okno restartu i uruchom narzędzie ponownie: blokada zwalnia się **sama**, gdy
+   czas rozruchu będzie nowszy od zapisanego. Nie usuwaj tu niczego ręcznie — skasowanie znacznika
+   pozwoliłoby wysłać drugi `shutdown.exe`.
+3. **`Unconfirmed`** („a previous run … never reported completion”) — porzucony przebieg: agent został przerwany albo
    maszyna została wyłączona w trakcie. System zwolnił uchwyt pliku, ale to **nie** znaczy, że praca
    WUA się zakończyła. Dopiero tu potrzebne jest ręczne uzgodnienie — patrz niżej.
-4. **„a coordination record this tool cannot interpret”** lub nierozpoznany status — plik blokady
+4. **`Unreadable`** („a coordination record this tool cannot interpret”) lub nierozpoznany status — plik blokady
    został uszkodzony albo zapisany przez inną wersję. Też ręczne uzgodnienie.
 
 Ręczne uzgodnienie (przypadki 3 i 4), w tej kolejności: na gościu sprawdź historię Windows Update

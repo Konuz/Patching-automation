@@ -368,6 +368,9 @@ function New-ApplyResultRecord {
         # True when this guest was already busy with another run of this tool, or carried an
         # unreconciled trace of one. Absolute: no reboot and no further cycle for this VM.
         [bool]$GuestRunConflict = $false,
+        # Which kind of conflict the guest reported. 'RebootPending' is the only one the fleet
+        # waits out; the rest are recorded and the VM stops. Empty when there was no conflict.
+        [string]$GuestRunConflictKind = '',
         [string[]]$MissingUpdateKeys = @(),
         [bool]$SelectionDrift = $false,
         [bool]$RequiresVerification = $false,
@@ -391,6 +394,7 @@ function New-ApplyResultRecord {
         cleanupStatus = $CleanupStatus
         cleanupReason = $CleanupReason
         guestRunConflict = $GuestRunConflict
+        guestRunConflictKind = $GuestRunConflictKind
         workspaceSealVerified = $WorkspaceSealVerified
         missingUpdateKeys = @($MissingUpdateKeys)
         selectionDrift = $SelectionDrift
@@ -424,6 +428,7 @@ function New-ApplyResultFromCycle {
     # carried an unreconciled trace of one. It has to survive every branch below, including the
     # failure branches, because it is what blocks the reboot and the next round for this VM.
     $guestRunConflict = [bool](Get-ObjectPropertyValue -InputObject $status -Path @('guestRunConflict') -DefaultValue $false)
+    $guestRunConflictKind = [string](Get-ObjectPropertyValue -InputObject $status -Path @('guestRunConflictKind') -DefaultValue '')
     # Left null when the agent did not report it - an older agent, or a cycle that supplied no
     # token - so "not checked" stays distinguishable from "checked and refused".
     $workspaceSealVerified = Get-ObjectPropertyValue -InputObject $status -Path @('workspaceSealVerified')
@@ -458,7 +463,7 @@ function New-ApplyResultFromCycle {
             -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
             -AgentCompletionConfirmed $false -AgentCompletionReason $agentCompletionReason `
             -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
-            -Errors $errors -GuestRunConflict $guestRunConflict -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
+            -Errors $errors -GuestRunConflict $guestRunConflict -GuestRunConflictKind $guestRunConflictKind -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
     }
 
     if ($null -eq $agentResult -or -not $agentResult.Completed) {
@@ -478,7 +483,7 @@ function New-ApplyResultFromCycle {
                 -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
                 -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
                 -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
-                -Errors $errors -GuestRunConflict $guestRunConflict -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
+                -Errors $errors -GuestRunConflict $guestRunConflict -GuestRunConflictKind $guestRunConflictKind -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
         }
     }
     # A partial install (WUA ResultCode 3) exits non-zero but is authoritative in
@@ -491,14 +496,14 @@ function New-ApplyResultFromCycle {
             -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
             -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
             -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
-            -Errors $errors -GuestRunConflict $guestRunConflict -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
+            -Errors $errors -GuestRunConflict $guestRunConflict -GuestRunConflictKind $guestRunConflictKind -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
     }
 
     return New-ApplyResultRecord -VMName $VMName -Outcome $outcome -InstallResult $installResult `
         -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
         -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
         -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
-        -Errors $errors -GuestRunConflict $guestRunConflict -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
+        -Errors $errors -GuestRunConflict $guestRunConflict -GuestRunConflictKind $guestRunConflictKind -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
 }
 
 function Add-OutstandingVerificationKeys {
@@ -1060,6 +1065,72 @@ function Merge-PatchRunStates {
 # The states a run may end on. An allow-list, not a deny-list of Pending/Failed: every state
 # added since - NeedsReview, PendingReboot - would otherwise have passed this test by default,
 # and so would a typo. Excluded is allowed but means "outside the scope of patching", not patched.
+# A guest that refuses the run because it is restarting is not a guest that has failed - the
+# marker reconciles itself the moment the boot time is newer. So the phase waits once, briefly,
+# and tries that VM again before recording the refusal.
+#
+# Coordinator-level, deliberately not CLI parameters: this is a courtesy for an overlap measured
+# in seconds, not a substitute for scheduling. A guest still restarting after the wait is reported
+# as it is, because this tool has no way to know how long that guest's restart legitimately takes,
+# and a phase that waits out an arbitrary reboot blocks every other VM in the fleet.
+$script:GuestRunConflictRetryWaitSeconds = 180
+$script:GuestRunConflictRetryLimit = 1
+
+function Get-FleetResultGuestRunConflictKind {
+    param($FleetResult)
+
+    # The guest's own classification, read out of whichever branch produced the result. A fleet
+    # result with no payload (a start error, a timeout with nothing harvested) has no verdict, and
+    # absence is not RebootPending.
+    $payload = Get-RuntimePropertyValue -InputObject $FleetResult -Name 'Payload'
+    $status = Get-RuntimePropertyValue -InputObject $payload -Name 'Status'
+    return [string](Get-ObjectPropertyValue -InputObject $status -Path @('guestRunConflictKind') -DefaultValue '')
+}
+
+function Select-RetryableGuestRunConflicts {
+    param($FleetResults)
+
+    # ONLY RebootPending. The other kinds are deliberately never waited out:
+    #   Held        - another run is installing on this guest right now. Waiting for it to finish
+    #                 and then starting our own agent is precisely the overlap the guard exists to
+    #                 prevent, and the other run's reboot may follow ours.
+    #   Unconfirmed - a previous run never reported completion. Nothing is going to change that
+    #                 without a person looking at Windows Update on the guest.
+    #   Unreadable  - a coordination record this tool cannot interpret. Same.
+    return @(@($FleetResults) | Where-Object { (Get-FleetResultGuestRunConflictKind -FleetResult $_) -eq 'RebootPending' })
+}
+
+function Merge-RetriedFleetResults {
+    param(
+        $OriginalResults,
+        $RetriedResults,
+        [string[]]$RetriedVMNames
+    )
+
+    # The retry replaces the first attempt's result for those VMs and nothing else. A VM that was
+    # retried but produced no second result keeps its first: dropping it would turn a refusal into
+    # a VM missing from the phase, which the all-green check reads as neither pass nor fail.
+    $retriedByName = @{}
+    foreach ($retried in @($RetriedResults)) {
+        $name = [string](Get-RuntimePropertyValue -InputObject $retried -Name 'VMName')
+        if (-not [string]::IsNullOrWhiteSpace($name)) {
+            $retriedByName[$name] = $retried
+        }
+    }
+
+    $merged = @()
+    foreach ($original in @($OriginalResults)) {
+        $name = [string](Get-RuntimePropertyValue -InputObject $original -Name 'VMName')
+        if (@($RetriedVMNames) -contains $name -and $retriedByName.ContainsKey($name)) {
+            $merged += $retriedByName[$name]
+            continue
+        }
+        $merged += $original
+    }
+
+    return @($merged)
+}
+
 $script:PatchRunSuccessfulStates = @('Green', 'GreenByOperatorChoice', 'Excluded')
 
 function Test-PatchRunAllGreen {

@@ -464,6 +464,95 @@ Assert-Equal (@($eulaFailure.InstallerKeys) -join ',') $keyA1 'a refused EULA dr
 Assert-Equal (@($eulaFailure.Status.errors).Count -gt 0) $true 'a refused EULA is a real error, not drift'
 Assert-Equal ([bool]$eulaFailure.Status.selectionDrift) $false 'a refused EULA is not selection drift'
 
+# --- a restarting guest is retried once inside the phase, nothing else is ------------------------
+# The real Invoke-GuestAgentFleet, with vSphere and the poll loop stubbed out. What is under test is
+# the wiring: which conflict kinds cause a second attempt, that the wait happens before it, that the
+# budget is one, and that a VM which was not retried keeps its own result.
+
+& {
+    $script:fleetAttempts = @()
+    $script:sleepCalls = @()
+    $script:conflictOnFirstAttemptOnly = $true
+
+    function Get-ExactVM { param([string]$Name, $Servers) return [pscustomobject]@{ Name = $Name; ExtensionData = [pscustomobject]@{ MoRef = 'vm-1' } } }
+    function Assert-VMReadyForGuestOps { param($VM) }
+    function Get-VMHostNameForTransfer { param($VMView) return 'esx-fixture' }
+    function Assert-GuestTransferEndpoint { param([string]$HostName, [string]$CurlPath) }
+    function New-GuestAuthentication { param($Credential) return [pscustomobject]@{ } }
+
+    # Stands in for the poll machinery: attempt 1 reports the conflict kind each item asked for,
+    # attempt 2 reports a clean run, so a second attempt is visible in the merged result.
+    function Invoke-InProcessAgentFleet {
+        param($Items, [int]$MaxInFlight, [int]$PollSeconds, [int]$ItemTimeoutSeconds,
+            [scriptblock]$StartScript, [scriptblock]$PollScript, [scriptblock]$CompleteScript,
+            [scriptblock]$IsTransientErrorScript, [scriptblock]$GetErrorMetadataScript, [scriptblock]$SleepScript = $null)
+
+        $attemptNumber = @($script:fleetAttempts).Count + 1
+        $script:fleetAttempts += ,@(@($Items) | ForEach-Object { [string]$_.VMName })
+
+        $results = @()
+        foreach ($item in @($Items)) {
+            $kind = if ($attemptNumber -eq 1 -or -not $script:conflictOnFirstAttemptOnly) { [string]$item.ConflictKind } else { '' }
+            $status = [pscustomobject]@{
+                guestRunConflict = (-not [string]::IsNullOrWhiteSpace($kind))
+                guestRunConflictKind = $kind
+                outcome = if ([string]::IsNullOrWhiteSpace($kind)) { 'InstallSucceeded' } else { 'Failed' }
+            }
+            $results += [pscustomobject]@{ Sequence = $item.Sequence; VMName = [string]$item.VMName; Payload = [pscustomobject]@{ Status = $status }; Error = $null }
+        }
+        return @($results)
+    }
+
+    $newItem = {
+        param([int]$Sequence, [string]$VMName, [string]$ConflictKind)
+        return [pscustomobject]@{ Sequence = $Sequence; VMName = $VMName; ConflictKind = $ConflictKind; VMOutputDirectory = 'unused'; MaxUpdates = 1; LocalSelectionPath = ''; SearchOnly = $true }
+    }
+
+    $runFleet = {
+        param($Items)
+        return @(Invoke-GuestAgentFleet -FleetItems @($Items) -VIServerScope @('vc-fixture') -Managers $null `
+                -GuestCredentialMap @{} -CurlPath 'curl.exe' -AgentPath 'agent.ps1' -IdentityHelperPath 'identity.ps1' `
+                -WorkspaceScriptPath 'workspace.ps1' -RunGuardScriptPath 'guard.ps1' -GuestWorkingDirectory 'C:\ProgramData\PatchingGuestOps' `
+                -TimeoutSeconds 60 -PollSeconds 1 -MaxInFlight 4 `
+                -SleepScript { param($Seconds) $script:sleepCalls += [int]$Seconds } 3>$null)
+    }
+
+    # 1. A restarting guest beside a healthy one: exactly that VM is tried again, after one wait.
+    $script:fleetAttempts = @(); $script:sleepCalls = @()
+    $mixed = @((& $newItem 1 'vm-rebooting' 'RebootPending'), (& $newItem 2 'vm-healthy' ''))
+    $mixedResults = @(& $runFleet $mixed)
+    Assert-Equal @($script:fleetAttempts).Count 2 'a restarting guest causes exactly one more dispatch'
+    Assert-Equal (@($script:fleetAttempts[1]) -join ',') 'vm-rebooting' 'only the restarting guest is dispatched again'
+    Assert-Equal @($script:sleepCalls).Count 1 'the phase waits once before the retry'
+    Assert-Equal $script:sleepCalls[0] $script:GuestRunConflictRetryWaitSeconds 'the wait is the bounded coordinator-level one'
+    Assert-Equal @($mixedResults).Count 2 'the merged phase still holds every VM'
+    Assert-Equal (Get-FleetResultGuestRunConflictKind -FleetResult @($mixedResults | Where-Object { $_.VMName -eq 'vm-rebooting' })[0]) '' 'the second attempt is what the phase reports'
+
+    # 2. The other three kinds are never waited out: no wait, no second dispatch.
+    foreach ($kind in @('Held', 'Unconfirmed', 'Unreadable')) {
+        $script:fleetAttempts = @(); $script:sleepCalls = @()
+        $blocked = @(& $runFleet @((& $newItem 1 'vm-blocked' $kind)))
+        Assert-Equal @($script:fleetAttempts).Count 1 ('a ' + $kind + ' conflict is not retried')
+        Assert-Equal @($script:sleepCalls).Count 0 ('a ' + $kind + ' conflict costs no wait')
+        Assert-Equal (Get-FleetResultGuestRunConflictKind -FleetResult @($blocked)[0]) $kind ('a ' + $kind + ' conflict is reported as it is')
+    }
+
+    # 3. A guest still restarting after the retry is reported, not retried for ever. The budget is
+    #    spent, so there is exactly one extra dispatch and one wait however long the guest takes.
+    $script:fleetAttempts = @(); $script:sleepCalls = @(); $script:conflictOnFirstAttemptOnly = $false
+    $stillRebooting = @(& $runFleet @((& $newItem 1 'vm-slow' 'RebootPending')))
+    Assert-Equal @($script:fleetAttempts).Count 2 'the in-phase retry budget is one attempt, spent even when it fails'
+    Assert-Equal @($script:sleepCalls).Count 1 'a retry that fails does not buy another wait'
+    Assert-Equal (Get-FleetResultGuestRunConflictKind -FleetResult @($stillRebooting)[0]) 'RebootPending' 'a guest still restarting is reported as it is'
+    $script:conflictOnFirstAttemptOnly = $true
+
+    # 4. A phase with nothing to retry pays nothing.
+    $script:fleetAttempts = @(); $script:sleepCalls = @()
+    $null = & $runFleet @((& $newItem 1 'vm-clean' ''))
+    Assert-Equal @($script:fleetAttempts).Count 1 'a phase with no conflict is dispatched once'
+    Assert-Equal @($script:sleepCalls).Count 0 'a phase with no conflict never waits'
+}
+
 # --- the workspace seal, as the agent enforces it ------------------------------------------------
 # The bootstrap verifies the directory and seals it; three GuestOps calls later this agent starts
 # in it. Re-reading the seal is what turns "it was safe when we checked" into "this is the same

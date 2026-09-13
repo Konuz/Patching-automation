@@ -351,7 +351,7 @@ function Initialize-GuestWorkspace {
     return [pscustomobject]@{ Status = 'Ok'; Reason = $null; Path = $Path }
 }
 $guard = Enter-GuestRunGuard -RunId $RunId -Phase 'Agent'
-$payload = [ordered]@{ acquired = [bool]$guard.Acquired; conflict = [bool]$guard.Conflict; reason = [string]$guard.Reason }
+$payload = [ordered]@{ acquired = [bool]$guard.Acquired; conflict = [bool]$guard.Conflict; reason = [string]$guard.Reason; conflictKind = [string]$guard.ConflictKind }
 $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $SignalPath -Encoding UTF8
 if (-not $guard.Acquired) { exit 20 }
 switch ($Mode) {
@@ -437,6 +437,9 @@ exit 0
             # the second run. Reading the first run's "Running" record would refuse it too, but
             # only after the lock had already let both processes into the WUA session.
             Assert-Contains ([string]$secondAnswer.reason) 'holds the guest run guard' 'the second run is stopped by the lock itself, not by reading the record afterwards'
+            # And it is classified as Held, not Unconfirmed: a live run is something to wait out,
+            # while an unreconciled record is something a person has to look at.
+            Assert-Equal ([string]$secondAnswer.conflictKind) 'Held' 'a live concurrent run is reported as Held'
         }
         $null = $secondProcess.WaitForExit(60000)
         Assert-Equal $secondProcess.ExitCode 20 'the refused run exits with the conflict code'
@@ -489,6 +492,9 @@ exit 0
             Assert-Equal ([bool]$afterCrashAnswer.conflict) $true 'an unreconciled trace is a conflict'
             Assert-Contains ([string]$afterCrashAnswer.reason) 'never reported completion' 'the conflict says what is unreconciled'
             Assert-Contains ([string]$afterCrashAnswer.reason) 'by hand' 'the conflict points at the manual reconciliation'
+            # Deliberately not Held: nothing holds this guest any more, and a run that waited for
+            # the handle to free up would wait for something that has already happened.
+            Assert-Equal ([string]$afterCrashAnswer.conflictKind) 'Unconfirmed' 'a crashed run leaves an Unconfirmed conflict, never a Held one'
         }
         $null = $afterCrashProcess.WaitForExit(60000)
 
@@ -506,6 +512,7 @@ exit 0
         if ($null -ne $afterRebootAnswer) {
             Assert-Equal ([bool]$afterRebootAnswer.acquired) $false 'an unconfirmed pending reboot blocks the next agent'
             Assert-Contains ([string]$afterRebootAnswer.reason) 'not been confirmed by a newer boot time' 'the pending reboot says what would reconcile it'
+            Assert-Equal ([string]$afterRebootAnswer.conflictKind) 'RebootPending' 'a guest on its way back up is reported as RebootPending'
         }
         $null = $afterRebootProcess.WaitForExit(60000)
 
@@ -543,9 +550,18 @@ exit 0
     # Every other recorded state, including one this tool does not know.
     Assert-Equal (Get-GuestRunGuardConflictReason -PreviousState $null) $null 'a guest with no record is available'
     Assert-Equal (Get-GuestRunGuardConflictReason -PreviousState ([pscustomobject]@{ status = 'Completed'; runId = 'run-y' })) $null 'a completed run leaves the guest available'
-    Assert-Contains (Get-GuestRunGuardConflictReason -PreviousState ([pscustomobject]@{ status = 'Running'; runId = 'run-z' })) 'never reported completion' 'a run still marked running is a conflict'
-    Assert-Contains (Get-GuestRunGuardConflictReason -PreviousState 'unreadable') 'cannot interpret' 'an unreadable record is a conflict'
-    Assert-Contains (Get-GuestRunGuardConflictReason -PreviousState ([pscustomobject]@{ status = 'Whatever'; runId = 'run-w' })) 'does not recognise' 'an unknown recorded status is a conflict, not a pass'
+    Assert-Contains ([string](Get-GuestRunGuardConflictReason -PreviousState ([pscustomobject]@{ status = 'Running'; runId = 'run-z' })).Reason) 'never reported completion' 'a run still marked running is a conflict'
+    Assert-Contains ([string](Get-GuestRunGuardConflictReason -PreviousState 'unreadable').Reason) 'cannot interpret' 'an unreadable record is a conflict'
+    Assert-Contains ([string](Get-GuestRunGuardConflictReason -PreviousState ([pscustomobject]@{ status = 'Whatever'; runId = 'run-w' })).Reason) 'does not recognise' 'an unknown recorded status is a conflict, not a pass'
+
+    # The kind, not just the text: the caller decides between waiting and stopping on it, so a
+    # conflict classified wrongly is either a run that gives up on a guest that is merely
+    # restarting, or a wait for a directory nobody is ever going to reconcile.
+    function Get-GuestRunGuardBootTimeUtc { return $recordedBootTime }
+    Assert-Equal (Get-GuestRunGuardConflictReason -PreviousState $pendingState).Kind 'RebootPending' 'an unconfirmed reboot is the kind that clears itself'
+    Assert-Equal (Get-GuestRunGuardConflictReason -PreviousState ([pscustomobject]@{ status = 'Running'; runId = 'run-z' })).Kind 'Unconfirmed' 'a run that never reported completion needs a hand, not a wait'
+    Assert-Equal (Get-GuestRunGuardConflictReason -PreviousState 'unreadable').Kind 'Unreadable' 'a record this tool cannot read needs a hand too'
+    Assert-Equal (Get-GuestRunGuardConflictReason -PreviousState ([pscustomobject]@{ status = 'Whatever'; runId = 'run-w' })).Kind 'Unreadable' 'an unrecognised status is never waited out'
 }
 
 # --- the coordination directory is never a cleanup target ----------------------------------------
