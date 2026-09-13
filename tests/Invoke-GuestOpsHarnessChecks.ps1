@@ -189,11 +189,19 @@ function New-FakeVMView {
     }
 }
 
+# Every phase must hand its vCenter connections down to the lookup, so the harness supplies a
+# scope exactly as a real run would.
+$harnessServerScope = @('vc.harness.invalid')
+
 # Shadow the three functions that would otherwise reach a real vCenter or the ESXi data
 # plane. Everything else - the cycle split, the transfer plumbing, the process polling and
 # the artifact parsing - is the production code.
 function Get-ExactVM {
-    param([string]$Name)
+    param([string]$Name, [object[]]$Servers)
+
+    # The real lookup refuses an empty scope; the fake one must too, or the harness would
+    # stop proving that every phase hands its connections down.
+    if (@($Servers).Count -eq 0) { throw ('Get-ExactVM was called without a connection scope for {0}.' -f $Name) }
 
     $state = $script:guestState[$Name]
     if ($null -eq $state) {
@@ -347,7 +355,7 @@ try {
     New-FakeGuest -VMName 'VM-upload-fails'
     $cycleError = ''
     try {
-        Start-VMAgentCycle -VMName 'VM-upload-fails' -Managers (New-FakeManagers -VMName 'VM-upload-fails') -GuestAuth $null -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -VMOutputDirectory (Join-Path $failureWorkspace 'VM-upload-fails') -MaxUpdates 1 | Out-Null
+        Start-VMAgentCycle -VMName 'VM-upload-fails' -Servers $harnessServerScope -Managers (New-FakeManagers -VMName 'VM-upload-fails') -GuestAuth $null -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -VMOutputDirectory (Join-Path $failureWorkspace 'VM-upload-fails') -MaxUpdates 1 | Out-Null
     }
     catch {
         $cycleError = $_.Exception.Message
@@ -395,7 +403,7 @@ try {
         LocalSelectionPath = ''
         SearchOnly = $true
     }
-    $isolationResults = @(Invoke-GuestAgentFleet -FleetItems @($fleetItem) -Managers $managerA -GuestCredentialMap @{ 'VM-B' = $harnessCredential } -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -TimeoutSeconds 120 -PollSeconds 1 -MaxInFlight 1)
+    $isolationResults = @(Invoke-GuestAgentFleet -FleetItems @($fleetItem) -VIServerScope $harnessServerScope -Managers $managerA -GuestCredentialMap @{ 'VM-B' = $harnessCredential } -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -TimeoutSeconds 120 -PollSeconds 1 -MaxInFlight 1)
     Assert-Equal -Actual $isolationResults.Count -Expected 1 -Message 'fleet client isolation returns the VM B result'
     Assert-Equal -Actual (@($isolationResults | Where-Object { $_.Error }).Count) -Expected 0 -Message 'fleet client isolation does not fail VM B'
     Assert-Equal -Actual $script:guestState['VM-A'].StartProgramCallCount -Expected 0 -Message 'fleet client isolation never starts VM A'
@@ -427,7 +435,7 @@ function New-HarnessFleetScripts {
         StartScript = {
             param($Item)
             $auth = New-GuestAuthentication -Credential $Item.Credential
-            return Start-VMAgentCycle -VMName $Item.VMName -Managers (New-FakeManagers -VMName $Item.VMName) -GuestAuth $auth -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -VMOutputDirectory (Join-Path $Workspace $Item.VMName) -MaxUpdates 1 -SearchOnly:([bool]$Item.SearchOnly) -TransferTimeoutSeconds $TransferTimeoutSeconds
+            return Start-VMAgentCycle -VMName $Item.VMName -Servers $harnessServerScope -Managers (New-FakeManagers -VMName $Item.VMName) -GuestAuth $auth -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -VMOutputDirectory (Join-Path $Workspace $Item.VMName) -MaxUpdates 1 -SearchOnly:([bool]$Item.SearchOnly) -TransferTimeoutSeconds $TransferTimeoutSeconds
         }.GetNewClosure()
         PollScript = {
             param($Handle)
@@ -489,7 +497,7 @@ try {
     $selectionManagers = New-FakeManagers -VMName 'VM-selection'
     $script:guestState['VM-selection'].Client = New-ClientBoundFakeClient -VMName 'VM-selection' -Managers $selectionManagers
     $suppliedSelectionPath = 'C:\synthetic\preset-selection.json'
-    $selectionHandle = Start-VMAgentCycle -VMName 'VM-selection' -Managers $selectionManagers -GuestAuth (New-GuestAuthentication -Credential $harnessCredential) -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -VMOutputDirectory (Join-Path $workspace 'VM-selection') -MaxUpdates 1 -SelectionPath $suppliedSelectionPath
+    $selectionHandle = Start-VMAgentCycle -VMName 'VM-selection' -Servers $harnessServerScope -Managers $selectionManagers -GuestAuth (New-GuestAuthentication -Credential $harnessCredential) -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -VMOutputDirectory (Join-Path $workspace 'VM-selection') -MaxUpdates 1 -SelectionPath $suppliedSelectionPath
     Assert-Equal -Actual ($null -ne $selectionHandle) -Expected $true -Message 'harness: a cycle without a local selection still starts'
     $selectionArguments = [string]$script:guestState['VM-selection'].AgentSpec.Arguments
     Assert-Equal -Actual ($selectionArguments.Contains($suppliedSelectionPath)) -Expected $true -Message 'harness: without LocalSelectionPath the supplied guest selection path is used verbatim'
@@ -552,7 +560,7 @@ try {
         SearchOnly = $true
     }
 
-    $retryResults = @(Invoke-GuestAgentFleet -FleetItems @($retryItem) -Managers $retryManagers -GuestCredentialMap @{ 'VM-retry' = $harnessCredential } -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -TimeoutSeconds 120 -PollSeconds 1 -MaxInFlight 1)
+    $retryResults = @(Invoke-GuestAgentFleet -FleetItems @($retryItem) -VIServerScope $harnessServerScope -Managers $retryManagers -GuestCredentialMap @{ 'VM-retry' = $harnessCredential } -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -TimeoutSeconds 120 -PollSeconds 1 -MaxInFlight 1)
     Assert-Equal $retryResults.Count 1 'harness: transient poll recovery returns one result'
     Assert-Equal ([string]$retryResults[0].Error) '' 'harness: transient poll recovery has no error'
     Assert-Equal $script:guestState['VM-retry'].StartProgramCallCount 2 'harness: transient poll recovery starts mkdir and the agent only once'
@@ -652,7 +660,7 @@ try {
     $selectionPath = Join-Path $workspace 'selection.json'
     '{"schemaVersion":"selection-v1","selectedUpdateKeys":["11111111-1111-1111-1111-111111111111|1"]}' | Set-Content -LiteralPath $selectionPath
     $cycleParams = @{
-        VMName = 'VM40'; Managers = (New-FakeManagers -VMName 'VM40'); GuestAuth = (New-GuestAuthentication -Credential $item.Credential)
+        VMName = 'VM40'; Servers = $harnessServerScope; Managers = (New-FakeManagers -VMName 'VM40'); GuestAuth = (New-GuestAuthentication -Credential $item.Credential)
         CurlPath = 'curl.exe'; AgentPath = $agentPath; IdentityHelperPath = $identityHelperPath
         GuestWorkingDirectory = $guestWorkingDirectory; VMOutputDirectory = (Join-Path $workspace 'VM40'); MaxUpdates = 1
         LocalSelectionPath = $selectionPath; SelectionPath = (Join-Path $guestWorkingDirectory 'selection.json')

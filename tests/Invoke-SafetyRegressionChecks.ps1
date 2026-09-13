@@ -66,30 +66,113 @@ Assert-Equal (Get-GuestOperationErrorKind -ErrorRecord ([pscustomobject]@{ Excep
 # Exercise the actual lookup against a fake inventory, including a full-name/short-name collision.
 & {
     function Get-VM {
-        param($Name)
+        param($Name, $Server, $ErrorAction)
+        # Inventory is only ever reachable through an explicit connection scope. A lookup that
+        # falls back to PowerCLI's global default session could pick a VM from a vCenter the
+        # operator never named, which is exactly the failure this scope exists to prevent.
+        if ($null -eq $Server -or @($Server).Count -eq 0) { throw 'Get-VM was called without a connection scope.' }
         @($inventory | Where-Object { $_.Name -eq $Name })
     }
+    $scopeServers = @('wanted-vc')
     $wrongVM = [pscustomobject]@{ Name = 'server'; ExtensionData = [pscustomobject]@{ Guest = [pscustomobject]@{ HostName = 'server.other.invalid' } } }
     $rightVM = [pscustomobject]@{ Name = 'server.target.invalid'; ExtensionData = [pscustomobject]@{ Guest = [pscustomobject]@{ HostName = 'server.target.invalid' } } }
     $inventory = @($wrongVM, $rightVM)
-    Assert-Equal (Get-ExactVM -Name 'server.target.invalid').Name 'server.target.invalid' 'full inventory name wins over an unrelated short name'
+    Assert-Equal (Get-ExactVM -Name 'server.target.invalid' -Servers $scopeServers).Name 'server.target.invalid' 'full inventory name wins over an unrelated short name'
 
     foreach ($guestName in @('server.other.invalid', '', 'server', 'SERVER.TARGET.INVALID.')) {
         $inventory = @([pscustomobject]@{ Name = 'server'; ExtensionData = [pscustomobject]@{ Guest = [pscustomobject]@{ HostName = $guestName } } })
         $accepted = $false
-        try { $null = Get-ExactVM -Name 'server.target.invalid'; $accepted = $true } catch { }
+        try { $null = Get-ExactVM -Name 'server.target.invalid' -Servers $scopeServers; $accepted = $true } catch { }
         Assert-Equal $accepted ($guestName -eq 'SERVER.TARGET.INVALID.') ('short-name fallback requires the requested guest FQDN: ' + $guestName)
     }
     $inventory = @([pscustomobject]@{ Name = 'server' })
     $accepted = $false
-    try { $null = Get-ExactVM -Name 'server.target.invalid'; $accepted = $true } catch { }
+    try { $null = Get-ExactVM -Name 'server.target.invalid' -Servers $scopeServers; $accepted = $true } catch { }
     Assert-Equal $accepted $false 'missing VMware Tools hostname cannot authorize an FQDN fallback'
-    Assert-Equal (Get-ExactVM -Name 'server').Name 'server' 'explicit bare inventory name remains supported'
+    Assert-Equal (Get-ExactVM -Name 'server' -Servers $scopeServers).Name 'server' 'explicit bare inventory name remains supported'
     foreach ($inventory in @(@($rightVM, $rightVM), @())) {
         $accepted = $false
-        try { $null = Get-ExactVM -Name 'server.target.invalid'; $accepted = $true } catch { }
+        try { $null = Get-ExactVM -Name 'server.target.invalid' -Servers $scopeServers; $accepted = $true } catch { }
         Assert-Equal $accepted $false 'ambiguous or missing inventory target is rejected'
     }
+}
+
+# --- vCenter scope for inventory lookups (task 1) -------------------------------------------
+& {
+    $script:getVMCalls = @()
+    function Get-VM {
+        param($Name, $Server, $ErrorAction)
+        if ($null -eq $Server -or @($Server).Count -eq 0) { throw 'Get-VM was called without a connection scope.' }
+        foreach ($serverName in @($Server)) { $script:getVMCalls += [string]$serverName }
+        $matched = @()
+        foreach ($serverName in @($Server)) {
+            foreach ($entry in @($inventoryByServer[[string]$serverName])) {
+                if ($entry.Name -eq $Name) { $matched += $entry }
+            }
+        }
+        return @($matched)
+    }
+
+    $wantedVM = [pscustomobject]@{ Name = 'scoped.target.invalid'; ExtensionData = [pscustomobject]@{ Guest = [pscustomobject]@{ HostName = 'scoped.target.invalid' } } }
+    $foreignVM = [pscustomobject]@{ Name = 'foreign.target.invalid'; ExtensionData = [pscustomobject]@{ Guest = [pscustomobject]@{ HostName = 'foreign.target.invalid' } } }
+    $inventoryByServer = @{ 'wanted-vc' = @($wantedVM); 'other-vc' = @($foreignVM) }
+
+    $script:getVMCalls = @()
+    Assert-Equal (Get-ExactVM -Name 'scoped.target.invalid' -Servers @('wanted-vc')).Name 'scoped.target.invalid' 'a target inside the requested scope resolves'
+    Assert-Equal (@($script:getVMCalls | Where-Object { $_ -eq 'other-vc' }).Count) 0 'a vCenter outside the requested scope is never queried'
+
+    $accepted = $false
+    try { $null = Get-ExactVM -Name 'foreign.target.invalid' -Servers @('wanted-vc'); $accepted = $true } catch { }
+    Assert-Equal $accepted $false 'a VM that exists only outside the requested scope is not resolved'
+
+    Assert-Equal (Get-ExactVM -Name 'foreign.target.invalid' -Servers @('wanted-vc', 'other-vc')).Name 'foreign.target.invalid' 'widening the scope to both vCenters resolves the second inventory'
+
+    # Multiple vs single connection scope must not change which VM wins.
+    $inventoryByServer = @{ 'wanted-vc' = @($wantedVM); 'other-vc' = @($wantedVM) }
+    $ambiguous = $false
+    try { $null = Get-ExactVM -Name 'scoped.target.invalid' -Servers @('wanted-vc', 'other-vc'); $ambiguous = $true } catch { }
+    Assert-Equal $ambiguous $false 'the same name in two in-scope vCenters is ambiguous, not first-wins'
+
+    # An empty or absent scope is a programming error, not a licence to search everything.
+    foreach ($emptyScope in @(@(), $null)) {
+        $scopeRejected = $false
+        try { $null = Get-ExactVM -Name 'scoped.target.invalid' -Servers $emptyScope } catch { $scopeRejected = $true }
+        Assert-Equal $scopeRejected $true 'an empty connection scope is refused'
+    }
+
+    # Wildcard metacharacters in a VM name are data, not a pattern.
+    foreach ($literalName in @('server[1]', 'server*literal', 'server?literal')) {
+        $literalVM = [pscustomobject]@{ Name = $literalName; ExtensionData = [pscustomobject]@{ Guest = [pscustomobject]@{ HostName = $literalName } } }
+        $decoyVM = [pscustomobject]@{ Name = 'server1'; ExtensionData = [pscustomobject]@{ Guest = [pscustomobject]@{ HostName = 'server1' } } }
+        $inventoryByServer = @{ 'wanted-vc' = @($literalVM, $decoyVM) }
+        $script:literalNameSeen = @()
+        function Get-VM {
+            param($Name, $Server, $ErrorAction)
+            if ($null -eq $Server -or @($Server).Count -eq 0) { throw 'Get-VM was called without a connection scope.' }
+            $script:literalNameSeen += [string]$Name
+            $pattern = [string]$Name
+            $matched = @()
+            foreach ($serverName in @($Server)) {
+                foreach ($entry in @($inventoryByServer[[string]$serverName])) {
+                    # A real Get-VM treats -Name as a wildcard pattern; the escaped form must
+                    # only ever match the one literal name the operator asked for.
+                    if ([System.Management.Automation.WildcardPattern]::new($pattern, 'IgnoreCase').IsMatch($entry.Name)) { $matched += $entry }
+                }
+            }
+            return @($matched)
+        }
+        Assert-Equal (Get-ExactVM -Name $literalName -Servers @('wanted-vc')).Name $literalName ('a wildcard metacharacter in a VM name stays literal: ' + $literalName)
+    }
+
+    # A failed query is not an empty inventory: it must never let a different VM be chosen.
+    function Get-VM {
+        param($Name, $Server, $ErrorAction)
+        if ($null -eq $Server -or @($Server).Count -eq 0) { throw 'Get-VM was called without a connection scope.' }
+        throw 'vCenter query failed'
+    }
+    $queryFailureAccepted = $false
+    try { $null = Get-ExactVM -Name 'scoped.target.invalid' -Servers @('wanted-vc'); $queryFailureAccepted = $true } catch { }
+    Assert-Equal $queryFailureAccepted $false 'a failed inventory query is an error, not an empty result'
 }
 
 # Load the real agent body and discovery adapter without running either script's entry point.
@@ -344,7 +427,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $plan = @([pscustomobject]@{ vmName = 'fixture-vm'; action = 'Install'; selectedUpdates = @([pscustomobject]@{ identityKey = '11111111-1111-1111-1111-111111111111|1' }) })
         $phaseDirectory = Join-Path $cycleDirectory 'apply'
         New-Item -ItemType Directory -Force -Path $phaseDirectory | Out-Null
-        $phaseResult = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $plan -Managers $null -GuestCredentialMap @{} -VIServers @() -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\unused' -TimeoutSeconds 1 -RebootTimeoutSeconds 1 -PollSeconds 1 -CycleOutputDirectory $phaseDirectory -ThrottleLimit 1 -RebootBatchSize 1 -DiscoveryRecords $discovery
+        $phaseResult = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $plan -Managers $null -GuestCredentialMap @{} -VIServers @() -VIServerScope @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\unused' -TimeoutSeconds 1 -RebootTimeoutSeconds 1 -PollSeconds 1 -CycleOutputDirectory $phaseDirectory -ThrottleLimit 1 -RebootBatchSize 1 -DiscoveryRecords $discovery
         Assert-Equal $script:rebootDispatchCount 0 'F2: a poll error never dispatches a reboot after operator approval'
         Assert-Equal $phaseResult.ExitCode 1 'F2: the poll error remains an unsuccessful apply run'
         Assert-Equal $phaseResult.ApplyResults[0].reason 'simulated poll error' 'F2: a timeout without payload preserves its original error'
@@ -375,7 +458,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $script:rebootDispatchCount = 0
         $permanentPhaseDirectory = Join-Path $cycleDirectory 'permanent-poll'
         New-Item -ItemType Directory -Force -Path $permanentPhaseDirectory | Out-Null
-        $permanentPhaseResult = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $plan -Managers $null -GuestCredentialMap @{} -VIServers @() -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\unused' -TimeoutSeconds 1 -RebootTimeoutSeconds 1 -PollSeconds 1 -CycleOutputDirectory $permanentPhaseDirectory -ThrottleLimit 1 -RebootBatchSize 1 -DiscoveryRecords @()
+        $permanentPhaseResult = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $plan -Managers $null -GuestCredentialMap @{} -VIServers @() -VIServerScope @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\unused' -TimeoutSeconds 1 -RebootTimeoutSeconds 1 -PollSeconds 1 -CycleOutputDirectory $permanentPhaseDirectory -ThrottleLimit 1 -RebootBatchSize 1 -DiscoveryRecords @()
         $permanentApplyResult = @($permanentPhaseResult.ApplyResults)[0]
         Assert-Equal $permanentPhaseResult.ExitCode 1 'F2: permanent poll error with a payload keeps the apply run unsuccessful'
         Assert-Equal $permanentApplyResult.outcome 'Failed' 'F2: permanent poll error cannot inherit InstallSucceeded from the payload'
@@ -408,7 +491,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         })
         $permanentDiscoveryDirectory = Join-Path $cycleDirectory 'permanent-discovery'
         New-Item -ItemType Directory -Force -Path $permanentDiscoveryDirectory | Out-Null
-        $permanentDiscoveryRecords = @(Invoke-DiscoveryPhase -TargetVMNames @('fixture-vm') -Managers $null -GuestCredentialMap @{} -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\unused' -MaxUpdates 1 -TimeoutSeconds 1 -PollSeconds 1 -CycleOutputDirectory $permanentDiscoveryDirectory -MaxInFlight 1)
+        $permanentDiscoveryRecords = @(Invoke-DiscoveryPhase -TargetVMNames @('fixture-vm') -VIServerScope @('vc.synthetic.invalid') -Managers $null -GuestCredentialMap @{} -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\unused' -MaxUpdates 1 -TimeoutSeconds 1 -PollSeconds 1 -CycleOutputDirectory $permanentDiscoveryDirectory -MaxInFlight 1)
         $permanentDiscoveryRecord = @($permanentDiscoveryRecords)[0]
         Assert-Equal $permanentDiscoveryRecord.outcome 'DiscoveryFailed' 'F2: permanent discovery poll error cannot inherit SearchOnly from the payload'
         Assert-Equal (@($permanentDiscoveryRecord.errors).Count -gt 0) $true 'F2: permanent discovery poll error remains in the final discovery record'
@@ -437,7 +520,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $timeoutDiscoveryRecords = $null
         $timeoutDiscoveryThrew = $false
         try {
-            $timeoutDiscoveryRecords = @(Invoke-DiscoveryPhase -TargetVMNames @('fixture-vm') -Managers $null -GuestCredentialMap @{} -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\unused' -MaxUpdates 1 -TimeoutSeconds 1 -PollSeconds 1 -CycleOutputDirectory $timeoutDiscoveryDirectory -MaxInFlight 1)
+            $timeoutDiscoveryRecords = @(Invoke-DiscoveryPhase -TargetVMNames @('fixture-vm') -VIServerScope @('vc.synthetic.invalid') -Managers $null -GuestCredentialMap @{} -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\unused' -MaxUpdates 1 -TimeoutSeconds 1 -PollSeconds 1 -CycleOutputDirectory $timeoutDiscoveryDirectory -MaxInFlight 1)
         }
         catch { $timeoutDiscoveryThrew = $true }
         Assert-Equal $timeoutDiscoveryThrew $false 'F2: timeout discovery without payload still returns a failure record'
@@ -551,7 +634,8 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $guestCredentialDecisionScript = $null
         $guestCredentialValidatedScript = $null
         $guestCredentialInteractive = $false
-        $resolvedVIServers = @()
+        $resolvedVIServers = @('vc.synthetic.invalid')
+        $viServerScope = @('vc.synthetic.invalid')
         $viserverCredentialMap = @{}
         $IgnoreVCenterCertificate = $false
         $guestOpsLibPath = 'unused'
@@ -629,7 +713,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
     $script:f5DiscoveryCall = 0
     $script:f5DiscoveryTargets = @()
 
-    function Get-ExactVM { param($Name) return [pscustomobject]@{ ExtensionData = [pscustomobject]@{} } }
+    function Get-ExactVM { param($Name, $Servers) if (@($Servers).Count -eq 0) { throw 'lookup without a connection scope' } return [pscustomobject]@{ ExtensionData = [pscustomobject]@{} } }
     function Assert-VMReadyForGuestOps { param($VM) }
     function Get-VMHostNameForTransfer { param($VMView) return 'esxi-f5.invalid' }
     function Invoke-Curl { param($CurlPath, $Arguments, $Description) }
@@ -656,7 +740,8 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         return [pscustomobject]@{ UserName = $Credential.UserName }
     }
     function Test-GuestCredentialForTarget {
-        param([string]$VMName, [pscredential]$Credential)
+        param([string]$VMName, [object[]]$VIServerScope, [pscredential]$Credential)
+        if (@($VIServerScope).Count -eq 0) { throw 'credential validation must scope its lookup' }
         if ($VMName -eq 'VM01') {
             return [pscustomobject]@{ Status = 'Invalid'; ErrorKind = 'InvalidGuestLogin'; Error = 'synthetic rejected local credential' }
         }
@@ -755,7 +840,8 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $SkipConfirmation = $true
         $PromptProvider = $null
         $managers = $null
-        $resolvedVIServers = @()
+        $resolvedVIServers = @('vc.synthetic.invalid')
+        $viServerScope = @('vc.synthetic.invalid')
         $viserverCredentialMap = @{}
         $IgnoreVCenterCertificate = $false
         $guestOpsLibPath = 'unused'
@@ -805,7 +891,8 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         return [pscustomobject]@{ UserName = $Credential.UserName }
     }
     function Test-GuestCredentialForTarget {
-        param([string]$VMName, [pscredential]$Credential)
+        param([string]$VMName, [object[]]$VIServerScope, [pscredential]$Credential)
+        if (@($VIServerScope).Count -eq 0) { throw 'credential validation must scope its lookup' }
         # ChildRejected and BootReadRejected both model a password rotated mid-run: still valid
         # when this phase checked it, refused by the guest moments later. ValidationUnavailable
         # models VMware Tools being down mid-reboot - an error, not a refusal, and the one the
@@ -815,11 +902,26 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         }
         return [pscustomobject]@{ Status = 'Valid'; ErrorKind = $null; Error = $null }
     }
+    # Reboot submission resolves the target in this process so the child job gets one vCenter
+    # and one managed object rather than the whole scope to search.
+    $script:f5SubmittedServers = @()
+    $script:f5SubmittedMoRefs = @()
+    function Get-ExactVM {
+        param($Name, $Servers)
+        if (@($Servers).Count -eq 0) { throw ('reboot submission must scope the lookup for {0}' -f $Name) }
+        return [pscustomobject]@{
+            Name = $Name
+            Uid = ('/VIServer=svc@{0}:443/VirtualMachine=vm-7/' -f (@($Servers)[0]))
+            ExtensionData = [pscustomobject]@{ MoRef = [pscustomobject]@{ Type = 'VirtualMachine'; Value = 'vm-7' } }
+        }
+    }
     function Get-GuestRebootJobScript { return { param($JobInput) $null = $JobInput } }
     function Invoke-ThrottledJobs {
         param($Items, $ThrottleLimit, $JobTimeoutSeconds, $ScriptBlock)
         $script:f5RebootJobCalls++
         $script:f5RebootCredentialUsers += @($Items | ForEach-Object { $_.GuestCredential.UserName })
+        $script:f5SubmittedServers += @($Items | ForEach-Object { @($_.VIServers) -join ',' })
+        $script:f5SubmittedMoRefs += @($Items | ForEach-Object { [string]$_.ExpectedMoRefIdentity })
         if ($script:f5RebootMode -eq 'Ambiguous') {
             return @($Items | ForEach-Object {
                     [pscustomobject]@{
@@ -856,7 +958,8 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
             })
     }
     function Invoke-VMGuestBootTimeRead {
-        param($VMName, $Managers, $GuestAuth, $CurlPath, $GuestWorkingDirectory, $BootTimeHelperPath, $TimeoutSeconds, $PollSeconds, [switch]$SkipHelperUpload)
+        param($VMName, [object[]]$Servers, $Managers, $GuestAuth, $CurlPath, $GuestWorkingDirectory, $BootTimeHelperPath, $TimeoutSeconds, $PollSeconds, [switch]$SkipHelperUpload)
+        if (@($Servers).Count -eq 0) { throw 'a boot-time read must scope its lookup' }
         $script:f5BootReadCalls++
         if ($script:f5RebootMode -eq 'BootReadRejected' -and $script:f5BootReadCalls -eq 1) {
             $invalidLogin = New-Object System.Exception('Synthetic InvalidGuestLogin during boot-time read.')
@@ -888,11 +991,15 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
     $script:f5GenericRebootPrompts = 0
     $childRejectedMap = @{ 'VM-reboot-recovery' = $oldCredential }
     $childRejectedContext = New-GuestCredentialContext -TargetNames @('VM-reboot-recovery') -CredentialMap $childRejectedMap
-    $childRejectedActions = @(Invoke-GuestRebootPhase -RebootTargets @($target) -GuestCredentialMap $childRejectedMap -VIServers @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 60 -PollSeconds 1 -RebootBatchSize 1 -CredentialContext $childRejectedContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $true)
+    $childRejectedActions = @(Invoke-GuestRebootPhase -RebootTargets @($target) -GuestCredentialMap $childRejectedMap -VIServers @('vc.synthetic.invalid') -VIServerScope @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 60 -PollSeconds 1 -RebootBatchSize 1 -CredentialContext $childRejectedContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $true)
     Assert-Equal -Actual $script:f5RebootJobCalls -Expected 2 -Message 'F5: an explicitly rejected reboot is submitted once more after credential recovery'
     Assert-Equal -Actual ($script:f5RebootCredentialUsers -join ';') -Expected 'OLD\adm;NEW\adm' -Message 'F5: retrying a rejected reboot uses the replacement credential'
     Assert-Equal -Actual $script:f5RecoveryPrompts -Expected 1 -Message 'F5: rejected reboot asks for one replacement credential'
     Assert-Equal -Actual $script:f5GenericRebootPrompts -Expected 0 -Message 'F5: credential recovery does not fall through to generic reboot prompting'
+    # Task 1: a reboot child logs in to the one vCenter that owns the VM, never the whole list,
+    # and carries the managed object the parent resolved so it cannot pick a namesake there.
+    Assert-Equal -Actual (($script:f5SubmittedServers | Sort-Object -Unique) -join ';') -Expected 'vc.synthetic.invalid' -Message 'F5: reboot submission names exactly the owning vCenter'
+    Assert-Equal -Actual (($script:f5SubmittedMoRefs | Sort-Object -Unique) -join ';') -Expected 'VirtualMachine:vm-7' -Message 'F5: reboot submission pins the managed object the parent resolved'
     Assert-Equal -Actual $childRejectedActions[0].validationStatus -Expected 'Confirmed' -Message 'F5: recovered reboot still waits for a newer boot time'
 
     $script:f5RebootMode = 'BootReadRejected'
@@ -903,7 +1010,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
     $script:f5GenericRebootPrompts = 0
     $bootReadMap = @{ 'VM-reboot-recovery' = $oldCredential }
     $bootReadContext = New-GuestCredentialContext -TargetNames @('VM-reboot-recovery') -CredentialMap $bootReadMap
-    $bootReadActions = @(Invoke-GuestRebootPhase -RebootTargets @($target) -GuestCredentialMap $bootReadMap -VIServers @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 60 -PollSeconds 1 -RebootBatchSize 1 -CredentialContext $bootReadContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $true)
+    $bootReadActions = @(Invoke-GuestRebootPhase -RebootTargets @($target) -GuestCredentialMap $bootReadMap -VIServers @('vc.synthetic.invalid') -VIServerScope @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 60 -PollSeconds 1 -RebootBatchSize 1 -CredentialContext $bootReadContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $true)
     Assert-Equal -Actual $script:f5RecoveryPrompts -Expected 1 -Message 'F5: InvalidGuestLogin during boot-time read asks for a replacement credential'
     Assert-Equal -Actual $script:f5RebootJobCalls -Expected 1 -Message 'F5: recovered boot-time read does not duplicate reboot submission'
     Assert-Equal -Actual $script:f5GenericRebootPrompts -Expected 0 -Message 'F5: recovered boot-time read does not reach a generic reboot prompt'
@@ -919,7 +1026,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
     $script:f5GenericRebootPrompts = 0
     $ambiguousMap = @{ 'VM-reboot-recovery' = $oldCredential }
     $ambiguousContext = New-GuestCredentialContext -TargetNames @('VM-reboot-recovery') -CredentialMap $ambiguousMap
-    $ambiguousActions = @(Invoke-GuestRebootPhase -RebootTargets @($target) -GuestCredentialMap $ambiguousMap -VIServers @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 60 -PollSeconds 1 -RebootBatchSize 1 -CredentialContext $ambiguousContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $true)
+    $ambiguousActions = @(Invoke-GuestRebootPhase -RebootTargets @($target) -GuestCredentialMap $ambiguousMap -VIServers @('vc.synthetic.invalid') -VIServerScope @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 60 -PollSeconds 1 -RebootBatchSize 1 -CredentialContext $ambiguousContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $true)
     Assert-Equal -Actual $script:f5RebootJobCalls -Expected 1 -Message 'F5: an ambiguous initiation error is never re-sent'
     Assert-Equal -Actual $script:f5RecoveryPrompts -Expected 0 -Message 'F5: an ambiguous initiation error asks for no replacement credential'
     Assert-Equal -Actual ($script:f5RebootCredentialUsers -join ';') -Expected 'OLD\adm' -Message 'F5: an ambiguous initiation error keeps the original credential'
@@ -940,7 +1047,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
     )
     $groupMap = @{ 'vm-a.corp.test' = $oldCredential; 'vm-b.corp.test' = $oldCredential }
     $groupContext = New-GuestCredentialContext -TargetNames @('vm-a.corp.test', 'vm-b.corp.test') -CredentialMap $groupMap
-    $groupActions = @(Invoke-GuestRebootPhase -RebootTargets $groupTargets -GuestCredentialMap $groupMap -VIServers @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 60 -PollSeconds 1 -RebootBatchSize 2 -CredentialContext $groupContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $true)
+    $groupActions = @(Invoke-GuestRebootPhase -RebootTargets $groupTargets -GuestCredentialMap $groupMap -VIServers @('vc.synthetic.invalid') -VIServerScope @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 60 -PollSeconds 1 -RebootBatchSize 2 -CredentialContext $groupContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $true)
     Assert-Equal -Actual $script:f5RecoveryPrompts -Expected 1 -Message 'F5: two guests sharing one account ask for one replacement credential'
     Assert-Equal -Actual (@($script:f5RebootCredentialUsers | Where-Object { $_ -eq 'NEW\adm' }).Count) -Expected 2 -Message 'F5: both guests in the account are re-sent with the replacement credential'
     Assert-Equal -Actual $script:f5GenericRebootPrompts -Expected 0 -Message 'F5: a shared-account recovery does not reach a generic reboot prompt'
@@ -962,7 +1069,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
     )
     $lockoutMap = @{ 'vm-c.corp.test' = $oldCredential; 'vm-d.corp.test' = $oldCredential }
     $lockoutContext = New-GuestCredentialContext -TargetNames @('vm-c.corp.test', 'vm-d.corp.test') -CredentialMap $lockoutMap
-    $lockoutActions = @(Invoke-GuestRebootPhase -RebootTargets $lockoutTargets -GuestCredentialMap $lockoutMap -VIServers @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 1 -PollSeconds 1 -RebootBatchSize 2 -CredentialContext $lockoutContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $false)
+    $lockoutActions = @(Invoke-GuestRebootPhase -RebootTargets $lockoutTargets -GuestCredentialMap $lockoutMap -VIServers @('vc.synthetic.invalid') -VIServerScope @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 1 -PollSeconds 1 -RebootBatchSize 2 -CredentialContext $lockoutContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $false)
     Assert-Equal -Actual $script:f5RecoveryPrompts -Expected 0 -Message 'F5: a non-interactive run never opens a credential dialog'
     Assert-Equal -Actual (@($script:f5RebootCredentialUsers | Where-Object { $_ -eq 'OLD\adm' }).Count) -Expected 2 -Message 'F5: a refused account is not re-submitted with the credential the guest already refused'
     Assert-Equal -Actual $script:f5RebootJobCalls -Expected 1 -Message 'F5: a refused account that cannot be recovered submits once'
@@ -979,7 +1086,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
     $script:f5GenericRebootPrompts = 0
     $unavailableMap = @{ 'VM-reboot-recovery' = $oldCredential }
     $unavailableContext = New-GuestCredentialContext -TargetNames @('VM-reboot-recovery') -CredentialMap $unavailableMap
-    $unavailableActions = @(Invoke-GuestRebootPhase -RebootTargets @($target) -GuestCredentialMap $unavailableMap -VIServers @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 1 -PollSeconds 1 -RebootBatchSize 1 -CredentialContext $unavailableContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $true)
+    $unavailableActions = @(Invoke-GuestRebootPhase -RebootTargets @($target) -GuestCredentialMap $unavailableMap -VIServers @('vc.synthetic.invalid') -VIServerScope @('vc.synthetic.invalid') -VIServerCredentialMap @{} -GuestOpsLibPath 'unused' -CurlPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -BootTimeHelperPath 'unused' -RebootTimeoutSeconds 1 -PollSeconds 1 -RebootBatchSize 1 -CredentialContext $unavailableContext -CredentialDecisionScript $recoveryDecision -CredentialInteractive $true)
     Assert-Equal -Actual $script:f5RecoveryPrompts -Expected 0 -Message 'F5: a validation error is never treated as a rejected credential'
     Assert-Equal -Actual $script:f5GenericRebootPrompts -Expected 1 -Message 'F5: a validation error still reaches the operator decision it can answer'
     Assert-Equal -Actual ($unavailableActions[0].validationStatus -eq 'CredentialRecovery') -Expected $false -Message 'F5: a validation error is not recorded as a credential refusal'
@@ -998,14 +1105,16 @@ function Connect-VIServersWithCredentialMap {
     if ($env:F5_JOB_MODE -eq 'ConnectFails') {
         throw (New-Object System.TimeoutException -ArgumentList 'synthetic vCenter login timeout')
     }
-    return [pscustomobject]@{ OpenedConnections = @() }
+    # Connections is the child's lookup scope; OpenedConnections is only what it may close.
+    return [pscustomobject]@{ Connections = @('vc.synthetic.invalid'); OpenedConnections = @() }
 }
 function New-GuestAuthentication {
     param([pscredential]$Credential)
     return [pscustomobject]@{ UserName = $Credential.UserName }
 }
 function Invoke-VMGuestReboot {
-    param([string]$VMName, $Managers, $GuestAuth)
+    param([string]$VMName, [object[]]$Servers, $Managers, $GuestAuth, [string]$ExpectedMoRefIdentity)
+    if (@($Servers).Count -eq 0) { throw 'the child job must hand its own connections to the lookup' }
     if ($env:F5_JOB_MODE -eq 'RebootPreflightFails') {
         # What Invoke-VMGuestReboot does for a Get-ExactVM/GetView failure: the guest was never
         # touched, so the caller must not spend a reboot timeout observing it.
@@ -1040,6 +1149,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         GuestCredential = $jobCredential
         IgnoreVCenterCertificate = $false
         GuestOpsLibPath = $jobLibPath
+        ExpectedMoRefIdentity = 'VirtualMachine:vm-4242'
     }
 
     try {
@@ -1131,7 +1241,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
     $script:f5StageCompletes = 0
     $script:f5StagePrompts = 0
 
-    function Get-ExactVM { param($Name) return [pscustomobject]@{ ExtensionData = [pscustomobject]@{} } }
+    function Get-ExactVM { param($Name, $Servers) if (@($Servers).Count -eq 0) { throw 'lookup without a connection scope' } return [pscustomobject]@{ ExtensionData = [pscustomobject]@{} } }
     function Assert-VMReadyForGuestOps { param($VM) }
     function Get-VMHostNameForTransfer { param($VMView) return 'esxi-stage.invalid' }
     function Invoke-Curl { param($CurlPath, $Arguments, $Description) }
@@ -1147,7 +1257,8 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         return [pscustomobject]@{ UserName = $Credential.UserName }
     }
     function Test-GuestCredentialForTarget {
-        param([string]$VMName, [pscredential]$Credential)
+        param([string]$VMName, [object[]]$VIServerScope, [pscredential]$Credential)
+        if (@($VIServerScope).Count -eq 0) { throw 'credential validation must scope its lookup' }
         # The password rotated mid-run, so it still validates; only the guest operation refuses
         # it. That is the case requirement 3 names, and the only one where the stage matters.
         return [pscustomobject]@{ Status = 'Valid'; ErrorKind = $null; Error = $null }

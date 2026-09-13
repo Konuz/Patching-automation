@@ -870,6 +870,26 @@ function Test-GuiForbiddenLauncherParameter {
 # The rule therefore covers the whole tail of the script from the resume branch onwards, which is
 # what the text needle it replaces reached, and not just the resume branch itself: the round loop
 # below it leaves via `break` and is exactly where a `return` would be written by mistake.
+# A VM lookup without an explicit connection scope silently falls back to PowerCLI's global
+# default sessions, so it can return a VM from a vCenter this run never named - and that VM is
+# then patched or rebooted. The scope is what makes the target set match the operator's list.
+# Returns 'ok' or the first unscoped call site.
+function Test-VMLookupsAreScoped {
+    param($Ast)
+
+    foreach ($call in @(Get-CommandAstsByName -Ast $Ast -Name 'Get-ExactVM')) {
+        if (Test-CommandAstSplats -CommandAst $call) {
+            continue
+        }
+
+        if (-not (Test-CommandAstHasParameter -CommandAst $call -ParameterName 'Servers')) {
+            return ('line {0}: Get-ExactVM without -Servers' -f $call.Extent.StartLineNumber)
+        }
+    }
+
+    return 'ok'
+}
+
 function Test-ScriptTailHasReturn {
     param($Ast)
 
@@ -974,6 +994,17 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     $finalReportVerdict = Test-FinalReportContract -Ast $orchestratorAstForChecks
     if ($finalReportVerdict -ne 'ok') {
         $failures += ('{0}: the Write-FinalReport contract is not met ({1})' -f $orchestratorPath, $finalReportVerdict)
+    }
+}
+
+foreach ($scopedLookupPath in @($orchestratorPath, $guestOpsLibPath)) {
+    if (-not $existingScripts.ContainsKey($scopedLookupPath)) {
+        continue
+    }
+
+    $scopedLookupVerdict = Test-VMLookupsAreScoped -Ast (Get-ScriptAst -RelativePath $scopedLookupPath -Path $existingScripts[$scopedLookupPath])
+    if ($scopedLookupVerdict -ne 'ok') {
+        $failures += ('{0}: every VM lookup must name the vCenter connections of this run ({1})' -f $scopedLookupPath, $scopedLookupVerdict)
     }
 }
 
@@ -1094,6 +1125,39 @@ $exitRule = {
     param($Ast)
     return (Test-ScriptExitsWithComputedCode -Ast $Ast)
 }
+
+# The scoped-lookup rule, probed the same way: a call with the scope passes, one without fails,
+# an abbreviation still counts, and a splat is left to the runtime gates rather than guessed at.
+$scopedLookupRule = {
+    param($Ast)
+    return (Test-VMLookupsAreScoped -Ast $Ast)
+}
+
+$scopedLookupOkSource = @'
+$vm = Get-ExactVM -Name $VMName -Servers $VIServerScope
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $scopedLookupOkSource -Rule $scopedLookupRule) -Expected 'ok' -Message 'a scoped lookup satisfies the scoped-lookup rule'
+
+$scopedLookupAbbreviatedSource = @'
+$vm = Get-ExactVM -Name $VMName -Server $VIServerScope
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $scopedLookupAbbreviatedSource -Rule $scopedLookupRule) -Expected 'ok' -Message 'an abbreviated -Server still satisfies the scoped-lookup rule'
+
+$scopedLookupSplatSource = @'
+$vm = Get-ExactVM @lookupParams
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $scopedLookupSplatSource -Rule $scopedLookupRule) -Expected 'ok' -Message 'a splatted lookup is left to the runtime gates'
+
+$scopedLookupViolationSource = @'
+$vm = Get-ExactVM -Name $VMName
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $scopedLookupViolationSource -Rule $scopedLookupRule) -Expected 'line 1: Get-ExactVM without -Servers' -Message 'an unscoped lookup trips the scoped-lookup rule'
+
+$scopedLookupCommentSource = @'
+# Get-ExactVM -Name $VMName
+$vm = Get-ExactVM -Name $VMName -Servers $VIServerScope
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $scopedLookupCommentSource -Rule $scopedLookupRule) -Expected 'ok' -Message 'an unscoped lookup in a comment does not trip the scoped-lookup rule'
 
 $exitSource = @'
 $scriptExitCode = 1

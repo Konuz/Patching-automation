@@ -71,7 +71,7 @@ try {
             $fixture.Status = [pscustomobject]@{ runId = $runId; outcome = 'SearchOnly'; finishedAt = $case.FinishedAt; updates = @(); errors = @() }
             $payload = Complete-VMAgentCycle -Handle $handle -AgentResult $case.Process 3>$null
             $fixture.FleetResult = [pscustomobject]@{ VMName = 'fixture-vm'; Sequence = 1; Payload = $payload; ResultKind = $case.ResultKind; Error = $case.Error }
-            $records = @(Invoke-DiscoveryPhase -TargetVMNames @('fixture-vm') -CycleOutputDirectory $testDirectory -MaxInFlight 1 -TimeoutSeconds 1 -PollSeconds 1 3>$null)
+            $records = @(Invoke-DiscoveryPhase -TargetVMNames @('fixture-vm') -VIServerScope @('vc.audit.invalid') -CycleOutputDirectory $testDirectory -MaxInFlight 1 -TimeoutSeconds 1 -PollSeconds 1 3>$null)
             $states = @(Get-VMPatchCompletionStates -DiscoveryRecords $records -UpdateGroups @())
             Assert-Equal $states[0].state $case.ExpectedState ('N4: ' + $case.Name)
             $saved = Get-Content -LiteralPath (Join-Path $testDirectory 'discovery.json') -Raw | ConvertFrom-Json
@@ -108,7 +108,8 @@ try {
     & {
         $fixture = @{ Calls = @(); Events = @(); FailHost = 'esxi-b.invalid' }
         function Get-ExactVM {
-            param($Name)
+            param($Name, $Servers)
+            if (@($Servers).Count -eq 0) { throw ('Get-ExactVM was called without a connection scope for {0}.' -f $Name) }
             if ($Name -eq 'missing-vm') { throw 'synthetic VM not found' }
             $hostName = if ($Name -like 'vm-b*') { 'esxi-b.invalid' } else { 'esxi-a.invalid' }
             return [pscustomobject]@{ ExtensionData = [pscustomobject]@{ HostName = $hostName } }
@@ -140,7 +141,7 @@ try {
         $probeError = ''
         $results = @()
         try {
-            $results = @(Invoke-GuestAgentFleet -FleetItems $items -GuestCredentialMap $credentials -CurlPath 'unused' -TimeoutSeconds 30 -PollSeconds 1 -MaxInFlight 4)
+            $results = @(Invoke-GuestAgentFleet -FleetItems $items -VIServerScope @('vc.audit.invalid') -GuestCredentialMap $credentials -CurlPath 'unused' -TimeoutSeconds 30 -PollSeconds 1 -MaxInFlight 4)
         }
         catch { $probeError = $_.Exception.Message }
         Assert-Equal $probeError '' 'N3: one untrusted ESXi does not abort the phase'
@@ -152,7 +153,7 @@ try {
         Assert-Equal $fixture.Calls.Count 2 'N3: each unique ESXi is checked once, a failing one included'
 
         $fixture.Calls = @(); $fixture.Events = @(); $fixture.FailHost = ''
-        $results = @(Invoke-GuestAgentFleet -FleetItems $items -GuestCredentialMap $credentials -CurlPath 'unused' -TimeoutSeconds 30 -PollSeconds 1 -MaxInFlight 4)
+        $results = @(Invoke-GuestAgentFleet -FleetItems $items -VIServerScope @('vc.audit.invalid') -GuestCredentialMap $credentials -CurlPath 'unused' -TimeoutSeconds 30 -PollSeconds 1 -MaxInFlight 4)
         Assert-Equal ($fixture.Events -join ',') 'probe,probe,start:vm-a1,start:vm-b1,start:vm-a2,start:vm-b2' 'N3: all endpoint checks finish before guest work; shared hosts are deduplicated'
         Assert-Equal @($results | Where-Object { $_.VMName -eq 'missing-vm' -and $_.ResultKind -eq 'StartError' }).Count 1 'N3: an inventory failure remains isolated to its VM'
         Assert-Equal @($results | Where-Object { [string]::IsNullOrWhiteSpace([string]$_.Error) }).Count 4 'N3: valid peers still complete when one VM cannot be resolved'
@@ -179,7 +180,7 @@ try {
         }
         $results = @(); $probeError = ''
         try {
-            $results = @(Invoke-GuestAgentFleet -FleetItems $credentialItems -CredentialContext $context -CurlPath 'unused' -TimeoutSeconds 30 -PollSeconds 1 -MaxInFlight 4)
+            $results = @(Invoke-GuestAgentFleet -FleetItems $credentialItems -VIServerScope @('vc.audit.invalid') -CredentialContext $context -CurlPath 'unused' -TimeoutSeconds 30 -PollSeconds 1 -MaxInFlight 4)
         }
         catch { $probeError = $_.Exception.Message }
         Assert-Equal $probeError '' 'N3: an already skipped account does not surface as a phase error'
@@ -190,7 +191,7 @@ try {
         $context.Aborted = $true
         $fixture.Calls = @(); $fixture.Events = @(); $probeError = ''
         try {
-            $results = @(Invoke-GuestAgentFleet -FleetItems $credentialItems -CredentialContext $context -CurlPath 'unused' -TimeoutSeconds 30 -PollSeconds 1 -MaxInFlight 4)
+            $results = @(Invoke-GuestAgentFleet -FleetItems $credentialItems -VIServerScope @('vc.audit.invalid') -CredentialContext $context -CurlPath 'unused' -TimeoutSeconds 30 -PollSeconds 1 -MaxInFlight 4)
         }
         catch { $probeError = $_.Exception.Message }
         Assert-Equal $probeError '' 'N3: an aborted credential context does not contact ESXi'

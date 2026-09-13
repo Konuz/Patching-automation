@@ -115,6 +115,20 @@ oznacza plik w **bieżącym katalogu** — zwykle katalog repo, obok `Start-Patc
 
 Wpisy listy to **FQDN-y** (np. `vm1.contoso.com`). Sufiks po pierwszej kropce wyznacza domenę — skrypt pyta o poświadczenia gościa **raz na domenę** (grupując maszyny po sufiksie). Wpis bez kropki (np. `oldbox`) to maszyna **lokalna** — pytana osobno, jedna na maszynę. Nazwę w vCenter skrypt rozwiązuje najpierw po pełnym FQDN. Gdy takiego wpisu nie ma, dopuszcza krótką nazwę (część przed pierwszą kropką) tylko wtedy, gdy VMware Tools potwierdza żądany FQDN gościa. Brak tej informacji, niezgodność domeny lub niejednoznaczna nazwa blokują operację. Kontrola obowiązuje przy skanowaniu, instalacji i restarcie. Parametr `-GuestCredential` wymusza jedno poświadczenie dla **wszystkich** VM (tryb nieinteraktywny / pojedyncza domena).
 
+**Zakres inwentarza.** Każde wyszukanie maszyny jest ograniczone do połączeń vCenter tego
+przebiegu (`-VIServer`). Bez takiego ograniczenia PowerCLI odpowiada z globalnych sesji
+domyślnych, więc maszyna istniejąca w vCenter, którego operator nie wskazał, mogłaby zostać
+przeskanowana, załatana i zrestartowana. Pusty zakres jest błędem, nie zgodą na szukanie
+wszędzie. Nazwa maszyny jest traktowana **literalnie** — `server[1]`, `server*cos` czy
+`server?cos` nie są wzorcami. Błąd zapytania do vCenter (zerwana sesja, timeout, odrzucone
+logowanie) nie jest pustym wynikiem: przerywa operację, zamiast pozwolić wybrać inną maszynę.
+
+Restart jest jedyną fazą uruchamianą w procesie potomnym. Proces nadrzędny rozwiązuje cel we
+własnej sesji i przekazuje dziecku **tylko** właściwy vCenter oraz tożsamość obiektu
+zarządzanego (MoRef); dziecko loguje się do tego jednego vCenter, ponownie rozwiązuje nazwę i
+odmawia działania, jeśli MoRef się nie zgadza. Gdy właściciela nie da się ustalić, maszyna jest
+raportowana jako nieudane zlecenie restartu (nic nie zostało wysłane).
+
 ---
 
 ## Workflow administratora

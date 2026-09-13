@@ -124,7 +124,7 @@ $roundLoop = $ast.Find({ param($n) $n -is [System.Management.Automation.Language
     $guestCredentialValidatedScript = $null; $guestCredentialInteractive = $false
     $runOutputDirectory = Join-Path $repoRoot 'out'; $MaxPatchRounds = 3; $SearchOnly = $false; $PlanOnly = $false
     $hasExplicitSelectedUpdateKeys = $false; $SkipConfirmation = $false; $PromptProvider = $null
-    $managers = $null; $guestCredentialMap = @{}; $resolvedVIServers = @(); $viserverCredentialMap = @{}
+    $managers = $null; $guestCredentialMap = @{}; $resolvedVIServers = @('vc.regression.invalid'); $viServerScope = @('vc.regression.invalid'); $viserverCredentialMap = @{}
     $IgnoreVCenterCertificate = $false; $guestOpsLibPath = ''; $curlPath = ''; $AgentPath = ''; $identityHelperPath = ''
     $GuestWorkingDirectory = ''; $TimeoutMinutes = 1; $RebootTimeoutMinutes = 1; $PollSeconds = 1; $ThrottleLimit = 1
     $resolvedRebootBatchSize = 1; $MaxUpdates = 1
@@ -163,7 +163,7 @@ foreach ($planOnlyCase in @($false, $true)) {
         $guestCredentialValidatedScript = $null; $guestCredentialInteractive = $false
         $runOutputDirectory = $planRoot; $MaxPatchRounds = 1; $SearchOnly = $false; $PlanOnly = $planOnlyCase
         $hasExplicitSelectedUpdateKeys = $false; $SkipConfirmation = $true; $PromptProvider = $null
-        $managers = $null; $guestCredentialMap = @{}; $resolvedVIServers = @(); $viserverCredentialMap = @{}
+        $managers = $null; $guestCredentialMap = @{}; $resolvedVIServers = @('vc.regression.invalid'); $viServerScope = @('vc.regression.invalid'); $viserverCredentialMap = @{}
         $IgnoreVCenterCertificate = $false; $guestOpsLibPath = ''; $curlPath = ''; $AgentPath = ''; $identityHelperPath = ''
         $GuestWorkingDirectory = ''; $TimeoutMinutes = 1; $RebootTimeoutMinutes = 1; $PollSeconds = 1; $ThrottleLimit = 1
         $resolvedRebootBatchSize = 1; $MaxUpdates = 1

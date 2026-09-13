@@ -171,11 +171,12 @@ function Get-GuestOperationFailureMetadata {
 function Test-GuestCredentialForTarget {
     param(
         [string]$VMName,
+        [object[]]$VIServerScope,
         [pscredential]$Credential
     )
 
     try {
-        $vm = Get-ExactVM -Name $VMName
+        $vm = Get-ExactVM -Name $VMName -Servers $VIServerScope
         Assert-VMReadyForGuestOps -VM $vm
         $managers = Get-GuestOpsManagers -VMView $vm.ExtensionData
         return Test-GuestCredential -VMView $vm.ExtensionData -Managers $managers -Credential $Credential
@@ -192,6 +193,7 @@ function Test-GuestCredentialForTarget {
 function Invoke-GuestOperationWithCredentialRecovery {
     param(
         [string]$VMName,
+        [object[]]$VIServerScope,
         [hashtable]$CredentialContext,
         [scriptblock]$CredentialDecisionScript,
         [scriptblock]$CredentialValidatedScript,
@@ -204,7 +206,7 @@ function Invoke-GuestOperationWithCredentialRecovery {
     while ($true) {
         $resolution = Resolve-GuestCredentialForTarget -VMName $VMName -Context $CredentialContext -ValidateScript {
             param($TargetName, $Credential)
-            return Test-GuestCredentialForTarget -VMName $TargetName -Credential $Credential
+            return Test-GuestCredentialForTarget -VMName $TargetName -VIServerScope $VIServerScope -Credential $Credential
         } -DecisionScript $CredentialDecisionScript -OnValidatedScript $CredentialValidatedScript -ForcePrompt:$forcePrompt -Interactive:$CredentialInteractive
 
         if ($resolution.Status -ne 'Ready') {
@@ -253,6 +255,7 @@ function New-AgentFleetItem {
 function Invoke-GuestAgentFleet {
     param(
         [object[]]$FleetItems,
+        [object[]]$VIServerScope,
         $Managers,
         $GuestCredentialMap,
         [string]$CurlPath,
@@ -282,9 +285,9 @@ function Invoke-GuestAgentFleet {
             # Resolve skipped/aborted accounts first, so their host is never probed for nothing.
             # Successful validation is cached; the start still uses normal credential recovery.
             if ($credentialRecoveryEnabled) {
-                $null = Invoke-GuestOperationWithCredentialRecovery -VMName $item.VMName -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive -OperationScript { param($ItemAuth) }
+                $null = Invoke-GuestOperationWithCredentialRecovery -VMName $item.VMName -VIServerScope $VIServerScope -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive -OperationScript { param($ItemAuth) }
             }
-            $vm = Get-ExactVM -Name $item.VMName
+            $vm = Get-ExactVM -Name $item.VMName -Servers $VIServerScope
             Assert-VMReadyForGuestOps -VM $vm
             $hostName = Get-VMHostNameForTransfer -VMView $vm.ExtensionData
 
@@ -315,12 +318,12 @@ function Invoke-GuestAgentFleet {
             param($Item)
             if (-not $credentialRecoveryEnabled) {
                 $itemAuth = New-GuestAuthentication -Credential $GuestCredentialMap[[string]$Item.VMName]
-                return Start-VMAgentCycle -VMName $Item.VMName -Managers $null -GuestAuth $itemAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $Item.VMOutputDirectory -MaxUpdates $Item.MaxUpdates -LocalSelectionPath $Item.LocalSelectionPath -SearchOnly:([bool]$Item.SearchOnly)
+                return Start-VMAgentCycle -VMName $Item.VMName -Servers $VIServerScope -Managers $null -GuestAuth $itemAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $Item.VMOutputDirectory -MaxUpdates $Item.MaxUpdates -LocalSelectionPath $Item.LocalSelectionPath -SearchOnly:([bool]$Item.SearchOnly)
             }
 
-            return Invoke-GuestOperationWithCredentialRecovery -VMName $Item.VMName -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive -OperationScript {
+            return Invoke-GuestOperationWithCredentialRecovery -VMName $Item.VMName -VIServerScope $VIServerScope -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive -OperationScript {
                 param($ItemAuth)
-                return Start-VMAgentCycle -VMName $Item.VMName -Managers $null -GuestAuth $ItemAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $Item.VMOutputDirectory -MaxUpdates $Item.MaxUpdates -LocalSelectionPath $Item.LocalSelectionPath -SearchOnly:([bool]$Item.SearchOnly)
+                return Start-VMAgentCycle -VMName $Item.VMName -Servers $VIServerScope -Managers $null -GuestAuth $ItemAuth -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -VMOutputDirectory $Item.VMOutputDirectory -MaxUpdates $Item.MaxUpdates -LocalSelectionPath $Item.LocalSelectionPath -SearchOnly:([bool]$Item.SearchOnly)
             }
         } `
         -PollScript {
@@ -335,7 +338,7 @@ function Invoke-GuestAgentFleet {
                 return ($null -ne $agentResult)
             }
 
-            return Invoke-GuestOperationWithCredentialRecovery -VMName $Handle.VMName -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive -Handle $Handle -OperationScript {
+            return Invoke-GuestOperationWithCredentialRecovery -VMName $Handle.VMName -VIServerScope $VIServerScope -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive -Handle $Handle -OperationScript {
                 param($ItemAuth)
                 $agentResult = Test-VMAgentCycleComplete -Handle $Handle
                 $Handle.AgentResult = $agentResult
@@ -351,7 +354,7 @@ function Invoke-GuestAgentFleet {
                 return Complete-VMAgentCycle -Handle $Handle -AgentResult $Handle.AgentResult
             }
 
-            return Invoke-GuestOperationWithCredentialRecovery -VMName $Handle.VMName -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive -Handle $Handle -OperationScript {
+            return Invoke-GuestOperationWithCredentialRecovery -VMName $Handle.VMName -VIServerScope $VIServerScope -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive -Handle $Handle -OperationScript {
                 param($ItemAuth)
                 return Complete-VMAgentCycle -Handle $Handle -AgentResult $Handle.AgentResult
             }
@@ -389,11 +392,16 @@ function Get-GuestRebootJobScript {
 
             # A child job starts cold, so there is never a session to reuse here; everything
             # it opens is its own to disconnect.
-            $connections = @((Connect-VIServersWithCredentialMap -VIServers @($JobInput.VIServers) -CredentialMap $JobInput.VIServerCredentialMap).OpenedConnections)
+            # Connections, not OpenedConnections: the scope this child may search is every
+            # session it holds for the one vCenter the parent named, and there is no fallback
+            # to PowerCLI's global default sessions.
+            $connectResult = Connect-VIServersWithCredentialMap -VIServers @($JobInput.VIServers) -CredentialMap $JobInput.VIServerCredentialMap
+            $connections = @($connectResult.OpenedConnections)
+            $jobScope = @($connectResult.Connections)
             $managers = $null
             $guestAuth = New-GuestAuthentication -Credential $JobInput.GuestCredential
             $rebootAttempted = $true
-            $rebootResult = Invoke-VMGuestReboot -VMName $JobInput.VMName -Managers $managers -GuestAuth $guestAuth
+            $rebootResult = Invoke-VMGuestReboot -VMName $JobInput.VMName -Servers $jobScope -Managers $managers -GuestAuth $guestAuth -ExpectedMoRefIdentity ([string](Get-ObjectPropertyValue -InputObject $JobInput -Path @('ExpectedMoRefIdentity')))
 
             return [pscustomobject]@{
                 Sequence = $JobInput.Sequence
@@ -881,6 +889,7 @@ function New-DiscoveryRecordFromAgentRun {
 function Invoke-ApplyPhase {
     param(
         $PatchPlanRecords,
+        [object[]]$VIServerScope,
         $Managers,
         $GuestCredentialMap,
         [string]$CurlPath,
@@ -960,7 +969,7 @@ function Invoke-ApplyPhase {
 
     if ($fleetItems.Count -gt 0) {
         Write-Step -Message ('Apply running with up to {0} VM(s) in flight.' -f $MaxInFlight)
-        $fleetResults = @(Invoke-GuestAgentFleet -FleetItems $fleetItems -Managers $Managers -GuestCredentialMap $GuestCredentialMap -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -MaxInFlight $MaxInFlight -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive)
+        $fleetResults = @(Invoke-GuestAgentFleet -FleetItems $fleetItems -VIServerScope $VIServerScope -Managers $Managers -GuestCredentialMap $GuestCredentialMap -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -MaxInFlight $MaxInFlight -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive)
 
         $doneCount = 0
         foreach ($fleetResult in @($fleetResults | Sort-Object Sequence)) {
@@ -1073,6 +1082,7 @@ function Invoke-GuestRebootPhase {
         $RebootTargets,
         $GuestCredentialMap,
         [string[]]$VIServers,
+        [object[]]$VIServerScope,
         [hashtable]$VIServerCredentialMap,
         [switch]$IgnoreVCenterCertificate,
         [string]$GuestOpsLibPath,
@@ -1120,14 +1130,14 @@ function Invoke-GuestRebootPhase {
             $timeoutSeconds = if ($null -eq $item.ReadTimeoutSeconds) { 120 } else { [int][math]::Max(1, [math]::Min(120, $item.ReadTimeoutSeconds)) }
             try {
                 if ($credentialRecoveryEnabled) {
-                    $bootTime = Invoke-GuestOperationWithCredentialRecovery -VMName $vmName -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive -OperationScript {
+                    $bootTime = Invoke-GuestOperationWithCredentialRecovery -VMName $vmName -VIServerScope $VIServerScope -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive -OperationScript {
                         param($ReadAuth)
-                        return Invoke-VMGuestBootTimeRead -VMName $vmName -Managers $null -GuestAuth $ReadAuth -CurlPath $CurlPath -GuestWorkingDirectory $GuestWorkingDirectory -BootTimeHelperPath $BootTimeHelperPath -TimeoutSeconds $timeoutSeconds -PollSeconds $PollSeconds -SkipHelperUpload:([bool]$helperUploadedByVm[$vmName])
+                        return Invoke-VMGuestBootTimeRead -VMName $vmName -Servers $VIServerScope -Managers $null -GuestAuth $ReadAuth -CurlPath $CurlPath -GuestWorkingDirectory $GuestWorkingDirectory -BootTimeHelperPath $BootTimeHelperPath -TimeoutSeconds $timeoutSeconds -PollSeconds $PollSeconds -SkipHelperUpload:([bool]$helperUploadedByVm[$vmName])
                     }
                 }
                 else {
                     $guestAuth = New-GuestAuthentication -Credential $GuestCredentialMap[$vmName]
-                    $bootTime = Invoke-VMGuestBootTimeRead -VMName $vmName -Managers $null -GuestAuth $guestAuth -CurlPath $CurlPath -GuestWorkingDirectory $GuestWorkingDirectory -BootTimeHelperPath $BootTimeHelperPath -TimeoutSeconds $timeoutSeconds -PollSeconds $PollSeconds -SkipHelperUpload:([bool]$helperUploadedByVm[$vmName])
+                    $bootTime = Invoke-VMGuestBootTimeRead -VMName $vmName -Servers $VIServerScope -Managers $null -GuestAuth $guestAuth -CurlPath $CurlPath -GuestWorkingDirectory $GuestWorkingDirectory -BootTimeHelperPath $BootTimeHelperPath -TimeoutSeconds $timeoutSeconds -PollSeconds $PollSeconds -SkipHelperUpload:([bool]$helperUploadedByVm[$vmName])
                 }
                 $helperUploadedByVm[$vmName] = $true
                 $results += [pscustomobject]@{
@@ -1165,21 +1175,52 @@ function Invoke-GuestRebootPhase {
     $submitRebootJobs = {
         param($SubmitItems, $CredentialOverrides)
         $jobInputs = @()
+        $resolutionFailures = @()
         foreach ($item in @($SubmitItems)) {
             $submitName = [string]$item.VMName
             $submitCredential = if ($null -ne $CredentialOverrides -and $CredentialOverrides.ContainsKey($submitName)) { $CredentialOverrides[$submitName] } else { $GuestCredentialMap[$submitName] }
+
+            # Resolve the target here, in the session this run already holds, so the child gets
+            # one vCenter name and one managed object instead of the whole scope to search. A
+            # child that logged in to every vCenter could reboot a same-named VM elsewhere.
+            $submitServer = $null
+            $submitMoRef = $null
+            try {
+                $submitVM = Get-ExactVM -Name $submitName -Servers $VIServerScope
+                $submitServer = Get-VMOwningServerName -VM $submitVM -Servers $VIServerScope
+                $submitMoRef = Get-VMMoRefIdentity -VM $submitVM
+                if ([string]::IsNullOrWhiteSpace([string]$submitServer)) {
+                    throw ('Unable to tell which vCenter owns VM {0}; refusing to reboot it through an unconfirmed session.' -f $submitName)
+                }
+            }
+            catch {
+                # Nothing reached the guest, so this is unambiguously a failed initiation.
+                $resolutionFailures += [pscustomobject]@{
+                    Sequence = $item.Sequence
+                    VMName = $item.VMName
+                    RebootReason = $item.RebootReason
+                    ProcessId = $null
+                    Error = $_.Exception.Message
+                    ErrorKind = 'Permanent'
+                    RejectedBeforeStart = $true
+                }
+                continue
+            }
+
             $jobInputs += [pscustomobject]@{
                 Sequence = $item.Sequence
                 VMName = $item.VMName
                 RebootReason = $item.RebootReason
-                VIServers = @($VIServers)
+                VIServers = @($submitServer)
+                ExpectedMoRefIdentity = $submitMoRef
                 VIServerCredentialMap = $VIServerCredentialMap
                 GuestCredential = $submitCredential
                 IgnoreVCenterCertificate = [bool]$IgnoreVCenterCertificate
                 GuestOpsLibPath = $GuestOpsLibPath
             }
         }
-        return @(Invoke-ThrottledJobs -Items $jobInputs -ThrottleLimit $RebootBatchSize -JobTimeoutSeconds 300 -ScriptBlock $restartJobScript)
+        $jobResults = if ($jobInputs.Count -gt 0) { @(Invoke-ThrottledJobs -Items $jobInputs -ThrottleLimit $RebootBatchSize -JobTimeoutSeconds 300 -ScriptBlock $restartJobScript) } else { @() }
+        return @($resolutionFailures) + @($jobResults)
     }
 
     $initiateRebootScript = {
@@ -1238,7 +1279,7 @@ function Invoke-GuestRebootPhase {
             $promptedAccountKeys[$retryAccountKey] = $true
             $resolution = Resolve-GuestCredentialForTarget -VMName $retryName -Context $CredentialContext -ValidateScript {
                 param($TargetName, $Credential)
-                return Test-GuestCredentialForTarget -VMName $TargetName -Credential $Credential
+                return Test-GuestCredentialForTarget -VMName $TargetName -VIServerScope $VIServerScope -Credential $Credential
             } -DecisionScript $CredentialDecisionScript -OnValidatedScript $CredentialValidatedScript -ForcePrompt:$forceAccountPrompt -Interactive:$CredentialInteractive
 
             # Validation succeeding is not permission to re-send. ValidateCredentialsInGuest and
@@ -1378,6 +1419,7 @@ function Invoke-ApplyAndOptionalReboot {
         $Managers,
         $GuestCredentialMap,
         [string[]]$VIServers,
+        [object[]]$VIServerScope,
         [hashtable]$VIServerCredentialMap,
         [switch]$IgnoreVCenterCertificate,
         [string]$GuestOpsLibPath,
@@ -1398,7 +1440,7 @@ function Invoke-ApplyAndOptionalReboot {
         [bool]$CredentialInteractive = $false
     )
 
-    $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $PatchPlanRecords -Managers $Managers -GuestCredentialMap $GuestCredentialMap -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -CycleOutputDirectory $CycleOutputDirectory -MaxInFlight $ThrottleLimit -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive)
+    $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $PatchPlanRecords -VIServerScope $VIServerScope -Managers $Managers -GuestCredentialMap $GuestCredentialMap -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -CycleOutputDirectory $CycleOutputDirectory -MaxInFlight $ThrottleLimit -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive)
     Write-PatchingSummary -ApplyResults $applyResults
 
     $rebootActions = @()
@@ -1414,7 +1456,7 @@ function Invoke-ApplyAndOptionalReboot {
                 $resolvedRebootBatchSize = Read-RebootBatchSize -TargetCount $rebootTargets.Count
             }
 
-            $rebootActions = @(Invoke-GuestRebootPhase -RebootTargets $rebootTargets -GuestCredentialMap $GuestCredentialMap -VIServers $VIServers -VIServerCredentialMap $VIServerCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $GuestOpsLibPath -CurlPath $CurlPath -GuestWorkingDirectory $GuestWorkingDirectory -RebootTimeoutSeconds $RebootTimeoutSeconds -PollSeconds $PollSeconds -RebootBatchSize $resolvedRebootBatchSize -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive)
+            $rebootActions = @(Invoke-GuestRebootPhase -RebootTargets $rebootTargets -GuestCredentialMap $GuestCredentialMap -VIServers $VIServers -VIServerScope $VIServerScope -VIServerCredentialMap $VIServerCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $GuestOpsLibPath -CurlPath $CurlPath -GuestWorkingDirectory $GuestWorkingDirectory -RebootTimeoutSeconds $RebootTimeoutSeconds -PollSeconds $PollSeconds -RebootBatchSize $resolvedRebootBatchSize -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive)
         }
         else {
             Write-Warning 'Guest reboot was not approved. Reboot phase skipped.'
@@ -1484,6 +1526,7 @@ function Resolve-GuestCredentialMap {
 function Invoke-DiscoveryPhase {
     param(
         [string[]]$TargetVMNames,
+        [object[]]$VIServerScope,
         $Managers,
         $GuestCredentialMap,
         [string]$CurlPath,
@@ -1517,7 +1560,7 @@ function Invoke-DiscoveryPhase {
 
     if ($fleetItems.Count -gt 0) {
         Write-Host ('Discovery running with up to {0} VM(s) in flight.' -f $MaxInFlight)
-        $fleetResults = @(Invoke-GuestAgentFleet -FleetItems $fleetItems -Managers $Managers -GuestCredentialMap $GuestCredentialMap -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -MaxInFlight $MaxInFlight -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive)
+        $fleetResults = @(Invoke-GuestAgentFleet -FleetItems $fleetItems -VIServerScope $VIServerScope -Managers $Managers -GuestCredentialMap $GuestCredentialMap -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -MaxInFlight $MaxInFlight -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive)
 
         $doneCount = 0
         foreach ($fleetResult in @($fleetResults | Sort-Object Sequence)) {
@@ -1714,6 +1757,13 @@ try {
     # survive this one.
     $connectResult = Connect-VIServersWithCredentialMap -VIServers $resolvedVIServers -CredentialMap $viserverCredentialMap -CredentialPromptScript $credentialPromptScript -RetryOnFailure:$retryVIServerLogin -ReuseExisting -CredentialRecoveryScript $viserverRecoveryScript -CredentialValidatedScript $viserverValidatedScript
     $connections = @($connectResult.OpenedConnections)
+    # Every inventory lookup in this run is scoped to these connections - Connections, not
+    # OpenedConnections, because a reused session is just as much in scope as one we opened;
+    # OpenedConnections only answers "what may this run tear down".
+    $viServerScope = @($connectResult.Connections)
+    if ($viServerScope.Count -eq 0) {
+        throw 'No vCenter connection is available for this run.'
+    }
 
     $managers = $null
 
@@ -1746,7 +1796,7 @@ try {
             # from, the saved keys carry a RevisionNumber that will not match a later round's
             # groups, and resume is typically run non-interactively with -SkipConfirmation,
             # where a round-two group selection prompt would simply hang.
-            $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive
+            $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerScope $viServerScope -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive
             $scriptExitCode = $applyOutcome.ExitCode
         }
 
@@ -1780,7 +1830,7 @@ try {
         New-Item -ItemType Directory -Force -Path $roundOutputDirectory | Out-Null
 
         Write-Step -Message ('Patch round {0} over {1} VM(s).' -f $roundNumber, @($roundTargetVMNames).Count)
-        $discoveryRecords = Invoke-DiscoveryPhase -TargetVMNames $roundTargetVMNames -Managers $managers -GuestCredentialMap $guestCredentialMap -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -MaxInFlight $ThrottleLimit -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive
+        $discoveryRecords = Invoke-DiscoveryPhase -TargetVMNames $roundTargetVMNames -VIServerScope $viServerScope -Managers $managers -GuestCredentialMap $guestCredentialMap -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -MaxInFlight $ThrottleLimit -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive
         $failedDiscoveryRecords = @($discoveryRecords | Where-Object { @($_.errors).Count -gt 0 })
 
         $updateGroups = @(New-UpdateGroupRecords -DiscoveryRecords $discoveryRecords | Sort-Object kbText,title)
@@ -1913,7 +1963,7 @@ try {
         $completionStates = @(Get-VMPatchCompletionStates -DiscoveryRecords $discoveryRecords -UpdateGroups $updateGroups -DeselectedUpdateKeys $deselectedUpdateKeys)
         Merge-PatchRunStates -StateMap $finalStateMap -CompletionStates $completionStates
 
-        $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -DiscoveryRecords $discoveryRecords -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive
+        $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerScope $viServerScope -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -DiscoveryRecords $discoveryRecords -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive
         if ($applyOutcome.ExitCode -ne 0) {
             $sawApplyFailure = $true
         }

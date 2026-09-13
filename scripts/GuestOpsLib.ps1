@@ -28,10 +28,37 @@ function Get-VMLookupCandidates {
 }
 
 function Get-ExactVM {
-    param([string]$Name)
+    param(
+        [string]$Name,
+        # The connection scope of this run. Without it Get-VM falls back to PowerCLI's global
+        # default sessions, so a VM present in a vCenter the operator never named could be
+        # patched or rebooted. An empty scope is a programming error, not "search everything".
+        [object[]]$Servers
+    )
+
+    $scopedServers = @(@($Servers) | Where-Object { $null -ne $_ -and -not ([string]::IsNullOrWhiteSpace([string]$_)) })
+    if ($scopedServers.Count -eq 0) {
+        throw ('A vCenter connection scope is required to resolve VM {0}.' -f $Name)
+    }
 
     foreach ($candidate in @(Get-VMLookupCandidates -Name $Name)) {
-        $exactMatches = @(Get-VM -Name $candidate -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $candidate })
+        # PowerCLI reads -Name as a wildcard pattern, so a VM literally named "server[1]" would
+        # never match itself and "server*" would match unrelated guests. Escaping keeps the
+        # exact comparison below - not the pattern - as the thing that decides.
+        $pattern = [System.Management.Automation.WildcardPattern]::Escape($candidate)
+        $exactMatches = @()
+        try {
+            $exactMatches = @(Get-VM -Name $pattern -Server $scopedServers -ErrorAction Stop | Where-Object { $_.Name -eq $candidate })
+        }
+        catch {
+            # "No such VM here" is the one error that may be read as an empty inventory, and
+            # only for this candidate. Anything else - a dropped session, a timeout, a refused
+            # login - must not become an empty result that lets a different VM be chosen.
+            if ([string](Get-ObjectPropertyValue -InputObject $_ -Path @('CategoryInfo', 'Category')) -ne 'ObjectNotFound') {
+                throw
+            }
+        }
+
         if ($exactMatches.Count -gt 1) {
             throw ('More than one VM matched exact name: {0}' -f $candidate)
         }
@@ -50,6 +77,89 @@ function Get-ExactVM {
     }
 
     throw ('VM not found: {0}' -f $Name)
+}
+
+function Get-VMOwningServerName {
+    param(
+        $VM,
+        [object[]]$Servers
+    )
+
+    $scopedServers = @(@($Servers) | Where-Object { $null -ne $_ -and -not ([string]::IsNullOrWhiteSpace([string]$_)) })
+
+    # Two independent readings of "which vCenter is this object from", because either can be
+    # absent depending on how the VM object was produced. The service URL is the authoritative
+    # one; the Uid is what PowerCLI stamps on every object it returns.
+    $candidateHosts = @()
+    $serviceUrl = [string](Get-ObjectPropertyValue -InputObject $VM -Path @('ExtensionData', 'Client', 'ServiceUrl'))
+    if (-not [string]::IsNullOrWhiteSpace($serviceUrl)) {
+        try { $candidateHosts += [string]([uri]$serviceUrl).Host } catch { }
+    }
+    # Regex.Match rather than -match: the static gate forbids even reading $matches, because
+    # the automatic variable is too easy to shadow by accident elsewhere.
+    $uid = [string](Get-ObjectPropertyValue -InputObject $VM -Path @('Uid'))
+    $uidMatch = [System.Text.RegularExpressions.Regex]::Match($uid, '@([^:/@]+?)(?::\d+)?/')
+    if ($uidMatch.Success) {
+        $candidateHosts += [string]$uidMatch.Groups[1].Value
+    }
+
+    foreach ($candidateHost in $candidateHosts) {
+        foreach ($serverName in $scopedServers) {
+            $scopedName = ([string]$serverName).Trim()
+            if ([string]::Equals($scopedName, $candidateHost, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $scopedName
+            }
+        }
+    }
+
+    # A single-vCenter scope leaves nothing to be ambiguous about: the lookup could not have
+    # reached anywhere else. With several in scope, refusing to guess is the safe answer - the
+    # caller turns it into a per-VM failure rather than widening the scope back out.
+    if ($scopedServers.Count -eq 1) {
+        return ([string]$scopedServers[0]).Trim()
+    }
+
+    return $null
+}
+
+function Get-VMMoRefIdentity {
+    param($VM)
+
+    $moRef = Get-ObjectPropertyValue -InputObject $VM -Path @('ExtensionData', 'MoRef')
+    if ($null -eq $moRef) {
+        return $null
+    }
+
+    $moRefType = [string](Get-ObjectPropertyValue -InputObject $moRef -Path @('Type'))
+    $moRefValue = [string](Get-ObjectPropertyValue -InputObject $moRef -Path @('Value'))
+    if ([string]::IsNullOrWhiteSpace($moRefType) -or [string]::IsNullOrWhiteSpace($moRefValue)) {
+        return $null
+    }
+
+    return ('{0}:{1}' -f $moRefType, $moRefValue)
+}
+
+function Assert-VMMatchesExpectedMoRef {
+    param(
+        $VM,
+        [string]$ExpectedMoRefIdentity,
+        [string]$VMName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ExpectedMoRefIdentity)) {
+        return
+    }
+
+    # A child process re-resolves the name against its own session, so this is what keeps it on
+    # the object the parent picked instead of a same-named VM somewhere else in that inventory.
+    $actual = [string](Get-VMMoRefIdentity -VM $VM)
+    if ([string]::IsNullOrWhiteSpace($actual)) {
+        throw ('VM {0} could not be confirmed against the expected managed object {1}.' -f $VMName, $ExpectedMoRefIdentity)
+    }
+
+    if (-not [string]::Equals($actual, $ExpectedMoRefIdentity, [System.StringComparison]::Ordinal)) {
+        throw ('VM {0} resolved to managed object {1}, not the expected {2}.' -f $VMName, $actual, $ExpectedMoRefIdentity)
+    }
 }
 
 function Assert-VMReadyForGuestOps {
@@ -789,6 +899,7 @@ function New-VMAgentCycleHandle {
 function Start-VMAgentCycle {
     param(
         [string]$VMName,
+        [object[]]$Servers,
         $Managers,
         $GuestAuth,
         [string]$CurlPath,
@@ -804,7 +915,7 @@ function Start-VMAgentCycle {
         [int]$TransferTimeoutSeconds = 300
     )
 
-    $vm = Get-ExactVM -Name $VMName
+    $vm = Get-ExactVM -Name $VMName -Servers $Servers
     Assert-VMReadyForGuestOps -VM $vm
 
     $vmView = $vm.ExtensionData
@@ -1262,8 +1373,10 @@ function Complete-VMAgentCycle {
 function Invoke-VMGuestReboot {
     param(
         [string]$VMName,
+        [object[]]$Servers,
         $Managers,
-        $GuestAuth
+        $GuestAuth,
+        [string]$ExpectedMoRefIdentity
     )
 
     Write-Step -Message ('Resolving VM {0} for guest reboot.' -f $VMName)
@@ -1271,7 +1384,8 @@ function Invoke-VMGuestReboot {
     # failure before it is unambiguously "never sent". Saying so spares the caller a full
     # reboot-timeout wait observing a guest that was never told to restart.
     try {
-        $vm = Get-ExactVM -Name $VMName
+        $vm = Get-ExactVM -Name $VMName -Servers $Servers
+        Assert-VMMatchesExpectedMoRef -VM $vm -ExpectedMoRefIdentity $ExpectedMoRefIdentity -VMName $VMName
         Assert-VMReadyForGuestOps -VM $vm
 
         $vmView = $vm.ExtensionData
@@ -1323,6 +1437,7 @@ function Start-GuestBootTimeQuery {
 function Invoke-VMGuestBootTimeRead {
     param(
         [string]$VMName,
+        [object[]]$Servers,
         $Managers,
         $GuestAuth,
         [string]$CurlPath,
@@ -1333,7 +1448,7 @@ function Invoke-VMGuestBootTimeRead {
         [switch]$SkipHelperUpload
     )
 
-    $vm = Get-ExactVM -Name $VMName
+    $vm = Get-ExactVM -Name $VMName -Servers $Servers
     Assert-VMReadyForGuestOps -VM $vm
 
     $vmView = $vm.ExtensionData
