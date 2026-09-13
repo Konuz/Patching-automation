@@ -14,6 +14,7 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'scripts/GuestOpsLib.ps1')
 . (Join-Path $repoRoot 'guest/GuestWorkspace.ps1')
+. (Join-Path $repoRoot 'guest/GuestRunGuard.ps1')
 
 $failures = @()
 $skipped = @()
@@ -233,6 +234,254 @@ Assert-Contains $fileScopedDecoded ([System.Convert]::ToBase64String([System.Tex
     finally {
         Remove-Item -LiteralPath $outputDirectory -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+
+# --- one run per guest, with two real processes ---------------------------------------------------
+# Not "FileShare::None appears in the source": two actual PowerShell processes, different run ids
+# and different working directories, against one coordination directory. Two WUA sessions
+# installing on one guest corrupt each other's work, so this is the property that matters.
+
+& {
+    $guardRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-guard-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Force -Path $guardRoot
+    try {
+        $guardScriptPath = Join-Path $repoRoot 'guest/GuestRunGuard.ps1'
+        $workspaceScriptPathForGuard = Join-Path $repoRoot 'guest/GuestWorkspace.ps1'
+
+        # The coordination directory resolver is the ONE thing a test may replace, and only to
+        # keep these processes out of the real C:\ProgramData\PatchingGuestOps\.coordination.
+        # Nothing in the product configures it.
+        $driverBody = @'
+param([string]$RepoRoot, [string]$CoordinationDirectory, [string]$RunId, [string]$Mode, [string]$SignalPath, [string]$ReleasePath)
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+. (Join-Path $RepoRoot 'guest/GuestWorkspace.ps1')
+. (Join-Path $RepoRoot 'guest/GuestRunGuard.ps1')
+function Get-GuestRunGuardDirectory { return $CoordinationDirectory }
+# Windows security descriptors are not available everywhere these tests run, so the directory is
+# taken as given here; the descriptor rules have their own section.
+function Initialize-GuestWorkspace {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { $null = New-Item -ItemType Directory -Force -Path $Path }
+    return [pscustomobject]@{ Status = 'Ok'; Reason = $null; Path = $Path }
+}
+$guard = Enter-GuestRunGuard -RunId $RunId -Phase 'Agent'
+$payload = [ordered]@{ acquired = [bool]$guard.Acquired; conflict = [bool]$guard.Conflict; reason = [string]$guard.Reason }
+$payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $SignalPath -Encoding UTF8
+if (-not $guard.Acquired) { exit 20 }
+switch ($Mode) {
+    'HoldUntilReleased' {
+        # Hold the lock until the test says otherwise, then finish properly.
+        $deadline = (Get-Date).AddSeconds(60)
+        while (-not (Test-Path -LiteralPath $ReleasePath) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+        $null = Set-GuestRunGuardCompleted -Guard $guard -Outcome 'InstallSucceeded'
+        Exit-GuestRunGuard -Guard $guard
+        exit 0
+    }
+    'CrashWhileHolding' {
+        # Exactly what a killed agent leaves behind: the handle is released by the OS, but no
+        # completion was ever recorded.
+        exit 99
+    }
+    'CompleteImmediately' {
+        $null = Set-GuestRunGuardCompleted -Guard $guard -Outcome 'SearchOnly'
+        Exit-GuestRunGuard -Guard $guard
+        exit 0
+    }
+    'RequestReboot' {
+        $null = Set-GuestRunGuardRebootRequested -Guard $guard
+        Exit-GuestRunGuard -Guard $guard
+        exit 0
+    }
+}
+exit 0
+'@
+        $driverPath = Join-Path $guardRoot 'guard-driver.ps1'
+        Set-Content -LiteralPath $driverPath -Value $driverBody -Encoding UTF8
+
+        # The host this gate is already running in. On Windows PowerShell 5.1 that is
+        # powershell.exe; elsewhere it is whatever launched this file. Either way the two
+        # children are real, separate processes, which is the point of this section.
+        $powershellPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+
+        $startGuardProcess = {
+            param($CoordinationDirectory, $RunId, $Mode, $SignalPath, $ReleasePath)
+            $arguments = @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $driverPath,
+                '-RepoRoot', $repoRoot, '-CoordinationDirectory', $CoordinationDirectory,
+                '-RunId', $RunId, '-Mode', $Mode, '-SignalPath', $SignalPath, '-ReleasePath', $ReleasePath
+            )
+            return (Start-Process -FilePath $powershellPath -ArgumentList $arguments -PassThru)
+        }
+
+        $waitForSignal = {
+            param($SignalPath)
+            $deadline = (Get-Date).AddSeconds(60)
+            while (-not (Test-Path -LiteralPath $SignalPath) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
+            if (-not (Test-Path -LiteralPath $SignalPath)) { return $null }
+            # The file is written in one shot, but a reader can still arrive between create and
+            # write, so an empty read is retried rather than treated as a malformed answer.
+            for ($attempt = 0; $attempt -lt 100; $attempt++) {
+                $raw = [string](Get-Content -LiteralPath $SignalPath -Raw -ErrorAction SilentlyContinue)
+                if (-not [string]::IsNullOrWhiteSpace($raw)) { return ($raw | ConvertFrom-Json) }
+                Start-Sleep -Milliseconds 100
+            }
+            return $null
+        }
+
+        # 1. The same guest, two runs, two different run ids and working directories: the second
+        #    must not be able to start WUA work.
+        $sharedCoordination = Join-Path $guardRoot 'shared'
+        $firstSignal = Join-Path $guardRoot 'first.json'
+        $releaseFlag = Join-Path $guardRoot 'release.flag'
+        $firstProcess = & $startGuardProcess $sharedCoordination 'run-one' 'HoldUntilReleased' $firstSignal $releaseFlag
+        $firstAnswer = & $waitForSignal $firstSignal
+        Assert-Equal ($null -ne $firstAnswer) $true 'the first run reports whether it took the guard'
+        if ($null -ne $firstAnswer) {
+            Assert-Equal ([bool]$firstAnswer.acquired) $true 'the first run takes the guard'
+        }
+
+        $secondSignal = Join-Path $guardRoot 'second.json'
+        $secondProcess = & $startGuardProcess $sharedCoordination 'run-two' 'CompleteImmediately' $secondSignal (Join-Path $guardRoot 'unused.flag')
+        $secondAnswer = & $waitForSignal $secondSignal
+        Assert-Equal ($null -ne $secondAnswer) $true 'the second run reports its verdict'
+        if ($null -ne $secondAnswer) {
+            Assert-Equal ([bool]$secondAnswer.acquired) $false 'a second run on the same guest cannot take the guard'
+            Assert-Equal ([bool]$secondAnswer.conflict) $true 'a busy guest is a conflict, not a transient error'
+            # The reason matters, not just the refusal: it has to be the open handle that stopped
+            # the second run. Reading the first run's "Running" record would refuse it too, but
+            # only after the lock had already let both processes into the WUA session.
+            Assert-Contains ([string]$secondAnswer.reason) 'holds the guest run guard' 'the second run is stopped by the lock itself, not by reading the record afterwards'
+        }
+        $null = $secondProcess.WaitForExit(60000)
+        Assert-Equal $secondProcess.ExitCode 20 'the refused run exits with the conflict code'
+
+        # Releasing the first run properly leaves the guest available again: an existing lock file
+        # from a finished run must not block the next one.
+        Set-Content -LiteralPath $releaseFlag -Value 'go' -Encoding UTF8
+        $null = $firstProcess.WaitForExit(60000)
+        Assert-Equal $firstProcess.ExitCode 0 'the holding run finishes normally'
+
+        $thirdSignal = Join-Path $guardRoot 'third.json'
+        $thirdProcess = & $startGuardProcess $sharedCoordination 'run-three' 'CompleteImmediately' $thirdSignal (Join-Path $guardRoot 'unused.flag')
+        $thirdAnswer = & $waitForSignal $thirdSignal
+        if ($null -ne $thirdAnswer) {
+            Assert-Equal ([bool]$thirdAnswer.acquired) $true 'a properly finished run does not block the next one'
+        }
+        $null = $thirdProcess.WaitForExit(60000)
+
+        # 2. A different guest is a different coordination directory, so it runs independently.
+        $otherCoordination = Join-Path $guardRoot 'other-guest'
+        $heldSignal = Join-Path $guardRoot 'held.json'
+        $heldRelease = Join-Path $guardRoot 'held-release.flag'
+        $heldProcess = & $startGuardProcess $sharedCoordination 'run-hold' 'HoldUntilReleased' $heldSignal $heldRelease
+        $null = & $waitForSignal $heldSignal
+        $otherSignal = Join-Path $guardRoot 'other.json'
+        $otherProcess = & $startGuardProcess $otherCoordination 'run-other' 'CompleteImmediately' $otherSignal (Join-Path $guardRoot 'unused.flag')
+        $otherAnswer = & $waitForSignal $otherSignal
+        if ($null -ne $otherAnswer) {
+            Assert-Equal ([bool]$otherAnswer.acquired) $true 'another guest is not blocked by this one'
+        }
+        $null = $otherProcess.WaitForExit(60000)
+        Set-Content -LiteralPath $heldRelease -Value 'go' -Encoding UTF8
+        $null = $heldProcess.WaitForExit(60000)
+
+        # 3. A crashed run releases its handle but never recorded completion. The next run must
+        #    refuse: the operating system releasing a file handle says nothing about whether a
+        #    WUA install finished.
+        $crashCoordination = Join-Path $guardRoot 'crashed'
+        $crashSignal = Join-Path $guardRoot 'crash.json'
+        $crashProcess = & $startGuardProcess $crashCoordination 'run-crash' 'CrashWhileHolding' $crashSignal (Join-Path $guardRoot 'unused.flag')
+        $null = & $waitForSignal $crashSignal
+        $null = $crashProcess.WaitForExit(60000)
+
+        $afterCrashSignal = Join-Path $guardRoot 'after-crash.json'
+        $afterCrashProcess = & $startGuardProcess $crashCoordination 'run-after-crash' 'CompleteImmediately' $afterCrashSignal (Join-Path $guardRoot 'unused.flag')
+        $afterCrashAnswer = & $waitForSignal $afterCrashSignal
+        Assert-Equal ($null -ne $afterCrashAnswer) $true 'the run after a crash reports its verdict'
+        if ($null -ne $afterCrashAnswer) {
+            Assert-Equal ([bool]$afterCrashAnswer.acquired) $false 'a run that never reported completion blocks the next one'
+            Assert-Equal ([bool]$afterCrashAnswer.conflict) $true 'an unreconciled trace is a conflict'
+            Assert-Contains ([string]$afterCrashAnswer.reason) 'never reported completion' 'the conflict says what is unreconciled'
+            Assert-Contains ([string]$afterCrashAnswer.reason) 'by hand' 'the conflict points at the manual reconciliation'
+        }
+        $null = $afterCrashProcess.WaitForExit(60000)
+
+        # 4. A requested reboot that was never confirmed by a newer boot time also blocks the next
+        #    agent - and it is not cleared by the requesting process exiting.
+        $rebootCoordination = Join-Path $guardRoot 'rebooted'
+        $rebootSignal = Join-Path $guardRoot 'reboot.json'
+        $rebootProcess = & $startGuardProcess $rebootCoordination 'run-reboot' 'RequestReboot' $rebootSignal (Join-Path $guardRoot 'unused.flag')
+        $null = & $waitForSignal $rebootSignal
+        $null = $rebootProcess.WaitForExit(60000)
+
+        $afterRebootSignal = Join-Path $guardRoot 'after-reboot.json'
+        $afterRebootProcess = & $startGuardProcess $rebootCoordination 'run-after-reboot' 'CompleteImmediately' $afterRebootSignal (Join-Path $guardRoot 'unused.flag')
+        $afterRebootAnswer = & $waitForSignal $afterRebootSignal
+        if ($null -ne $afterRebootAnswer) {
+            Assert-Equal ([bool]$afterRebootAnswer.acquired) $false 'an unconfirmed pending reboot blocks the next agent'
+            Assert-Contains ([string]$afterRebootAnswer.reason) 'not been confirmed by a newer boot time' 'the pending reboot says what would reconcile it'
+        }
+        $null = $afterRebootProcess.WaitForExit(60000)
+
+        # The coordination file is never deleted: it is the shared record for this guest, and
+        # throwing it away would lose the only trace of an unfinished run.
+        Assert-Equal (Test-Path -LiteralPath (Join-Path $crashCoordination 'guest-run.lock')) $true 'the coordination record survives a refused acquisition'
+    }
+    finally {
+        if ($guardRoot -like '*guestops-guard-*') {
+            Remove-Item -LiteralPath $guardRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# --- reconciliation is boot-time evidence, nothing else ------------------------------------------
+
+& {
+    $recordedBootTime = [datetime]::Parse('2026-09-13T10:00:00Z').ToUniversalTime()
+    $pendingState = [pscustomobject]@{ status = 'RebootRequested'; runId = 'run-x'; bootTimeUtc = $recordedBootTime.ToString('o') }
+
+    function Get-GuestRunGuardBootTimeUtc { return $recordedBootTime }
+    Assert-Equal (Test-GuestRunGuardRebootConfirmed -PreviousState $pendingState) $false 'the same boot time does not confirm a reboot'
+    Assert-Equal ($null -ne (Get-GuestRunGuardConflictReason -PreviousState $pendingState)) $true 'an unconfirmed reboot remains a conflict'
+
+    function Get-GuestRunGuardBootTimeUtc { return $recordedBootTime.AddMinutes(-5) }
+    Assert-Equal (Test-GuestRunGuardRebootConfirmed -PreviousState $pendingState) $false 'a boot time that moved backwards does not confirm a reboot'
+
+    function Get-GuestRunGuardBootTimeUtc { return $null }
+    Assert-Equal (Test-GuestRunGuardRebootConfirmed -PreviousState $pendingState) $false 'an unreadable boot time never confirms a reboot'
+
+    function Get-GuestRunGuardBootTimeUtc { return $recordedBootTime.AddMinutes(5) }
+    Assert-Equal (Test-GuestRunGuardRebootConfirmed -PreviousState $pendingState) $true 'a strictly newer boot time confirms the reboot'
+    Assert-Equal (Get-GuestRunGuardConflictReason -PreviousState $pendingState) $null 'a confirmed reboot clears the way for the next run'
+
+    # Every other recorded state, including one this tool does not know.
+    Assert-Equal (Get-GuestRunGuardConflictReason -PreviousState $null) $null 'a guest with no record is available'
+    Assert-Equal (Get-GuestRunGuardConflictReason -PreviousState ([pscustomobject]@{ status = 'Completed'; runId = 'run-y' })) $null 'a completed run leaves the guest available'
+    Assert-Contains (Get-GuestRunGuardConflictReason -PreviousState ([pscustomobject]@{ status = 'Running'; runId = 'run-z' })) 'never reported completion' 'a run still marked running is a conflict'
+    Assert-Contains (Get-GuestRunGuardConflictReason -PreviousState 'unreadable') 'cannot interpret' 'an unreadable record is a conflict'
+    Assert-Contains (Get-GuestRunGuardConflictReason -PreviousState ([pscustomobject]@{ status = 'Whatever'; runId = 'run-w' })) 'does not recognise' 'an unknown recorded status is a conflict, not a pass'
+}
+
+# --- the coordination directory is never a cleanup target ----------------------------------------
+# Cleanup deletes a cycle directory recursively, so the one thing it must never reach is the
+# shared coordination record.
+
+& {
+    $handle = [pscustomobject]@{
+        GuestWorkingDirectory = 'C:\ProgramData\PatchingGuestOps'
+        GuestCycleDirectory = 'C:\ProgramData\PatchingGuestOps\.coordination'
+        RunId = '.coordination'
+    }
+    $verdict = Test-GuestCycleDirectoryRemovable -Handle $handle
+    Assert-Equal $verdict.Removable $false 'the coordination directory is never removable as a cycle directory'
+
+    $guidHandle = [pscustomobject]@{
+        GuestWorkingDirectory = 'C:\ProgramData\PatchingGuestOps'
+        GuestCycleDirectory = 'C:\ProgramData\PatchingGuestOps\0123456789abcdef0123456789abcdef'
+        RunId = '0123456789abcdef0123456789abcdef'
+    }
+    Assert-Equal (Test-GuestCycleDirectoryRemovable -Handle $guidHandle).Removable $true 'a real cycle directory is still removable'
 }
 
 # --- the rules themselves, against real security descriptors --------------------------------------

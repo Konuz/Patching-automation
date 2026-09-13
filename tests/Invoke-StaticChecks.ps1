@@ -215,6 +215,8 @@ $agentPath = 'guest\Run-LocalPatch.ps1'
 $identityHelperPath = 'guest\UpdateIdentity.ps1'
 $bootTimeHelperPath = 'guest\Read-BootTime.ps1'
 $workspaceHelperPath = 'guest\GuestWorkspace.ps1'
+$runGuardHelperPath = 'guest\GuestRunGuard.ps1'
+$rebootRequestHelperPath = 'guest\Request-GuestReboot.ps1'
 $orchestratorPath = 'scripts\Invoke-GuestOpsPatchValidation.ps1'
 $runtimeHelperPath = 'scripts\OrchestratorRuntime.ps1'
 $guestOpsLibPath = 'scripts\GuestOpsLib.ps1'
@@ -230,7 +232,7 @@ $guiPromptsPath = 'scripts\GuiPrompts.ps1'
 $guiLauncherPath = 'Start-PatchingGuestOpsGui.ps1'
 
 $existingScripts = @{}
-foreach ($relativePath in @($agentPath, $identityHelperPath, $bootTimeHelperPath, $workspaceHelperPath, $orchestratorPath, $runtimeHelperPath, $guestOpsLibPath, $vmTargetLibPath, $launcherPath, $modelPath, $modelTestPath, $runtimeTestPath, $harnessTestPath, $workspaceTestPath)) {
+foreach ($relativePath in @($agentPath, $identityHelperPath, $bootTimeHelperPath, $workspaceHelperPath, $runGuardHelperPath, $rebootRequestHelperPath, $orchestratorPath, $runtimeHelperPath, $guestOpsLibPath, $vmTargetLibPath, $launcherPath, $modelPath, $modelTestPath, $runtimeTestPath, $harnessTestPath, $workspaceTestPath)) {
     $path = Assert-FileExists -RelativePath $relativePath
     if ($path) {
         $existingScripts[$relativePath] = $path
@@ -302,6 +304,39 @@ if ($existingScripts.ContainsKey($workspaceHelperPath)) {
     Assert-TextDoesNotMatch -RelativePath $workspaceHelperPath -Text $workspaceHelperText -Pattern '(?i)\bRemove-Item\b' -Reason 'the guest workspace guard never deletes anything'
 }
 
+foreach ($guestGuardPath in @($runGuardHelperPath, $rebootRequestHelperPath)) {
+    if (-not $existingScripts.ContainsKey($guestGuardPath)) {
+        continue
+    }
+
+    $guestGuardAst = Get-ScriptAst -RelativePath $guestGuardPath -Path $existingScripts[$guestGuardPath]
+    $guestGuardText = Get-ScriptText -Path $existingScripts[$guestGuardPath]
+
+    Assert-NoForbiddenCommand -Ast $guestGuardAst -RelativePath $guestGuardPath -ForbiddenNames $forbiddenCommands
+    Assert-NoForbiddenCommandLiteral -RelativePath $guestGuardPath -Text $guestGuardText -ForbiddenNames $forbiddenCommands
+    Assert-NoReservedVariableName -Ast $guestGuardAst -RelativePath $guestGuardPath -ReservedNames $reservedVariableNames
+    Assert-NoOrphanedBranchKeyword -Ast $guestGuardAst -RelativePath $guestGuardPath
+    Assert-TextDoesNotMatch -RelativePath $guestGuardPath -Text $guestGuardText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
+
+    # The coordination record is shared state for the whole guest. Deleting it, or clearing it
+    # because it looks old, would throw away the one trace that says whether the previous run
+    # finished - and age is never evidence that a WUA install ended.
+    Assert-TextDoesNotMatch -RelativePath $guestGuardPath -Text $guestGuardText -Pattern '(?i)\bRemove-Item\b' -Reason 'the guest run guard never deletes its coordination record'
+    Assert-TextDoesNotMatch -RelativePath $guestGuardPath -Text $guestGuardText -Pattern '(?i)\b(Stop-Process|taskkill)\b' -Reason 'the guest run guard never kills the process that holds the lock'
+}
+
+if ($existingScripts.ContainsKey($runGuardHelperPath)) {
+    $runGuardText = Get-ScriptText -Path $existingScripts[$runGuardHelperPath]
+
+    # FileShare::None is what makes the lock a lock; the behaviour around it is covered by the
+    # two-process tests in Invoke-GuestWorkspaceChecks.ps1.
+    Assert-TextContains -RelativePath $runGuardHelperPath -Text $runGuardText -Needle '[System.IO.FileShare]::None'
+    # One fixed coordination path, independent of -GuestWorkingDirectory: a lock that moves with
+    # the working directory is not a lock, because a second run brings its own.
+    Assert-TextContains -RelativePath $runGuardHelperPath -Text $runGuardText -Needle 'C:\ProgramData\PatchingGuestOps\.coordination'
+    Assert-TextDoesNotMatch -RelativePath $runGuardHelperPath -Text $runGuardText -Pattern '\$GuestWorkingDirectory' -Reason 'the coordination directory must not follow the operator-supplied working directory'
+}
+
 if ($existingScripts.ContainsKey($bootTimeHelperPath)) {
     $bootTimeHelperAst = Get-ScriptAst -RelativePath $bootTimeHelperPath -Path $existingScripts[$bootTimeHelperPath]
     $bootTimeHelperText = Get-ScriptText -Path $existingScripts[$bootTimeHelperPath]
@@ -335,10 +370,12 @@ if ($existingScripts.ContainsKey($guestOpsLibPath)) {
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'ListProcessesInGuest'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'InitiateFileTransferToGuest'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'InitiateFileTransferFromGuest'
-    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'New-GuestRebootArguments'
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Start-GuestReboot'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Start-GuestReboot'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Invoke-VMGuestReboot'
-    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'C:\Windows\System32\shutdown.exe'
+    # shutdown.exe is now invoked from inside the guest, by the process that holds the guest run
+    # guard while it orders the restart, so the needle follows it into the request script.
+    Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'New-GuestRebootBootstrapCommand'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'PatchingGuestOps reboot after updates'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Connect-VIServersWithCredentialMap'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle '[ValidateRange(1,2147483647)][int]$TimeoutSeconds = 300'

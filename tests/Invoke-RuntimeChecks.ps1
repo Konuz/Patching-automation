@@ -172,13 +172,14 @@ $selectionArgumentText = New-GuestAgentArguments -GuestAgentPath 'C:\ProgramData
 Assert-Contains -Text $selectionArgumentText -Needle '-SelectionPath "C:\ProgramData\PatchingGuestOps\selection.json"' -Message 'selection path is passed as a quoted argument'
 Assert-NotContains -Text $selectionArgumentText -Needle '-SelectedUpdateKeys' -Message 'selection path replaces selected update key CLI payload'
 
-$rebootArgumentText = New-GuestRebootArguments
-Assert-Contains -Text $rebootArgumentText -Needle '/r' -Message 'guest reboot arguments request restart'
-Assert-Contains -Text $rebootArgumentText -Needle '/t 0' -Message 'guest reboot arguments request immediate reboot'
-Assert-Contains -Text $rebootArgumentText -Needle '/c "PatchingGuestOps reboot after updates"' -Message 'guest reboot arguments include stable comment'
+# The shutdown arguments now belong to the guest-side request script, which is the process that
+# holds the guest run guard while it orders the restart.
+. (Join-Path $repoRoot 'guest\Request-GuestReboot.ps1')
+$rebootArguments = @(Get-GuestRebootShutdownArguments)
+Assert-Equal -Actual ($rebootArguments -join ' ') -Expected '/r /t 0 /c PatchingGuestOps reboot after updates' -Message 'guest reboot arguments request an immediate restart with the stable comment'
 
-$quotedRebootArgumentText = New-GuestRebootArguments -Comment 'Reboot after "updates"'
-Assert-Contains -Text $quotedRebootArgumentText -Needle '/c "Reboot after ''updates''"' -Message 'guest reboot comment replaces embedded double quotes'
+$quotedRebootArguments = @(Get-GuestRebootShutdownArguments -Comment 'Reboot after "updates"')
+Assert-Equal -Actual $quotedRebootArguments[4] -Expected "Reboot after 'updates'" -Message 'guest reboot comment replaces embedded double quotes'
 # guest/Read-BootTime.ps1 is pure local WMI plus a file write, so it can simply be executed here
 # instead of being pinned down by text needles in the static gate.
 $bootTimeScriptPath = Join-Path $repoRoot 'guest\Read-BootTime.ps1'

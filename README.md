@@ -409,6 +409,32 @@ zero transferów i zero uruchomień agenta na tej maszynie. Brak odpowiedzi od g
 wyjścia, przekroczony czas) też jest błędem, nie sukcesem. `-SkipHelperUpload` oszczędza transfer,
 nie kontrolę: przy ponownym użyciu helpera czasu rozruchu sprawdzany jest także sam plik.
 
+**Jeden przebieg na gościa.** Wewnątrz maszyny działa blokada w stałym katalogu
+`C:\ProgramData\PatchingGuestOps\.coordination` — jedna na gościa, wspólna dla wszystkich
+procesów narzędzia, niezależna od `runId`, katalogu cyklu, konta wykonawczego i
+`-GuestWorkingDirectory`. Nie ma przełącznika, który zmienia jej położenie ani który ją pomija.
+Dwie równoległe sesje WUA na jednej maszynie psują sobie nawzajem pracę, a restart zlecony w
+trakcie instalacji zostawia w połowie zapisaną aktualizację.
+
+Blokada to otwarty uchwyt pliku (`FileShare::None`), a zapis właściciela (runId, PID, czas startu
+i rozruchu, faza, zakończenie) znajduje się **w tym samym pliku**. To rozróżnienie jest istotne:
+system zwalnia uchwyt po awarii procesu, ale to nie znaczy, że praca WUA się zakończyła.
+Potwierdzenie zakończenia jest zapisywane dopiero **po** zapisaniu końcowego `status.json`.
+Dlatego przerwany agent zostawia stan `Running`, a następny przebieg odmawia startu. Stan
+`RebootRequested` również blokuje — aż nowszy czas rozruchu potwierdzi, że maszyna faktycznie
+wstała. Plik po poprawnie zakończonym przebiegu nie blokuje niczego.
+
+Odmowa oznacza `guestRunConflict=true`: maszyna jest `Failed`, **nie jest restartowana**, nie
+trafia do kolejnej rundy i przebieg nie może zakończyć się kodem 0 — nawet jeśli proces
+odrzuconego agenta już się zakończył. Restart także przechodzi przez tę blokadę: `shutdown.exe`
+jest uruchamiany z wnętrza gościa przez proces, który trzyma uchwyt.
+
+**Ręczne uzgodnienie porzuconego przebiegu.** Nie ma przełącznika, który ignoruje blokadę. Na
+gościu sprawdź historię Windows Update i to, czy nie działa `Run-LocalPatch.ps1`. Dopiero gdy
+masz pewność, że poprzedni przebieg się zakończył, usuń plik
+`C:\ProgramData\PatchingGuestOps\.coordination\guest-run.lock`. Następny przebieg wystartuje
+normalnie. Automatycznego czyszczenia po czasie celowo nie ma.
+
 **Konfiguracja curl jest ignorowana.** Każde wywołanie `curl.exe` przechodzi przez jeden
 wrapper, który wymusza `--disable` jako **pierwszy** argument — dla próby HTTPS, wysyłki i
 pobrania. Bez tego curl czyta `%APPDATA%\_curlrc`, `CURL_HOME/.curlrc` lub `~/.curlrc`, więc

@@ -336,6 +336,53 @@ function Test-IsTerminalAgentOutcome {
     return ($Outcome -in @('InstallSucceeded', 'InstallSucceededWithErrors', 'InstallFailed', 'DownloadFailed', 'NoSelectedUpdates', 'NoApplicableUpdates'))
 }
 
+# One shape for every apply branch. Four hand-written literals drifted apart before this
+# existed: a property one branch happened not to set is a terminating error under StrictMode for
+# whoever reads the collection back, and a field silently missing from the timeout branch is a
+# field the summary and the reboot selection disagree about. A step that did not happen gets an
+# explicit $null or an empty array - never a missing property.
+function New-ApplyResultRecord {
+    param(
+        [string]$VMName,
+        [string]$Action = 'Install',
+        [string]$Outcome,
+        $InstallResult = $null,
+        [string]$Reason = '',
+        $RoleFlags = $null,
+        $RebootRequired = $null,
+        $AgentCompletionConfirmed = $null,
+        [string]$AgentCompletionReason = '',
+        $CleanupStatus = $null,
+        $CleanupReason = $null,
+        [string[]]$Errors = @(),
+        # True when this guest was already busy with another run of this tool, or carried an
+        # unreconciled trace of one. Absolute: no reboot and no further cycle for this VM.
+        [bool]$GuestRunConflict = $false,
+        [string[]]$MissingUpdateKeys = @(),
+        [bool]$SelectionDrift = $false,
+        [bool]$RequiresVerification = $false
+    )
+
+    return [pscustomobject]@{
+        vmName = $VMName
+        action = $Action
+        outcome = $Outcome
+        installResult = $InstallResult
+        reason = $Reason
+        roleFlags = $RoleFlags
+        rebootRequired = $RebootRequired
+        agentCompletionConfirmed = $AgentCompletionConfirmed
+        agentCompletionReason = $AgentCompletionReason
+        cleanupStatus = $CleanupStatus
+        cleanupReason = $CleanupReason
+        guestRunConflict = $GuestRunConflict
+        missingUpdateKeys = @($MissingUpdateKeys)
+        selectionDrift = $SelectionDrift
+        requiresVerification = $RequiresVerification
+        errors = @($Errors)
+    }
+}
+
 function New-ApplyResultFromCycle {
     param(
         [string]$VMName,
@@ -357,6 +404,17 @@ function New-ApplyResultFromCycle {
     $errors = @(Get-ObjectPropertyValue -InputObject $status -Path @('errors') -DefaultValue @())
     $agentCompletionConfirmed = [bool](Get-RuntimePropertyValue -InputObject $Cycle -Name 'AgentCompletionConfirmed' -DefaultValue $false)
     $agentCompletionReason = [string](Get-RuntimePropertyValue -InputObject $Cycle -Name 'AgentCompletionReason' -DefaultValue '')
+    # The agent reports this when the guest was already busy with another run of this tool, or
+    # carried an unreconciled trace of one. It has to survive every branch below, including the
+    # failure branches, because it is what blocks the reboot and the next round for this VM.
+    $guestRunConflict = [bool](Get-ObjectPropertyValue -InputObject $status -Path @('guestRunConflict') -DefaultValue $false)
+    if ($guestRunConflict) {
+        $conflictReason = [string](Get-ObjectPropertyValue -InputObject $status -Path @('guestRunConflictReason'))
+        if ([string]::IsNullOrWhiteSpace($conflictReason)) {
+            $conflictReason = 'The guest reported that another PatchingGuestOps run holds it.'
+        }
+        $errors += ('Guest run conflict: {0}' -f $conflictReason)
+    }
 
     if (-not $agentCompletionConfirmed) {
         $reason = 'Agent completion was not confirmed; apply guest process did not complete.'
@@ -364,20 +422,11 @@ function New-ApplyResultFromCycle {
             $reason = '{0} {1}' -f $reason, $agentCompletionReason
         }
         $errors += $reason
-        return [pscustomobject]@{
-            vmName = $VMName
-            action = 'Install'
-            outcome = 'Failed'
-            installResult = $installResult
-            reason = $reason
-            roleFlags = Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')
-            rebootRequired = $rebootRequired
-            agentCompletionConfirmed = $false
-            agentCompletionReason = $agentCompletionReason
-            cleanupStatus = Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus'
-            cleanupReason = Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason'
-            errors = @($errors)
-        }
+        return New-ApplyResultRecord -VMName $VMName -Outcome 'Failed' -InstallResult $installResult -Reason $reason `
+            -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
+            -AgentCompletionConfirmed $false -AgentCompletionReason $agentCompletionReason `
+            -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
+            -Errors $errors -GuestRunConflict $guestRunConflict
     }
 
     if ($null -eq $agentResult -or -not $agentResult.Completed) {
@@ -393,20 +442,11 @@ function New-ApplyResultFromCycle {
         else {
             $reason = 'Apply guest process did not complete.'
             $errors += $reason
-            return [pscustomobject]@{
-                vmName = $VMName
-                action = 'Install'
-                outcome = 'Failed'
-                installResult = $installResult
-                reason = $reason
-                roleFlags = Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')
-                rebootRequired = $rebootRequired
-                agentCompletionConfirmed = $agentCompletionConfirmed
-                agentCompletionReason = $agentCompletionReason
-                cleanupStatus = Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus'
-                cleanupReason = Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason'
-                errors = @($errors)
-            }
+            return New-ApplyResultRecord -VMName $VMName -Outcome 'Failed' -InstallResult $installResult -Reason $reason `
+                -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
+                -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
+                -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
+                -Errors $errors -GuestRunConflict $guestRunConflict
         }
     }
     # A partial install (WUA ResultCode 3) exits non-zero but is authoritative in
@@ -415,36 +455,18 @@ function New-ApplyResultFromCycle {
     elseif ($null -ne $agentResult.ExitCode -and [int]$agentResult.ExitCode -ne 0 -and $outcome -ne 'InstallSucceededWithErrors') {
         $reason = 'Apply guest process exited with code {0}.' -f $agentResult.ExitCode
         $errors += $reason
-        return [pscustomobject]@{
-            vmName = $VMName
-            action = 'Install'
-            outcome = 'Failed'
-            installResult = $installResult
-            reason = $reason
-            roleFlags = Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')
-            rebootRequired = $rebootRequired
-            agentCompletionConfirmed = $agentCompletionConfirmed
-            agentCompletionReason = $agentCompletionReason
-            cleanupStatus = Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus'
-            cleanupReason = Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason'
-            errors = @($errors)
-        }
+        return New-ApplyResultRecord -VMName $VMName -Outcome 'Failed' -InstallResult $installResult -Reason $reason `
+            -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
+            -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
+            -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
+            -Errors $errors -GuestRunConflict $guestRunConflict
     }
 
-    return [pscustomobject]@{
-        vmName = $VMName
-        action = 'Install'
-        outcome = $outcome
-        installResult = $installResult
-        reason = ''
-        roleFlags = Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')
-        rebootRequired = $rebootRequired
-        agentCompletionConfirmed = $agentCompletionConfirmed
-        agentCompletionReason = $agentCompletionReason
-        cleanupStatus = Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus'
-        cleanupReason = Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason'
-        errors = @($errors)
-    }
+    return New-ApplyResultRecord -VMName $VMName -Outcome $outcome -InstallResult $installResult `
+        -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
+        -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
+        -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
+        -Errors $errors -GuestRunConflict $guestRunConflict
 }
 
 function Test-IsApplyResultError {
@@ -587,6 +609,14 @@ function Select-RebootRequiredApplyResults {
         }
 
         if ($discoveryErrorByVmName.ContainsKey($vmName)) {
+            continue
+        }
+
+        # A guest that refused this run - because another one holds it, or because it carries an
+        # unreconciled trace of one - must not be restarted. The other run may be mid-install,
+        # and a restart across a half-written update is exactly what the guard exists to stop.
+        # This holds even though the refused agent's own process has already ended.
+        if ([bool](Get-ObjectPropertyValue -InputObject $result -Path @('guestRunConflict') -DefaultValue $false)) {
             continue
         }
 

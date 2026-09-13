@@ -188,10 +188,29 @@ $agentTry = @($agentAst.EndBlock.Statements | Where-Object { $_ -is [System.Mana
 $statusInit = @($agentAst.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.AssignmentStatementAst] -and $_.Left.Extent.Text -eq '$status' })[0]
 
 function Invoke-AgentFixture {
-    param([int]$SearchCode = 2, [bool]$Cluster = $false, [bool]$Empty = $false, [switch]$SearchOnly, [bool]$PendingReboot = $false)
+    param([int]$SearchCode = 2, [bool]$Cluster = $false, [bool]$Empty = $false, [switch]$SearchOnly, [bool]$PendingReboot = $false,
+        # The one-run-per-guest lock, as the agent sees it: acquired, refused because another run
+        # holds this guest, or refused because the coordination directory is unusable.
+        [ValidateSet('Acquired', 'Conflict', 'Unavailable')][string]$GuardResult = 'Acquired')
     # Only external effects are mocked: local probes, artifact I/O, and WUA COM.
     function Write-AgentLog { param($Message) }
     function Save-Status { param($Status) }
+    $script:guardCompletions = @()
+    $script:guardReleases = 0
+    function Enter-GuestRunGuard {
+        param([string]$RunId, [string]$Phase)
+        switch ($GuardResult) {
+            'Conflict' { return [pscustomobject]@{ Acquired = $false; Conflict = $true; Reason = 'synthetic: another run holds this guest'; Stream = $null; RunId = $RunId; Phase = $Phase } }
+            'Unavailable' { return [pscustomobject]@{ Acquired = $false; Conflict = $false; Reason = 'synthetic: the coordination directory could not be secured'; Stream = $null; RunId = $RunId; Phase = $Phase } }
+            default { return [pscustomobject]@{ Acquired = $true; Conflict = $false; Reason = $null; Stream = 'synthetic-handle'; RunId = $RunId; Phase = $Phase } }
+        }
+    }
+    function Set-GuestRunGuardCompleted {
+        param($Guard, [string]$Outcome)
+        $script:guardCompletions += [string]$Outcome
+        return $true
+    }
+    function Exit-GuestRunGuard { param($Guard) $script:guardReleases++ }
     function Test-IsElevated { $true }
     function Get-ServiceSnapshot { @() }
     function Get-SystemDriveFreeGB { 100 }
@@ -235,6 +254,7 @@ function Invoke-AgentFixture {
     }
     $RunId = 'fixture'; $WorkingDirectory = 'unused'; $SearchCriteria = 'IsInstalled=0'; $MaxUpdates = 1
     $SelectedUpdateKeys = @(); $SelectionPath = 'mock-selection.json'; $scriptExitCode = 1
+    $guestRunGuard = $null
     . ([scriptblock]::Create($statusInit.Extent.Text))
     . ([scriptblock]::Create($agentTry.Extent.Text))
     # Model the same JSON boundary as a downloaded status.json.
@@ -244,7 +264,8 @@ function Invoke-AgentFixture {
     $discovery = New-DiscoveryRecordFromAgentRun -VMName 'fixture' -AgentRun $cycle -OutputDirectory 'unused'
     $groups = @(New-UpdateGroupRecords -DiscoveryRecords @($discovery))
     $states = @(Get-VMPatchCompletionStates -DiscoveryRecords @($discovery) -UpdateGroups $groups)
-    [pscustomobject]@{ Status = $payload; ExitCode = $scriptExitCode; InstallCalled = $installer.Called; DownloadCalled = $downloader.Called; State = $states[0].state; Cycle = $cycle }
+    $applyResult = New-ApplyResultFromCycle -VMName 'fixture' -Cycle $cycle 3>$null
+    [pscustomobject]@{ Status = $payload; ExitCode = $scriptExitCode; InstallCalled = $installer.Called; DownloadCalled = $downloader.Called; State = $states[0].state; Cycle = $cycle; ApplyResult = $applyResult; GuardCompletions = @($script:guardCompletions); GuardReleases = $script:guardReleases }
 }
 
 foreach ($searchCode in @(0, 1, 3, 4, 5, 99)) {
@@ -273,6 +294,61 @@ $ordinaryApply = Invoke-AgentFixture -PendingReboot $true
 Assert-Equal $ordinaryApply.InstallCalled $true 'ordinary selected updates still reach WUA install'
 Assert-Equal $ordinaryApply.Status.outcome 'InstallSucceeded' 'ordinary successful installation stays successful'
 Assert-Equal $ordinaryApply.ExitCode 0 'ordinary successful installation exits zero'
+
+# --- one run per guest, as the orchestrator sees it (task 4) ---------------------------------
+# The agent reports guestRunConflict when the guest was already busy with another run of this
+# tool, or carried an unreconciled trace of one. From there it is absolute: no WUA work, no
+# restart, and no further round for that VM - even though the refused agent's own process has
+# already ended, which is exactly what makes it look finished to everything else.
+
+foreach ($guardCase in @(
+        [pscustomobject]@{ Result = 'Conflict'; Conflict = $true },
+        [pscustomobject]@{ Result = 'Unavailable'; Conflict = $false }
+    )) {
+    $refused = Invoke-AgentFixture -GuardResult $guardCase.Result
+    Assert-Equal $refused.InstallCalled $false ('a guest that refused the run installs nothing (' + $guardCase.Result + ')')
+    Assert-Equal $refused.DownloadCalled $false ('a guest that refused the run downloads nothing (' + $guardCase.Result + ')')
+    Assert-Equal $refused.ExitCode 1 ('a guest that refused the run is an error (' + $guardCase.Result + ')')
+    Assert-Equal $refused.Status.outcome 'Failed' ('a guest that refused the run reports Failed (' + $guardCase.Result + ')')
+    Assert-Equal ([bool]$refused.Status.guestRunConflict) $guardCase.Conflict ('only a refusal by another run is a guest run conflict (' + $guardCase.Result + ')')
+    Assert-Equal ([bool]$refused.ApplyResult.guestRunConflict) $guardCase.Conflict ('the apply result carries the conflict flag (' + $guardCase.Result + ')')
+    Assert-Equal @($refused.GuardCompletions).Count 0 ('a run that never took the guard never records completion (' + $guardCase.Result + ')')
+    Assert-Equal $refused.State 'Failed' ('a refused guest is never green (' + $guardCase.Result + ')')
+}
+
+# Completion is recorded once, after the terminal status, and the handle is released with it.
+$acquired = Invoke-AgentFixture
+Assert-Equal ([bool]$acquired.Status.guestRunConflict) $false 'an ordinary run reports no conflict'
+Assert-Equal @($acquired.GuardCompletions).Count 1 'a finished run records completion exactly once'
+Assert-Equal $acquired.GuardCompletions[0] ([string]$acquired.Status.outcome) 'the recorded completion carries this cycle terminal outcome'
+Assert-Equal $acquired.GuardReleases 1 'a finished run releases the handle'
+
+# A handled WUA error is still a proper ending: the guest must be usable by the next run.
+$wuaFailure = Invoke-AgentFixture -SearchCode 4
+Assert-Equal $wuaFailure.ExitCode 1 'a WUA search failure is an error'
+Assert-Equal ([bool]$wuaFailure.Status.guestRunConflict) $false 'a WUA failure is not a guest run conflict'
+Assert-Equal @($wuaFailure.GuardCompletions).Count 1 'a handled WUA failure still records completion and frees the guest'
+Assert-Equal $wuaFailure.GuardReleases 1 'a handled WUA failure still releases the handle'
+
+# A conflicted VM is never a reboot target and never a target of the next round, whatever else
+# its apply result says - including a rebootRequired it reported before being refused.
+& {
+    $conflicted = New-ApplyResultRecord -VMName 'vm-conflict' -Outcome 'Failed' -RebootRequired $true -AgentCompletionConfirmed $true -GuestRunConflict $true -Errors @('Guest run conflict: synthetic')
+    $healthy = New-ApplyResultRecord -VMName 'vm-healthy' -Outcome 'InstallSucceeded' -RebootRequired $true -AgentCompletionConfirmed $true
+    $rebootTargets = @(Select-RebootRequiredApplyResults -ApplyResults @($conflicted, $healthy) -DiscoveryRecords @())
+    Assert-Equal (@($rebootTargets | ForEach-Object { [string]$_.vmName }) -join ',') 'vm-healthy' 'a guest run conflict is never a reboot target'
+
+    # The same filter the round loop applies when it chooses what to verify next.
+    $nextTargets = @(@($conflicted, $healthy) | Where-Object {
+            (Get-RuntimePropertyValue -InputObject $_ -Name 'action') -eq 'Install' -and
+            [bool](Get-RuntimePropertyValue -InputObject $_ -Name 'agentCompletionConfirmed' -DefaultValue $false) -and
+            -not [bool](Get-RuntimePropertyValue -InputObject $_ -Name 'guestRunConflict' -DefaultValue $false)
+        } | ForEach-Object { [string](Get-RuntimePropertyValue -InputObject $_ -Name 'vmName') })
+    Assert-Equal ($nextTargets -join ',') 'vm-healthy' 'a guest run conflict is never carried into the next round'
+
+    # And it is an error, so the run cannot exit 0 on it.
+    Assert-Equal (Test-IsApplyResultError -ApplyResult $conflicted) $true 'a guest run conflict keeps the run from succeeding'
+}
 
 $clusterApply = Invoke-AgentFixture -Cluster $true -PendingReboot $true
 Assert-Equal $clusterApply.DownloadCalled $false 'current cluster role blocks download from a saved selection'
@@ -643,6 +719,8 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $AgentPath = 'unused'
         $identityHelperPath = 'unused'
         $workspaceScriptPath = 'unused'
+        $runGuardScriptPath = 'unused'
+        $rebootRequestScriptPath = 'unused'
         $GuestWorkingDirectory = 'C:\unused'
         $TimeoutMinutes = 1
         $RebootTimeoutMinutes = 1
@@ -850,6 +928,8 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $AgentPath = 'unused'
         $identityHelperPath = 'unused'
         $workspaceScriptPath = 'unused'
+        $runGuardScriptPath = 'unused'
+        $rebootRequestScriptPath = 'unused'
         $GuestWorkingDirectory = 'C:\unused'
         $TimeoutMinutes = 1
         $RebootTimeoutMinutes = 1
@@ -1115,8 +1195,15 @@ function New-GuestAuthentication {
     return [pscustomobject]@{ UserName = $Credential.UserName }
 }
 function Invoke-VMGuestReboot {
-    param([string]$VMName, [object[]]$Servers, $Managers, $GuestAuth, [string]$ExpectedMoRefIdentity)
+    param([string]$VMName, [object[]]$Servers, $Managers, $GuestAuth, [string]$ExpectedMoRefIdentity,
+        [string]$WorkspaceScriptPath, [string]$RunGuardScriptPath, [string]$RebootScriptPath,
+        [int]$SubmissionWaitSeconds = 20, [int]$PollSeconds = 2)
     if (@($Servers).Count -eq 0) { throw 'the child job must hand its own connections to the lookup' }
+    # The reboot is ordered from inside the guest by a process that holds the run guard, so the
+    # child must be handed all three guest scripts that make up that command.
+    foreach ($requiredScript in @($WorkspaceScriptPath, $RunGuardScriptPath, $RebootScriptPath)) {
+        if ([string]::IsNullOrWhiteSpace($requiredScript)) { throw 'the child job must be given the guest reboot scripts' }
+    }
     if ($env:F5_JOB_MODE -eq 'RebootPreflightFails') {
         # What Invoke-VMGuestReboot does for a Get-ExactVM/GetView failure: the guest was never
         # touched, so the caller must not spend a reboot timeout observing it.
@@ -1152,6 +1239,9 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         IgnoreVCenterCertificate = $false
         GuestOpsLibPath = $jobLibPath
         ExpectedMoRefIdentity = 'VirtualMachine:vm-4242'
+        WorkspaceScriptPath = 'unused-workspace'
+        RunGuardScriptPath = 'unused-run-guard'
+        RebootScriptPath = 'unused-reboot-request'
     }
 
     try {

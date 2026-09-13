@@ -125,7 +125,7 @@ $roundLoop = $ast.Find({ param($n) $n -is [System.Management.Automation.Language
     $runOutputDirectory = Join-Path $repoRoot 'out'; $MaxPatchRounds = 3; $SearchOnly = $false; $PlanOnly = $false
     $hasExplicitSelectedUpdateKeys = $false; $SkipConfirmation = $false; $PromptProvider = $null
     $managers = $null; $guestCredentialMap = @{}; $resolvedVIServers = @('vc.regression.invalid'); $viServerScope = @('vc.regression.invalid'); $viserverCredentialMap = @{}
-    $IgnoreVCenterCertificate = $false; $guestOpsLibPath = ''; $curlPath = ''; $AgentPath = ''; $identityHelperPath = ''; $workspaceScriptPath = ''
+    $IgnoreVCenterCertificate = $false; $guestOpsLibPath = ''; $curlPath = ''; $AgentPath = ''; $identityHelperPath = ''; $workspaceScriptPath = ''; $runGuardScriptPath = ''; $rebootRequestScriptPath = ''
     $GuestWorkingDirectory = ''; $TimeoutMinutes = 1; $RebootTimeoutMinutes = 1; $PollSeconds = 1; $ThrottleLimit = 1
     $resolvedRebootBatchSize = 1; $MaxUpdates = 1
     . ([scriptblock]::Create($roundLoop.Extent.Text))
@@ -164,7 +164,7 @@ foreach ($planOnlyCase in @($false, $true)) {
         $runOutputDirectory = $planRoot; $MaxPatchRounds = 1; $SearchOnly = $false; $PlanOnly = $planOnlyCase
         $hasExplicitSelectedUpdateKeys = $false; $SkipConfirmation = $true; $PromptProvider = $null
         $managers = $null; $guestCredentialMap = @{}; $resolvedVIServers = @('vc.regression.invalid'); $viServerScope = @('vc.regression.invalid'); $viserverCredentialMap = @{}
-        $IgnoreVCenterCertificate = $false; $guestOpsLibPath = ''; $curlPath = ''; $AgentPath = ''; $identityHelperPath = ''; $workspaceScriptPath = ''
+        $IgnoreVCenterCertificate = $false; $guestOpsLibPath = ''; $curlPath = ''; $AgentPath = ''; $identityHelperPath = ''; $workspaceScriptPath = ''; $runGuardScriptPath = ''; $rebootRequestScriptPath = ''
         $GuestWorkingDirectory = ''; $TimeoutMinutes = 1; $RebootTimeoutMinutes = 1; $PollSeconds = 1; $ThrottleLimit = 1
         $resolvedRebootBatchSize = 1; $MaxUpdates = 1
         . ([scriptblock]::Create($roundLoop.Extent.Text))

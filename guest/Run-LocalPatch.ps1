@@ -13,6 +13,10 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot 'UpdateIdentity.ps1')
+# The workspace guard supplies the protected-directory primitives the run guard needs for the
+# fixed coordination directory; the run guard is what stops two runs meeting on this guest.
+. (Join-Path $PSScriptRoot 'GuestWorkspace.ps1')
+. (Join-Path $PSScriptRoot 'GuestRunGuard.ps1')
 
 if (-not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) {
     New-Item -ItemType Directory -Force -Path $WorkingDirectory | Out-Null
@@ -416,10 +420,16 @@ $status = [ordered]@{
     pendingRebootBefore = $null
     pendingRebootAfter = $null
     roleFlags = $null
+    # False unless this guest was already busy with another run of this tool, or carried an
+    # unreconciled trace of one. True is absolute: no WUA work here, no reboot, no next cycle
+    # for this VM in this run - even after the other process has ended.
+    guestRunConflict = $false
+    guestRunConflictReason = $null
     errors = @()
 }
 
 $scriptExitCode = 1
+$guestRunGuard = $null
 
 try {
     Write-AgentLog -Message 'Agent started.'
@@ -428,6 +438,20 @@ try {
     if ($MaxUpdates -lt 1) {
         throw 'MaxUpdates must be greater than or equal to 1.'
     }
+
+    # Taken before the WUA session is created, and held until the terminal status below has been
+    # written. Two WUA sessions installing on one guest corrupt each other's work, so a guest
+    # that is already busy - or that carries the trace of a run which never reported completion -
+    # is reported and left alone rather than worked on anyway.
+    $guestRunGuard = Enter-GuestRunGuard -RunId $RunId -Phase 'Agent'
+    if (-not $guestRunGuard.Acquired) {
+        if ($guestRunGuard.Conflict) {
+            $status.guestRunConflict = $true
+            $status.guestRunConflictReason = [string]$guestRunGuard.Reason
+        }
+        throw ('This guest is not available for a patching run: {0}' -f $guestRunGuard.Reason)
+    }
+    Write-AgentLog -Message ('Guest run guard acquired for run {0}.' -f $RunId)
 
     $status.isElevated = Test-IsElevated
     $status.services = Get-ServiceSnapshot
@@ -676,6 +700,20 @@ finally {
     $status.finishedAt = (Get-Date).ToString('o')
     Save-Status -Status $status
     Write-AgentLog -Message ('Agent finished with outcome {0} and exit code {1}.' -f $status.outcome, $scriptExitCode)
+
+    # Completion is recorded only now, after the terminal status is on disk: it is what lets the
+    # next run start without a conflict, so recording it any earlier would hand a guest whose
+    # result was never written to another run. A crash before this point deliberately leaves the
+    # guard saying "Running", which is the unreconciled state the next run must refuse.
+    if ($null -ne $guestRunGuard -and $guestRunGuard.Acquired) {
+        try {
+            $null = Set-GuestRunGuardCompleted -Guard $guestRunGuard -Outcome ([string]$status.outcome)
+        }
+        catch {
+            Write-AgentLog -Message ('WARNING: the guest run guard could not record completion: {0}' -f $_.Exception.Message)
+        }
+        Exit-GuestRunGuard -Guard $guestRunGuard
+    }
 }
 
 exit $scriptExitCode

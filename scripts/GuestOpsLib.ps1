@@ -755,11 +755,41 @@ function New-GuestAgentArguments {
     return ($arguments -join ' ')
 }
 
-function New-GuestRebootArguments {
-    param([string]$Comment = 'PatchingGuestOps reboot after updates')
+# The guest-side statuses of the reboot request, mapped from its exit code. Only 'never sent' and
+# 'sent' matter to the caller, and getting that wrong in either direction is expensive: treating a
+# sent reboot as unsent invites a second restart, treating an unsent one as sent burns a whole
+# -RebootTimeoutMinutes waiting for a guest that was never told to restart.
+$script:GuestRebootExitCodes = @{
+    0  = [pscustomobject]@{ Sent = $true;  Conflict = $false; Reason = $null }
+    20 = [pscustomobject]@{ Sent = $false; Conflict = $true;  Reason = 'another PatchingGuestOps run holds this guest, or a previous run left an unreconciled trace on it' }
+    21 = [pscustomobject]@{ Sent = $false; Conflict = $false; Reason = 'the guest refused the reboot request before shutdown.exe was invoked' }
+    22 = [pscustomobject]@{ Sent = $true;  Conflict = $false; Reason = 'shutdown.exe was invoked but reported a failure; the restart may still be in progress' }
+    23 = [pscustomobject]@{ Sent = $false; Conflict = $false; Reason = 'the guest coordination directory could not be secured' }
+}
 
-    $safeComment = ([string]$Comment) -replace '"', "'"
-    return ('/r /t 0 /c "{0}"' -f $safeComment)
+function New-GuestRebootBootstrapCommand {
+    param(
+        [string]$WorkspaceScriptText,
+        [string]$RunGuardScriptText,
+        [string]$RebootScriptText,
+        [string]$RunId,
+        [string]$Comment = 'PatchingGuestOps reboot after updates'
+    )
+
+    foreach ($part in @($WorkspaceScriptText, $RunGuardScriptText, $RebootScriptText)) {
+        if ([string]::IsNullOrWhiteSpace($part)) {
+            throw 'The guest reboot request needs the workspace guard, the run guard and the request script.'
+        }
+    }
+
+    # Run id and comment travel as base64 DATA. The comment is operator-visible text and the run
+    # id is generated, but neither may become a place where PowerShell syntax can be written.
+    $runIdBase64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$RunId))
+    $commentBase64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$Comment))
+    $preamble = "`$GuestRebootRequest = [pscustomobject]@{ RunIdBase64 = '$runIdBase64'; CommentBase64 = '$commentBase64' }"
+
+    $commandText = @($preamble, $WorkspaceScriptText, $RunGuardScriptText, $RebootScriptText) -join [Environment]::NewLine
+    return [System.Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($commandText))
 }
 
 function Start-GuestReboot {
@@ -767,14 +797,48 @@ function Start-GuestReboot {
         $ProcessManager,
         $VMView,
         $GuestAuth,
-        [string]$Comment = 'PatchingGuestOps reboot after updates'
+        [string]$Comment = 'PatchingGuestOps reboot after updates',
+        [string]$RunId,
+        [string]$WorkspaceScriptPath,
+        [string]$RunGuardScriptPath,
+        [string]$RebootScriptPath
     )
 
+    # shutdown.exe is invoked from inside the guest, by a process that holds the guest run guard,
+    # so a reboot can never be ordered while an agent on that guest is still installing or while
+    # a second run of this tool is working on it. Starting shutdown.exe directly over GuestOps -
+    # which is what this replaces - had no way to know either of those things.
+    $encodedCommand = New-GuestRebootBootstrapCommand `
+        -WorkspaceScriptText (Get-GuestWorkspaceScriptText -WorkspaceScriptPath $WorkspaceScriptPath) `
+        -RunGuardScriptText (Get-GuestWorkspaceScriptText -WorkspaceScriptPath $RunGuardScriptPath) `
+        -RebootScriptText (Get-GuestWorkspaceScriptText -WorkspaceScriptPath $RebootScriptPath) `
+        -RunId $RunId -Comment $Comment
+
     $programSpec = New-Object VMware.Vim.GuestProgramSpec
-    $programSpec.ProgramPath = 'C:\Windows\System32\shutdown.exe'
-    $programSpec.Arguments = New-GuestRebootArguments -Comment $Comment
+    $programSpec.ProgramPath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+    $programSpec.Arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {0}' -f $encodedCommand)
+    $programSpec.WorkingDirectory = 'C:\Windows\System32'
 
     return $ProcessManager.StartProgramInGuest($VMView.MoRef, $GuestAuth, $programSpec)
+}
+
+function Get-GuestRebootSubmissionVerdict {
+    param($ProcessResult)
+
+    # A guest that is restarting stops answering, so "no result" is the ordinary success path and
+    # has to be read as "sent". Only an exit code this tool understands can say otherwise.
+    if ($null -eq $ProcessResult -or -not $ProcessResult.Completed -or $null -eq $ProcessResult.ExitCode) {
+        return [pscustomobject]@{ Sent = $true; Conflict = $false; Reason = $null }
+    }
+
+    $code = [int]$ProcessResult.ExitCode
+    if ($script:GuestRebootExitCodes.ContainsKey($code)) {
+        return $script:GuestRebootExitCodes[$code]
+    }
+
+    # An unrecognised code is ambiguous, not a rejection: the safe reading is that the guest may
+    # already be going down.
+    return [pscustomobject]@{ Sent = $true; Conflict = $false; Reason = ('the guest reported an unrecognised reboot exit code {0}' -f $code) }
 }
 
 function Start-GuestAgent {
@@ -1032,7 +1096,10 @@ function Start-VMAgentCycle {
         [int]$TransferTimeoutSeconds = 300,
         # Read from the trusted local copy and executed in the guest through -EncodedCommand.
         # Defaulted here rather than at the call sites so every caller gets the guard.
-        [string]$WorkspaceScriptPath = (Join-Path $PSScriptRoot '..\guest\GuestWorkspace.ps1')
+        [string]$WorkspaceScriptPath = (Join-Path $PSScriptRoot '..\guest\GuestWorkspace.ps1'),
+        # Uploaded beside the agent, which dot-sources both: the workspace primitives and the
+        # one-run-per-guest lock. Safe to upload, because the directory was verified first.
+        [string]$RunGuardScriptPath = (Join-Path $PSScriptRoot '..\guest\GuestRunGuard.ps1')
     )
 
     $vm = Get-ExactVM -Name $VMName -Servers $Servers
@@ -1072,6 +1139,11 @@ function Start-VMAgentCycle {
 
     $guestIdentityHelperPath = Join-Path $guestCycleDirectory 'UpdateIdentity.ps1'
     Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $IdentityHelperPath -GuestPath $guestIdentityHelperPath -TimeoutSeconds $TransferTimeoutSeconds
+
+    # The agent dot-sources both of these. They go into the cycle directory, which the workspace
+    # check above has already proven only SYSTEM and Administrators can write to.
+    Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $WorkspaceScriptPath -GuestPath (Join-Path $guestCycleDirectory 'GuestWorkspace.ps1') -TimeoutSeconds $TransferTimeoutSeconds
+    Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $RunGuardScriptPath -GuestPath (Join-Path $guestCycleDirectory 'GuestRunGuard.ps1') -TimeoutSeconds $TransferTimeoutSeconds
 
     if (-not [string]::IsNullOrWhiteSpace($LocalSelectionPath) -and -not [string]::IsNullOrWhiteSpace($SelectionPath)) {
         Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $LocalSelectionPath -GuestPath $SelectionPath -TimeoutSeconds $TransferTimeoutSeconds
@@ -1496,7 +1568,15 @@ function Invoke-VMGuestReboot {
         [object[]]$Servers,
         $Managers,
         $GuestAuth,
-        [string]$ExpectedMoRefIdentity
+        [string]$ExpectedMoRefIdentity,
+        [string]$WorkspaceScriptPath,
+        [string]$RunGuardScriptPath,
+        [string]$RebootScriptPath,
+        # How long to wait for the request process to report. A guest that is actually restarting
+        # stops answering well before this, and that silence is read as "sent"; the wait exists
+        # only to catch the cases where the guest is still up and refused.
+        [int]$SubmissionWaitSeconds = 20,
+        [int]$PollSeconds = 2
     )
 
     Write-Step -Message ('Resolving VM {0} for guest reboot.' -f $VMName)
@@ -1518,11 +1598,38 @@ function Invoke-VMGuestReboot {
         throw
     }
     Write-Step -Message ('Initiating guest reboot for VM {0}.' -f $VMName)
-    $rebootProcessId = Start-GuestReboot -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth
+    $rebootRunId = [guid]::NewGuid().ToString('N')
+    $rebootProcessId = Start-GuestReboot -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -RunId $rebootRunId -WorkspaceScriptPath $WorkspaceScriptPath -RunGuardScriptPath $RunGuardScriptPath -RebootScriptPath $RebootScriptPath
+
+    # The request process holds the guest run guard while it orders the restart, so its exit code
+    # is the only place a refusal can surface. Read it if the guest is still there to answer.
+    $submissionResult = $null
+    try {
+        $submissionResult = Wait-GuestProcess -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -ProcessId $rebootProcessId -TimeoutSeconds ([int][math]::Max(1, $SubmissionWaitSeconds)) -PollSeconds ([int][math]::Max(1, $PollSeconds))
+    }
+    catch {
+        # The guest going away mid-poll is what a successful restart looks like from here.
+        $submissionResult = $null
+    }
+
+    $verdict = Get-GuestRebootSubmissionVerdict -ProcessResult $submissionResult
+    if (-not $verdict.Sent) {
+        $rejection = New-Object System.InvalidOperationException -ArgumentList ('The guest refused the reboot request for {0}: {1}' -f $VMName, $verdict.Reason)
+        try {
+            $rejection.Data['RejectedBeforeStart'] = $true
+            if ([bool]$verdict.Conflict) {
+                $rejection.Data['GuestRunConflict'] = $true
+            }
+        }
+        catch { }
+        throw $rejection
+    }
 
     return [pscustomobject]@{
         VMName = $VMName
         ProcessId = $rebootProcessId
+        RunId = $rebootRunId
+        SubmissionReason = [string]$verdict.Reason
     }
 }
 

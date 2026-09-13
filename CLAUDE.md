@@ -79,12 +79,14 @@ Execution flows through layered runtime scripts plus the offline planning model 
 
 1. **`Start-PatchingGuestOps.ps1`** (root launcher) — prompts for any missing params, runs static + model checks unless `-SkipStaticChecks`, rejects legacy `-InstallSelection` before credential prompts, then splats everything into the orchestrator. `-VIServer` can hold one vCenter or several vCenters separated by semicolons; the launcher normalizes that list and passes through `-VIServerCredential` only when the operator explicitly supplied one. Guest credentials are resolved per VM into a `name -> pscredential` map: one `Get-Credential` prompt per FQDN domain suffix and one per local (no-dot) machine (`Resolve-GuestCredentialMap` + `Get-GuestCredentialGroups`). The VM list therefore holds FQDNs; `Get-ExactVM` resolves each by full FQDN first, then permits a short inventory name only when VMware Tools reports the requested guest FQDN. Missing or mismatched guest hostnames reject that fallback; duplicate inventory matches are rejected. The same lookup is used for discovery, apply and reboot, and **every call must name the vCenter connections of this run** (`Get-ExactVM -Servers`, pinned by `Test-VMLookupsAreScoped` in the static gate) — see "Inventory scope" below. An explicit `-GuestCredential` overrides this for all VMs (non-interactive runs). There are two entry points: this launcher for console runs, and `Start-PatchingGuestOpsGui.ps1` for GUI runs. Users should never have to call the orchestrator directly.
 2. **`Start-PatchingGuestOpsGui.ps1`** (optional GUI launcher) — WinForms on PS 5.1, requires an STA host. Collects parameters and credentials in a modal form, saves settings to `%LOCALAPPDATA%\PatchingGuestOps\settings.json` and credentials (DPAPI per key) to `credentials.json`, expands grouped store keys into per-name maps via `Get-GuestCredentialGroups`, then calls the console launcher via `&`. Passes `-PromptProvider`, `-StoredVIServerCredentials` and `-StoredGuestCredentials`; **never** passes `-SelectedUpdateKeys` or `-SkipConfirmation`, as either would end the patch-round loop after the first run. Update group selection is a modal dialog; everything else stays in the console. The VM list is intentionally not persisted.
-3. **`scripts/Invoke-GuestOpsPatchValidation.ps1`** (orchestrator, runs on the stepping stone) — resolves one or many VM targets, connects to one or more semicolon-separated vCenters, runs discovery cycles over GuestOps, builds grouped update records, resolves selection from explicit `-SelectedUpdateKeys` or interactive grouped selection, writes a per-VM patch plan, asks for final confirmation, then applies selected groups. vCenter credentials are resolved into `VIServerCredentialMap`: explicit `-VIServerCredential` applies to every vCenter, otherwise prompts are grouped by FQDN domain and failed vCenter logins retry only that vCenter so the operator can enter local credentials. Discovery and apply run **in this process** as one fleet (see "In-process fleet" below), so a run holds a single vCenter session throughout; `Connect-VIServersWithCredentialMap` also reuses a session that is already connected, which is what makes `-KeepConnected` worth setting. Apply-result, fleet, round-decision and reboot-action semantics live in `scripts/OrchestratorRuntime.ps1` and are covered by `tests/Invoke-RuntimeChecks.ps1`; that helper also writes `reboot-actions.json`, `rounds.json` and the summaries. Keep PowerCLI/GuestOps calls and interactive prompts (`Read-Host`) outside it — its only side effects are local artifact writes. `-PatchPlanPath` resumes from a saved `patch-plan.json`: it skips discovery and group selection, shows the saved plan, asks for confirmation unless `-SkipConfirmation` is set, runs apply against the selected updates in the plan, and stays **single-round** (there is no discovery to judge the starting state from, and the saved keys carry a `RevisionNumber` that will not match a later round's groups). After apply, the normal discovery-driven path evaluates reboot targets from both per-VM apply `rebootRequired` and the run's discovery `pendingRebootBefore.isPending`; the `-PatchPlanPath` resume path has no discovery records, so it only uses apply `rebootRequired`. If any VM requires reboot, it shows a separate VM list and requires the operator to type `REBOOT`; `-SkipConfirmation` never skips this reboot prompt, nor the follow-up prompt for `-RebootBatchSize`. Confirmed reboot is initiated inside the guest through GuestOps by starting `shutdown.exe /r /t 0 /c "PatchingGuestOps reboot after updates"`, limited by `-RebootBatchSize`.
+3. **`scripts/Invoke-GuestOpsPatchValidation.ps1`** (orchestrator, runs on the stepping stone) — resolves one or many VM targets, connects to one or more semicolon-separated vCenters, runs discovery cycles over GuestOps, builds grouped update records, resolves selection from explicit `-SelectedUpdateKeys` or interactive grouped selection, writes a per-VM patch plan, asks for final confirmation, then applies selected groups. vCenter credentials are resolved into `VIServerCredentialMap`: explicit `-VIServerCredential` applies to every vCenter, otherwise prompts are grouped by FQDN domain and failed vCenter logins retry only that vCenter so the operator can enter local credentials. Discovery and apply run **in this process** as one fleet (see "In-process fleet" below), so a run holds a single vCenter session throughout; `Connect-VIServersWithCredentialMap` also reuses a session that is already connected, which is what makes `-KeepConnected` worth setting. Apply-result, fleet, round-decision and reboot-action semantics live in `scripts/OrchestratorRuntime.ps1` and are covered by `tests/Invoke-RuntimeChecks.ps1`; that helper also writes `reboot-actions.json`, `rounds.json` and the summaries. Keep PowerCLI/GuestOps calls and interactive prompts (`Read-Host`) outside it — its only side effects are local artifact writes. `-PatchPlanPath` resumes from a saved `patch-plan.json`: it skips discovery and group selection, shows the saved plan, asks for confirmation unless `-SkipConfirmation` is set, runs apply against the selected updates in the plan, and stays **single-round** (there is no discovery to judge the starting state from, and the saved keys carry a `RevisionNumber` that will not match a later round's groups). After apply, the normal discovery-driven path evaluates reboot targets from both per-VM apply `rebootRequired` and the run's discovery `pendingRebootBefore.isPending`; the `-PatchPlanPath` resume path has no discovery records, so it only uses apply `rebootRequired`. If any VM requires reboot, it shows a separate VM list and requires the operator to type `REBOOT`; `-SkipConfirmation` never skips this reboot prompt, nor the follow-up prompt for `-RebootBatchSize`. Confirmed reboot is initiated inside the guest through GuestOps by running `guest/Request-GuestReboot.ps1`, which takes the guest run guard and then invokes `shutdown.exe /r /t 0 /c "PatchingGuestOps reboot after updates"` while holding it, limited by `-RebootBatchSize`.
 4. **`scripts/PatchPlanModel.ps1`** (offline model) — pure planning/reporting logic for update identity validation, default group selection, Failover Cluster skips, per-VM patch plans, summaries, and PlanOnly exit semantics. Keep it free of PowerCLI, GuestOps calls, `Read-Host`, and top-level runtime flow.
 5. **`scripts/GuestOpsLib.ps1`** (GuestOps helpers) — shared PowerCLI/GuestOps file transfer and process-run helpers. The guest agent cycle is split into `Start-VMAgentCycle` (upload + `StartProgramInGuest`), `Test-VMAgentCycleComplete` (one `ListProcessesInGuest`) and `Complete-VMAgentCycle` (download + parse). Those three are the whole cycle; the single-shot `Invoke-VMAgentCycle`/`Invoke-GuestAgentRun` that preceded them are gone, along with the needles that were keeping them alive after their last caller disappeared.
 6. **`guest/Run-LocalPatch.ps1`** (agent, runs *inside* the guest) — WUA COM only: `Microsoft.Update.Session` → searcher → downloader → installer. Writes `status.json` + `agent.log` to a unique cycle directory (`C:\ProgramData\PatchingGuestOps\<runId>`). **Never reboots** — it only reports `pendingReboot`.
 7. **`guest/GuestWorkspace.ps1`** (guard, runs *inside* the guest, **never uploaded**) — creates the tool directory with a protected DACL and verifies owner, access rules, reparse points and the parent before anything is written to it. Executed through `powershell.exe -EncodedCommand`; see "Securing the guest directory before the first upload".
-8. **`guest/Read-BootTime.ps1`** (helper, runs *inside* the guest) — reads `Win32_OperatingSystem.LastBootUpTime` and writes a UTC/ISO 8601 result for the reboot validation gate.
+8. **`guest/GuestRunGuard.ps1`** (guard, runs *inside* the guest) — the one-run-per-guest lock and its coordination record; see "One run per guest".
+9. **`guest/Request-GuestReboot.ps1`** (runs *inside* the guest, **never uploaded**) — takes the run guard and invokes `shutdown.exe` while holding it.
+10. **`guest/Read-BootTime.ps1`** (helper, runs *inside* the guest) — reads `Win32_OperatingSystem.LastBootUpTime` and writes a UTC/ISO 8601 result for the reboot validation gate.
 
 ### Inventory scope: which vCenter may answer a lookup
 
@@ -225,6 +227,66 @@ orchestrator's reason table must agree: 10 path, 11 owner, 12 access rule, 13 re
 14 parent, 15 unreadable descriptor, 16 create failed, 17 unexpected. An **unrecognised code, and
 a lost exit code, both fail the VM** — vSphere forgets exit codes shortly after a process ends,
 and "no answer" is the one thing that must never read as success.
+
+### One run per guest: the guest run guard
+
+`guest/GuestRunGuard.ps1` runs inside the guest and holds **one lock per guest**, shared by every
+process this tool starts there. Two WUA sessions installing on one machine corrupt each other's
+work, and a reboot ordered while an agent is mid-install can leave a half-written update. Nothing
+else provides that exclusion — a run id, a cycle directory or a per-account marker are all things
+a second run brings its own copy of — so the lock lives at **one fixed path**,
+`C:\ProgramData\PatchingGuestOps\.coordination\guest-run.lock`, independent of the run id, the
+cycle directory, the account the agent runs as and `-GuestWorkingDirectory`. There is deliberately
+**no switch to move it and no switch to ignore it**; the static gate pins both.
+
+The coordination directory is created and verified through `Initialize-GuestWorkspace`, so it gets
+the same protected DACL as the tool directory whatever `-GuestWorkingDirectory` was set to. It is
+never a cleanup target: `Test-GuestCycleDirectoryRemovable` requires the directory name to be a
+generated GUID, and `.coordination` is not one.
+
+The lock is an open handle with `FileShare::None`, and the owner record — run id, process id,
+start time, boot time, phase, completion — lives **inside that same file**, so only the holder can
+write it. Two facts are kept apart on purpose:
+
+- **The handle** is released by the operating system when the holder dies. That says nothing
+  about whether its WUA work finished.
+- **The record** says whether the previous run reached a terminal status. `Completed` is written
+  only *after* this cycle's terminal `status.json` has been saved — recording it any earlier
+  would hand a guest whose result was never written to the next run.
+
+So a crashed agent leaves `Running` behind, and the next run refuses. Status `RebootRequested`
+refuses too, until a **strictly newer boot time** proves the guest actually came back; an
+unreadable or unrecognised record refuses as well. `Completed`, and an empty file, are the only
+states that let the next run proceed — an existing lock file from a finished run never blocks
+anything. Nothing is ever cleared by age, by a pid missing from vSphere, or by the controller
+exiting.
+
+The agent takes the guard before creating the WUA session and holds it through the terminal
+status write. A refusal becomes `guestRunConflict = true` in `status.json` and in the apply
+result, and that is **absolute for the rest of the run**: the VM is `Failed`, it is filtered out
+of reboot targets (`Select-RebootRequiredApplyResults`) and out of the next round's targets, and
+the run cannot exit 0 — even though the refused agent's own process has already ended, which is
+exactly what makes it look finished to everything else.
+
+Reboot is the other holder. `shutdown.exe` is no longer started directly over GuestOps; instead
+`guest/Request-GuestReboot.ps1` (concatenated with the workspace guard and the run guard, and run
+through `-EncodedCommand`) takes the guard, writes `RebootRequested`, and invokes `shutdown.exe`
+itself — so a restart can never be ordered on a guest whose agent is still installing. The order
+of writes is load-bearing: the marker goes down **before** `shutdown.exe` is invoked, and is
+rolled back **only** when this process is certain it never got that far. Once invoked, an
+ambiguous result keeps the marker — a second shutdown is never authorised by not knowing. The
+request's exit code is read back over a short wait (20s): `0` sent, `20` refused by the guard
+(nothing sent, `GuestRunConflict`), `21` never invoked (nothing sent), `22` invoked but reported
+a failure (ambiguous, treated as sent), and **no answer at all is "sent"** — a guest that is
+actually restarting stops answering.
+
+**Reconciling an abandoned run is a manual procedure, by design.** There is no override switch.
+On the guest, check Windows Update (`Get-WindowsUpdateLog`, the update history, and whether a
+reboot is pending) and confirm no `Run-LocalPatch.ps1` is running. Once you are satisfied the
+previous run is genuinely over, delete
+`C:\ProgramData\PatchingGuestOps\.coordination\guest-run.lock`. The next run then starts
+clean. An automatic reaper is out of scope for the same reason age-based cycle cleanup is: a run
+this tool cannot prove is finished is one it must not overrule.
 
 ### Guest-side cleanup: the only destructive operation
 
