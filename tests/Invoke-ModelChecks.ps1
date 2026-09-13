@@ -176,30 +176,104 @@ Assert-Throws -ScriptBlock { New-CanonicalUpdateIdentityKey -UpdateId '11111111-
 Assert-Equal -Actual (Get-UpdateKbText -KbArticleIds $null) -Expected '' -Message 'empty KB list becomes empty text'
 Assert-Equal -Actual (Get-UpdateKbText -KbArticleIds @('5060842', '5060821')) -Expected 'KB5060842,KB5060821' -Message 'KB list gets KB prefixes'
 
-Assert-True -Condition (Get-DefaultUpdateSelection -Title '2026-06 Cumulative Update for Windows Server' -Categories @('Security Updates')) -Message 'security cumulative update selected by default'
-Assert-True -Condition (Get-DefaultUpdateSelection -Title 'Critical Update for Windows Server' -Categories @('Critical Updates')) -Message 'critical update selected by default'
-Assert-True -Condition (Get-DefaultUpdateSelection -Title 'Update Rollup for Windows Server' -Categories @('Update Rollups')) -Message 'update rollup selected by default'
-Assert-True -Condition (Get-DefaultUpdateSelection -Title 'Windows Malicious Software Removal Tool x64' -Categories @('Tools')) -Message 'MSRT selected by default'
-Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title '2026-06 Preview Cumulative Update for Windows Server' -Categories @('Updates'))) -Message 'preview update skipped by default'
-Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Driver update for network adapter' -Categories @('Drivers'))) -Message 'driver update skipped by default'
-Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Feature update to Windows Server' -Categories @('Upgrades'))) -Message 'feature update skipped by default'
-Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Optional browse-only update' -Categories @('Updates'))) -Message 'optional browse-only update skipped by default'
-Assert-True -Condition (Get-DefaultUpdateSelection -Title 'Security Update applied optionally' -Categories @('Security Updates')) -Message 'embedded optional substring does not deselect a security update'
+# --- the default selection policy, decided on structured metadata only ------------------------
+# The policy used to read the title and the localised category NAMES, so the same package was
+# selected on an English guest and skipped on a German or Polish one. It now decides on the
+# classification GUIDs, MsrcSeverity, UpdateType, BrowseOnly and the KB id - all of which are
+# language-independent - and admits the cost: a package it cannot classify becomes NeedsReview
+# and waits for the operator instead of being guessed at.
 
-Assert-True -Condition (Get-DefaultUpdateSelection -Title 'Localized package title' -Categories @('Updates') -MsrcSeverity 'Critical' -UpdateType 'Software') -Message 'critical MSRC severity is selected even when title is not English'
-Assert-True -Condition (Get-DefaultUpdateSelection -Title 'Localized package title' -Categories @('Updates') -MsrcSeverity 'Important' -UpdateType 'Software') -Message 'important MSRC severity is selected even when title is not English'
-Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Security-like driver title' -Categories @('Security Updates') -MsrcSeverity 'Critical' -UpdateType 'Driver')) -Message 'driver update type is skipped even when severity is critical'
-Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Localized package title' -Categories @('Updates') -MsrcSeverity 'Critical' -UpdateType '2')) -Message 'integer driver enum value is skipped like the Driver string'
-Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title '2026-06 Preview Cumulative Update for Windows Server' -Categories @('Updates') -MsrcSeverity 'Critical' -UpdateType 'Software')) -Message 'critical severity does not override the preview exclusion'
+$securityUpdatesId = '0fa1201d-4330-4fa8-8ae9-b877473b6441'
+$criticalUpdatesId = 'e6cf1350-c01b-414d-a61f-263d14d133b4'
+$updateRollupsId = '28bc880e-0592-4cbf-8f95-c79b17911d5f'
+$definitionUpdatesId = 'e0789628-ce08-4437-be74-2495b842f43b'
 
-# Defender security intelligence updates are ticked like anything else - they install cheaply and
-# need no reboot. What they must not do is decide whether a VM is finished; that is asserted in the
-# completion-state section below, not here.
-Assert-Equal -Actual (Get-DefaultUpdateSelection -Title 'Security Intelligence Update for Microsoft Defender Antivirus' -Categories @('Definition Updates') -MsrcSeverity 'Critical' -UpdateType Software) -Expected $true -Message 'a Defender definition is still selected by default'
-Assert-Equal -Actual (Get-DefaultUpdateSelection -Title 'Security Update for Microsoft Defender Antivirus antimalware platform' -UpdateType Software) -Expected $true -Message 'Platform security updates remain selected'
+function New-PolicyUpdate {
+    param(
+        [string]$Title = 'Any title at all',
+        [string[]]$CategoryIds = @(),
+        [string[]]$KbArticleIds = @(),
+        $BrowseOnly = $false,
+        [string]$MsrcSeverity = '',
+        [string]$UpdateType = 'Software',
+        [string[]]$Categories = @()
+    )
 
-# The predicate that keeps them out of the completion count. KB2267602 is the stable identity -
-# the title is localised, so a title rule would silently stop working on a non-English server.
+    return [pscustomobject]@{
+        title = $Title
+        categories = @($Categories)
+        categoryIds = @($CategoryIds)
+        kbArticleIds = @($KbArticleIds)
+        browseOnly = $BrowseOnly
+        msrcSeverity = $MsrcSeverity
+        updateType = $UpdateType
+    }
+}
+
+foreach ($includedCategoryId in @($securityUpdatesId, $criticalUpdatesId, $updateRollupsId)) {
+    $decision = Get-UpdatePolicyDecision -Update (New-PolicyUpdate -CategoryIds @($includedCategoryId))
+    Assert-Equal -Actual $decision.Decision -Expected 'Include' -Message ('classification ' + $includedCategoryId + ' is selected by default')
+}
+
+# Braces and case are how some sources spell a GUID; neither changes what it identifies.
+Assert-Equal -Actual (Get-UpdatePolicyDecision -Update (New-PolicyUpdate -CategoryIds @(('{' + $securityUpdatesId.ToUpperInvariant() + '}')))).Decision -Expected 'Include' -Message 'a braced, upper-case classification GUID is the same classification'
+
+# The same package, described in three languages with identical structured metadata.
+$englishUpdate = New-PolicyUpdate -Title '2026-06 Cumulative Update for Windows Server' -Categories @('Security Updates') -CategoryIds @($securityUpdatesId)
+$polishUpdate = New-PolicyUpdate -Title 'Aktualizacja zbiorcza 2026-06 dla Windows Server' -Categories @('Aktualizacje zabezpieczen') -CategoryIds @($securityUpdatesId)
+$germanUpdate = New-PolicyUpdate -Title 'Kumulatives Update 2026-06 fuer Windows Server' -Categories @('Sicherheitsupdates') -CategoryIds @($securityUpdatesId)
+foreach ($localisedUpdate in @($englishUpdate, $polishUpdate, $germanUpdate)) {
+    Assert-Equal -Actual (Get-UpdatePolicyDecision -Update $localisedUpdate).Decision -Expected 'Include' -Message ('the decision does not depend on the language of the title: ' + $localisedUpdate.title)
+}
+
+# A title that says nothing useful, with a classification that does.
+Assert-Equal -Actual (Get-UpdatePolicyDecision -Update (New-PolicyUpdate -Title 'Dowolny opis' -CategoryIds @($securityUpdatesId))).Decision -Expected 'Include' -Message 'a classification decides regardless of the title'
+
+# ...and the reverse: an English title full of the old keywords, with no structured backing.
+foreach ($temptingTitle in @('2026-06 Cumulative Update for Windows Server', 'Critical Update for Windows Server', 'Security Update Rollup')) {
+    Assert-Equal -Actual (Get-UpdatePolicyDecision -Update (New-PolicyUpdate -Title $temptingTitle)).Decision -Expected 'NeedsReview' -Message ('a promising title alone no longer selects anything: ' + $temptingTitle)
+}
+
+# Exclusions.
+Assert-Equal -Actual (Get-UpdatePolicyDecision -Update (New-PolicyUpdate -UpdateType 'Driver' -CategoryIds @($securityUpdatesId) -MsrcSeverity 'Critical')).Decision -Expected 'Exclude' -Message 'a driver is excluded even with a security classification and a critical severity'
+Assert-Equal -Actual (Get-UpdatePolicyDecision -Update (New-PolicyUpdate -UpdateType '2' -CategoryIds @($securityUpdatesId))).Decision -Expected 'Exclude' -Message 'the integer driver enum is excluded like the Driver string'
+Assert-Equal -Actual (Get-UpdatePolicyDecision -Update (New-PolicyUpdate -BrowseOnly $true -CategoryIds @($securityUpdatesId) -MsrcSeverity 'Critical')).Decision -Expected 'Exclude' -Message 'BrowseOnly excludes automatic selection whatever else the update says'
+
+# Severity, once drivers and BrowseOnly have had their say.
+Assert-Equal -Actual (Get-UpdatePolicyDecision -Update (New-PolicyUpdate -MsrcSeverity 'Critical')).Decision -Expected 'Include' -Message 'a critical MSRC severity is selected'
+Assert-Equal -Actual (Get-UpdatePolicyDecision -Update (New-PolicyUpdate -MsrcSeverity 'Important')).Decision -Expected 'Include' -Message 'an important MSRC severity is selected'
+Assert-Equal -Actual (Get-UpdatePolicyDecision -Update (New-PolicyUpdate -MsrcSeverity 'Moderate')).Decision -Expected 'NeedsReview' -Message 'a lesser severity is neither included nor silently dropped'
+
+# The two KB-identified packages.
+Assert-Equal -Actual (Get-UpdatePolicyDecision -Update (New-PolicyUpdate -Title 'Narzedzie Windows do usuwania zlosliwego oprogramowania' -KbArticleIds @('890830'))).Decision -Expected 'Include' -Message 'MSRT is selected by its KB id, not its title'
+Assert-Equal -Actual (Get-UpdatePolicyDecision -Update (New-PolicyUpdate -Title 'Aktualizacja analizy zabezpieczen' -KbArticleIds @('KB2267602') -CategoryIds @($definitionUpdatesId))).Decision -Expected 'Include' -Message 'Defender signatures are selected by their KB id, not their title'
+
+# The Defender platform and engine updates are ordinary packages: the title fragment "Defender"
+# must never exclude them, and without structured backing they are a question, not a decision.
+Assert-Equal -Actual (Get-UpdatePolicyDecision -Update (New-PolicyUpdate -Title 'Update for Microsoft Defender Antivirus antimalware platform' -CategoryIds @($securityUpdatesId) -KbArticleIds @('4052623'))).Decision -Expected 'Include' -Message 'a Defender platform update with a security classification is an ordinary included update'
+Assert-Equal -Actual (Get-UpdatePolicyDecision -Update (New-PolicyUpdate -Title 'Update for Microsoft Defender Antivirus engine' -KbArticleIds @('4052623'))).Decision -Expected 'NeedsReview' -Message 'a Defender engine update is not excluded by its title, only unclassified'
+
+# Missing and unusable metadata.
+Assert-Equal -Actual (Get-UpdatePolicyDecision -Update (New-PolicyUpdate -BrowseOnly $null)).Decision -Expected 'NeedsReview' -Message 'an update with no classification, no severity and no BrowseOnly flag needs review'
+Assert-True -Condition ((Get-UpdatePolicyDecision -Update (New-PolicyUpdate -BrowseOnly $null)).Reason -like '*no classification*') -Message 'the missing-metadata reason says what was missing'
+Assert-Equal -Actual (Get-UpdatePolicyDecision -Update (New-PolicyUpdate -CategoryIds @('not-a-guid', ''))).Decision -Expected 'NeedsReview' -Message 'an unusable classification value matches nothing'
+Assert-Equal -Actual (Get-UpdatePolicyDecision -Update (New-PolicyUpdate -CategoryIds @($definitionUpdatesId))).Decision -Expected 'NeedsReview' -Message 'a classification this tool does not install on its own needs review'
+Assert-Equal -Actual (Get-UpdatePolicyDecision -Update (New-PolicyUpdate -KbArticleIds @('8908301'))).Decision -Expected 'NeedsReview' -Message 'a KB id that merely contains the MSRT number is not MSRT'
+
+# A plan saved before this change carries no categoryIds and no browseOnly at all. It must still
+# be readable, and the honest answer for it is NeedsReview rather than a guess in either
+# direction.
+$legacyUpdate = [pscustomobject]@{ title = '2026-06 Cumulative Update for Windows Server'; categories = @('Security Updates'); kbArticleIds = @('5031234'); msrcSeverity = ''; updateType = 'Software' }
+Assert-Equal -Actual (Get-UpdatePolicyDecision -Update $legacyUpdate).Decision -Expected 'NeedsReview' -Message 'an update record written before this change is read without throwing'
+
+# Get-DefaultUpdateSelection is the thin wrapper the group builder uses: only Include preselects.
+Assert-Equal -Actual (Get-DefaultUpdateSelection -Update (New-PolicyUpdate -CategoryIds @($securityUpdatesId))) -Expected $true -Message 'an included update is preselected'
+Assert-Equal -Actual (Get-DefaultUpdateSelection -Update (New-PolicyUpdate -BrowseOnly $true)) -Expected $false -Message 'an excluded update is not preselected'
+Assert-Equal -Actual (Get-DefaultUpdateSelection -Update (New-PolicyUpdate)) -Expected $false -Message 'an update needing review is not preselected'
+
+# The predicate that keeps Defender signatures out of the completion count. KB2267602 is the
+# stable identity - the title is localised, so a title rule would silently stop working on a
+# non-English server.
 Assert-Equal -Actual (Test-IsDefenderDefinitionUpdate -Title 'Security Intelligence Update for Microsoft Defender Antivirus' -KbArticleIds @('2267602')) -Expected $true -Message 'a Defender definition is recognised by its KB id'
 Assert-Equal -Actual (Test-IsDefenderDefinitionUpdate -Title 'Aktualizacja analizy zabezpieczen dla Microsoft Defender Antivirus' -KbArticleIds @('KB2267602')) -Expected $true -Message 'KB metadata is independent of title language'
 Assert-Equal -Actual (Test-IsDefenderDefinitionUpdate -Title 'Aktualizacja analizy zabezpieczen dla Microsoft Defender Antivirus' -KbArticleIds @(' kb2267602 ')) -Expected $true -Message 'a KB id with surrounding whitespace and mixed case is still recognised'
@@ -210,11 +284,74 @@ Assert-Equal -Actual (Test-IsDefenderDefinitionUpdate -Title '2026-06 Cumulative
 Assert-Equal -Actual (Test-IsDefenderDefinitionUpdate -Title '2026-06 Cumulative Update for Windows Server' -KbArticleIds @('5031234', '2267602')) -Expected $false -Message 'a package listing the definition KB alongside its own is not the definition'
 Assert-Equal -Actual (Test-IsDefenderDefinitionUpdate -Title 'Definition Update for Microsoft Endpoint Protection' -KbArticleIds @('2461484')) -Expected $false -Message 'SCEP definitions are a separate family this rule does not claim'
 
-Assert-True -Condition (Get-DefaultUpdateSelection -Title 'Localized package title' -Categories @('Updates') -MsrcSeverity 'Critical' -UpdateType 'Software') -Message 'critical MSRC severity is selected even when title is not English'
-Assert-True -Condition (Get-DefaultUpdateSelection -Title 'Localized package title' -Categories @('Updates') -MsrcSeverity 'Important' -UpdateType 'Software') -Message 'important MSRC severity is selected even when title is not English'
-Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Security-like driver title' -Categories @('Security Updates') -MsrcSeverity 'Critical' -UpdateType 'Driver')) -Message 'driver update type is skipped even when severity is critical'
-Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title 'Localized package title' -Categories @('Updates') -MsrcSeverity 'Critical' -UpdateType '2')) -Message 'integer driver enum value is skipped like the Driver string'
-Assert-True -Condition (-not (Get-DefaultUpdateSelection -Title '2026-06 Preview Cumulative Update for Windows Server' -Categories @('Updates') -MsrcSeverity 'Critical' -UpdateType 'Software')) -Message 'critical severity does not override the preview exclusion'
+
+# --- NeedsReview is a state of its own -----------------------------------------------------------
+# It is neither Green nor Pending: nothing here can be installed without someone deciding, and
+# guessing in either direction is what this state exists to prevent.
+
+$reviewSecurityId = '0fa1201d-4330-4fa8-8ae9-b877473b6441'
+$unclassifiedKey = 'aaaa1111-1111-1111-1111-111111111111|1'
+$reviewDiscovery = @(
+    [pscustomobject]@{ vmName = 'VM-review'; outcome = 'SearchOnly'; errors = @(); roleFlags = $null; updates = @(
+        [pscustomobject]@{ updateId = 'aaaa1111-1111-1111-1111-111111111111'; revisionNumber = 1; title = 'Something WUA did not classify'; kbArticleIds = @('5031234'); categories = @('Updates'); categoryIds = @(); browseOnly = $null; msrcSeverity = ''; updateType = 'Software' }
+    ) }
+)
+$reviewGroups = @(New-UpdateGroupRecords -DiscoveryRecords $reviewDiscovery)
+Assert-Equal -Actual $reviewGroups[0].policyDecision -Expected 'NeedsReview' -Message 'an unclassifiable group is marked for review'
+Assert-Equal -Actual $reviewGroups[0].selectedByDefault -Expected $false -Message 'a group needing review is not preselected'
+Assert-True -Condition ((Get-UpdateGroupDisplayTitle -UpdateGroup $reviewGroups[0]) -like '*NEEDS REVIEW*') -Message 'the list shows the uncertainty rather than an ordinary empty checkbox'
+
+$reviewStates = @(Get-VMPatchCompletionStates -DiscoveryRecords $reviewDiscovery -UpdateGroups $reviewGroups)
+Assert-Equal -Actual $reviewStates[0].state -Expected 'NeedsReview' -Message 'an unresolved review keeps the VM out of Green'
+Assert-Equal -Actual $reviewStates[0].needsReviewSelectableCount -Expected 1 -Message 'the review count is reported'
+
+# An explicit operator refusal - the identity in the deselected set - resolves it, exactly like
+# unticking an ordinary preselected group does.
+$resolvedStates = @(Get-VMPatchCompletionStates -DiscoveryRecords $reviewDiscovery -UpdateGroups $reviewGroups -DeselectedUpdateKeys @($unclassifiedKey))
+Assert-Equal -Actual $resolvedStates[0].state -Expected 'GreenByOperatorChoice' -Message 'a consciously refused review becomes an operator choice'
+
+# Refusing it by bare updateId also resolves it, because the revision changes between rounds.
+$revisedReviewDiscovery = @(
+    [pscustomobject]@{ vmName = 'VM-review'; outcome = 'SearchOnly'; errors = @(); roleFlags = $null; updates = @(
+        [pscustomobject]@{ updateId = 'aaaa1111-1111-1111-1111-111111111111'; revisionNumber = 2; title = 'Something WUA did not classify'; kbArticleIds = @('5031234'); categories = @('Updates'); categoryIds = @(); browseOnly = $null; msrcSeverity = ''; updateType = 'Software' }
+    ) }
+)
+$revisedReviewGroups = @(New-UpdateGroupRecords -DiscoveryRecords $revisedReviewDiscovery)
+$revisedReviewStates = @(Get-VMPatchCompletionStates -DiscoveryRecords $revisedReviewDiscovery -UpdateGroups $revisedReviewGroups -DeselectedUpdateKeys @($unclassifiedKey))
+Assert-Equal -Actual $revisedReviewStates[0].state -Expected 'GreenByOperatorChoice' -Message 'a revised package does not resurrect a review the operator already refused'
+
+# A classifiable group beside it still decides normally.
+$mixedReviewDiscovery = @(
+    [pscustomobject]@{ vmName = 'VM-mixed'; outcome = 'SearchOnly'; errors = @(); roleFlags = $null; updates = @(
+        [pscustomobject]@{ updateId = 'aaaa1111-1111-1111-1111-111111111111'; revisionNumber = 1; title = 'Something WUA did not classify'; kbArticleIds = @('5031234'); categories = @('Updates'); categoryIds = @(); browseOnly = $null; msrcSeverity = ''; updateType = 'Software' },
+        [pscustomobject]@{ updateId = 'bbbb2222-2222-2222-2222-222222222222'; revisionNumber = 1; title = 'Classified security update'; kbArticleIds = @('5031235'); categories = @('Security Updates'); categoryIds = @($reviewSecurityId); browseOnly = $false; msrcSeverity = ''; updateType = 'Software' }
+    ) }
+)
+$mixedReviewGroups = @(New-UpdateGroupRecords -DiscoveryRecords $mixedReviewDiscovery)
+$mixedReviewStates = @(Get-VMPatchCompletionStates -DiscoveryRecords $mixedReviewDiscovery -UpdateGroups $mixedReviewGroups)
+Assert-Equal -Actual $mixedReviewStates[0].state -Expected 'Pending' -Message 'a real pending update outranks a review'
+
+# --- the decision must not depend on which VM reported the group first ----------------------------
+# One identity key, two VMs, contradictory structured metadata. Taking the first record would make
+# the answer depend on the order of the VM list; OR-ing them would silently pick the more
+# permissive one. Both orders must give the same answer, and that answer is NeedsReview.
+
+$conflictKey = 'cccc3333-3333-3333-3333-333333333333|1'
+$conflictUpdateA = [pscustomobject]@{ updateId = 'cccc3333-3333-3333-3333-333333333333'; revisionNumber = 1; title = 'Contested package'; kbArticleIds = @('5031236'); categories = @('Security Updates'); categoryIds = @($reviewSecurityId); browseOnly = $false; msrcSeverity = 'Critical'; updateType = 'Software' }
+$conflictUpdateB = [pscustomobject]@{ updateId = 'cccc3333-3333-3333-3333-333333333333'; revisionNumber = 1; title = 'Contested package'; kbArticleIds = @('5031236'); categories = @('Updates'); categoryIds = @(); browseOnly = $true; msrcSeverity = ''; updateType = 'Software' }
+
+foreach ($order in @(@('A', 'B'), @('B', 'A'))) {
+    $first = if ($order[0] -eq 'A') { $conflictUpdateA } else { $conflictUpdateB }
+    $second = if ($order[1] -eq 'A') { $conflictUpdateA } else { $conflictUpdateB }
+    $conflictDiscovery = @(
+        [pscustomobject]@{ vmName = 'VM-first'; outcome = 'SearchOnly'; errors = @(); roleFlags = $null; updates = @($first) },
+        [pscustomobject]@{ vmName = 'VM-second'; outcome = 'SearchOnly'; errors = @(); roleFlags = $null; updates = @($second) }
+    )
+    $conflictGroups = @(New-UpdateGroupRecords -DiscoveryRecords $conflictDiscovery)
+    $conflictGroup = @($conflictGroups | Where-Object { $_.identityKey -eq $conflictKey })[0]
+    Assert-Equal -Actual $conflictGroup.policyDecision -Expected 'NeedsReview' -Message ('contradictory metadata for one key is never resolved by record order (' + ($order -join '') + ')')
+    Assert-Equal -Actual $conflictGroup.selectedByDefault -Expected $false -Message ('a contested group is not preselected (' + ($order -join '') + ')')
+}
 
 Assert-Equal -Actual (Get-RoleFlagText -RoleFlags $null) -Expected 'unknown' -Message 'missing role flags are unknown'
 Assert-Equal -Actual (Get-RoleFlagText -RoleFlags ([pscustomobject]@{ detected = @() })) -Expected 'none' -Message 'empty role flags are none'
@@ -479,11 +616,11 @@ Assert-Equal -Actual (Get-StateFor -States $revisedStates -VMName 'VM02').state 
 # what matters is what the operator is shown and what an explicit tick actually installs.
 $defenderDiscovery = @(
     [pscustomobject]@{ vmName = 'VM01'; outcome = 'SearchOnly'; errors = @(); roleFlags = $null; updates = @(
-        [pscustomobject]@{ updateId = 'dddddddd-4444-4444-4444-444444444444'; revisionNumber = 200; title = 'Aktualizacja analizy zabezpieczen dla Microsoft Defender Antivirus - KB2267602'; kbArticleIds = @('2267602'); categories = @('Definition Updates'); msrcSeverity = 'Critical'; updateType = 'Software' },
-        [pscustomobject]@{ updateId = 'cccccccc-3333-3333-3333-333333333333'; revisionNumber = 1; title = '2026-06 Cumulative Update for Windows Server'; kbArticleIds = @('5031234'); categories = @('Security Updates'); msrcSeverity = 'Critical'; updateType = 'Software' },
-        [pscustomobject]@{ updateId = 'eeeeeeee-5555-5555-5555-555555555555'; revisionNumber = 1; title = 'Update for Microsoft Defender Antivirus antimalware platform - KB4052623'; kbArticleIds = @('4052623'); categories = @('Security Updates'); msrcSeverity = 'Critical'; updateType = 'Software' },
-        [pscustomobject]@{ updateId = 'ffffffff-6666-6666-6666-666666666666'; revisionNumber = 1; title = 'Intel Chipset Driver'; kbArticleIds = @(); categories = @('Drivers'); msrcSeverity = $null; updateType = 'Driver' },
-        [pscustomobject]@{ updateId = '11111111-7777-7777-7777-777777777777'; revisionNumber = 1; title = '2026-06 Preview Cumulative Update for Windows Server'; kbArticleIds = @('5031299'); categories = @('Updates'); msrcSeverity = 'Critical'; updateType = 'Software' }
+        [pscustomobject]@{ updateId = 'dddddddd-4444-4444-4444-444444444444'; revisionNumber = 200; title = 'Aktualizacja analizy zabezpieczen dla Microsoft Defender Antivirus - KB2267602'; kbArticleIds = @('2267602'); categories = @('Definition Updates'); categoryIds = @('e0789628-ce08-4437-be74-2495b842f43b'); browseOnly = $false; msrcSeverity = 'Critical'; updateType = 'Software' },
+        [pscustomobject]@{ updateId = 'cccccccc-3333-3333-3333-333333333333'; revisionNumber = 1; title = '2026-06 Cumulative Update for Windows Server'; kbArticleIds = @('5031234'); categories = @('Security Updates'); categoryIds = @('0fa1201d-4330-4fa8-8ae9-b877473b6441'); browseOnly = $false; msrcSeverity = 'Critical'; updateType = 'Software' },
+        [pscustomobject]@{ updateId = 'eeeeeeee-5555-5555-5555-555555555555'; revisionNumber = 1; title = 'Update for Microsoft Defender Antivirus antimalware platform - KB4052623'; kbArticleIds = @('4052623'); categories = @('Security Updates'); categoryIds = @('0fa1201d-4330-4fa8-8ae9-b877473b6441'); browseOnly = $false; msrcSeverity = 'Critical'; updateType = 'Software' },
+        [pscustomobject]@{ updateId = 'ffffffff-6666-6666-6666-666666666666'; revisionNumber = 1; title = 'Intel Chipset Driver'; kbArticleIds = @(); categories = @('Drivers'); categoryIds = @(); browseOnly = $false; msrcSeverity = $null; updateType = 'Driver' },
+        [pscustomobject]@{ updateId = '11111111-7777-7777-7777-777777777777'; revisionNumber = 1; title = '2026-06 Preview Cumulative Update for Windows Server'; kbArticleIds = @('5031299'); categories = @('Updates'); categoryIds = @(); browseOnly = $true; msrcSeverity = 'Critical'; updateType = 'Software' }
     ) }
 )
 $defenderGroups = @(New-UpdateGroupRecords -DiscoveryRecords $defenderDiscovery)
@@ -516,7 +653,7 @@ Assert-Equal -Actual $defenderPlanVM.selectedUpdates[0].identityKey -Expected $d
 # a different group and a fully patched fleet never converges.
 $definitionOnlyDiscovery = @(
     [pscustomobject]@{ vmName = 'VM01'; outcome = 'SearchOnly'; errors = @(); roleFlags = $null; updates = @(
-        [pscustomobject]@{ updateId = 'dddddddd-4444-4444-4444-444444444444'; revisionNumber = 200; title = 'Aktualizacja analizy zabezpieczen dla Microsoft Defender Antivirus - KB2267602'; kbArticleIds = @('2267602'); categories = @('Definition Updates'); msrcSeverity = 'Critical'; updateType = 'Software' }
+        [pscustomobject]@{ updateId = 'dddddddd-4444-4444-4444-444444444444'; revisionNumber = 200; title = 'Aktualizacja analizy zabezpieczen dla Microsoft Defender Antivirus - KB2267602'; kbArticleIds = @('2267602'); categories = @('Definition Updates'); categoryIds = @('e0789628-ce08-4437-be74-2495b842f43b'); browseOnly = $false; msrcSeverity = 'Critical'; updateType = 'Software' }
     ) }
 )
 $definitionOnlyGroups = @(New-UpdateGroupRecords -DiscoveryRecords $definitionOnlyDiscovery)
@@ -530,7 +667,7 @@ Assert-Equal -Actual (Get-GroupFor -Groups $definitionOnlyGroups -IdentityKey $d
 # one or not, the new revision must not start blocking Green.
 $definitionRevisedDiscovery = @(
     [pscustomobject]@{ vmName = 'VM01'; outcome = 'SearchOnly'; errors = @(); roleFlags = $null; updates = @(
-        [pscustomobject]@{ updateId = 'dddddddd-4444-4444-4444-444444444444'; revisionNumber = 201; title = 'Aktualizacja analizy zabezpieczen dla Microsoft Defender Antivirus - KB2267602'; kbArticleIds = @('2267602'); categories = @('Definition Updates'); msrcSeverity = 'Critical'; updateType = 'Software' }
+        [pscustomobject]@{ updateId = 'dddddddd-4444-4444-4444-444444444444'; revisionNumber = 201; title = 'Aktualizacja analizy zabezpieczen dla Microsoft Defender Antivirus - KB2267602'; kbArticleIds = @('2267602'); categories = @('Definition Updates'); categoryIds = @('e0789628-ce08-4437-be74-2495b842f43b'); browseOnly = $false; msrcSeverity = 'Critical'; updateType = 'Software' }
     ) }
 )
 $definitionRevisedGroups = @(New-UpdateGroupRecords -DiscoveryRecords $definitionRevisedDiscovery)

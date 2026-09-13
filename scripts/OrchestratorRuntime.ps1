@@ -893,11 +893,37 @@ function Merge-PatchRunStates {
     }
 }
 
+# The states a run may end on. An allow-list, not a deny-list of Pending/Failed: every state
+# added since - NeedsReview, PendingReboot - would otherwise have passed this test by default,
+# and so would a typo. Excluded is allowed but means "outside the scope of patching", not patched.
+$script:PatchRunSuccessfulStates = @('Green', 'GreenByOperatorChoice', 'Excluded')
+
 function Test-PatchRunAllGreen {
-    param([hashtable]$StateMap)
+    param(
+        [hashtable]$StateMap,
+        # Every VM this run was supposed to reach. A VM missing from the map has no verdict at
+        # all, and no verdict is not success: it is the shape a VM takes when it dropped out of
+        # the round loop without anyone recording why.
+        [string[]]$ExpectedVMNames = @()
+    )
 
     foreach ($vmName in @($StateMap.Keys)) {
-        if ([string]$StateMap[$vmName].state -in @('Pending', 'Failed')) {
+        if ([string]$StateMap[$vmName].state -notin $script:PatchRunSuccessfulStates) {
+            return $false
+        }
+    }
+
+    foreach ($expectedVMName in @($ExpectedVMNames)) {
+        $expectedKey = [string]$expectedVMName
+        if ([string]::IsNullOrWhiteSpace($expectedKey)) {
+            continue
+        }
+
+        if (-not $StateMap.ContainsKey($expectedKey)) {
+            return $false
+        }
+
+        if ([string]$StateMap[$expectedKey].state -notin $script:PatchRunSuccessfulStates) {
             return $false
         }
     }

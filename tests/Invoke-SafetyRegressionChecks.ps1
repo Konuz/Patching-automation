@@ -1685,6 +1685,149 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
     }
 }
 
+# F6: an update the policy cannot classify is only resolved by an operator who saw it. The whole
+# path runs through the production round loop: an unticked box after an interactive selection is a
+# decision, the same box left unticked by a non-interactive run is not, and the run has to end
+# incomplete in the second case rather than reporting a green fleet.
+& {
+    $f6Directory = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-f6-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $f6Directory | Out-Null
+
+    $f6RoundLoop = $orchestratorAst.Find({ param($node)
+        $node -is [System.Management.Automation.Language.WhileStatementAst] -and $node.Extent.Text.Contains('$roundNumber++')
+    }, $true)
+    $f6RoundFinalization = $orchestratorAst.Find({ param($node)
+        $node -is [System.Management.Automation.Language.IfStatementAst] -and $node.Extent.Text.Contains('Write-PatchRunSummary -RunOutputDirectory')
+    }, $true)
+    Assert-Equal ($null -ne $f6RoundLoop) $true 'F6: the production round loop is available to the policy-review regression'
+
+    # No classification GUIDs, no severity, no BrowseOnly flag: exactly what WUA gives for a
+    # package this tool has no structural grounds to install or skip.
+    $f6Update = [pscustomobject]@{
+        updateId = '66666666-6666-6666-6666-666666666666'
+        revisionNumber = 1
+        title = 'Paket ohne Klassifizierung'
+        kbArticleIds = @('5031240')
+        categories = @('Updates')
+        categoryIds = @()
+        browseOnly = $null
+        msrcSeverity = ''
+        updateType = 'Software'
+    }
+    $f6Discovery = @(
+        [pscustomobject]@{ vmName = 'VM-review'; computerName = 'VM-review'; outcome = 'SearchOnly'; errors = @(); roleFlags = [pscustomobject]@{ failoverCluster = $false }; pendingRebootBefore = [pscustomobject]@{ isPending = $false }; updates = @($f6Update) }
+    )
+
+    $script:f6SelectionPrompts = 0
+    function Invoke-DiscoveryPhase {
+        param($TargetVMNames, $VIServerScope, $Managers, $GuestCredentialMap, $CurlPath, $AgentPath, $IdentityHelperPath, $WorkspaceScriptPath, $RunGuardScriptPath, $GuestWorkingDirectory, $MaxUpdates, $TimeoutSeconds, $PollSeconds, $CycleOutputDirectory, $MaxInFlight, $CredentialContext, $CredentialDecisionScript, $CredentialValidatedScript, $CredentialInteractive)
+        return @($f6Discovery)
+    }
+    function Read-UpdateGroupSelection {
+        param($UpdateGroups, $PromptProvider)
+        $script:f6SelectionPrompts++
+        # The operator looked at the list and left the unclassified group unticked.
+        return [pscustomobject]@{ Aborted = $false; Keys = @() }
+    }
+    function Confirm-PatchPlan { param([switch]$SkipConfirmation) $true }
+    function Read-ContinuePatchingDecision { param($CompletionStates, $Round) return 'FINISH' }
+    function Invoke-ApplyAndOptionalReboot {
+        param($PatchPlanRecords, $VIServerScope, $Managers, $GuestCredentialMap, $VIServers, $VIServerCredentialMap, [switch]$IgnoreVCenterCertificate, $GuestOpsLibPath, $CurlPath, $AgentPath, $IdentityHelperPath, $WorkspaceScriptPath, $RunGuardScriptPath, $RebootRequestScriptPath, $GuestWorkingDirectory, $TimeoutSeconds, $RebootTimeoutSeconds, $PollSeconds, $CycleOutputDirectory, $ThrottleLimit, $RebootBatchSize, $DiscoveryRecords, $CredentialContext, $CredentialDecisionScript, $CredentialValidatedScript, $CredentialInteractive)
+        return [pscustomobject]@{ ExitCode = 0; RebootRan = $false; RebootActions = @(); ApplyResults = @() }
+    }
+    function Write-PatchRoundVerification { param($CompletionStates, $Round) }
+    function Write-PatchRunSummary { param($RunOutputDirectory, $RoundSummaries, $FinalStateMap) }
+    function Show-UpdateGroups { param($UpdateGroups) }
+    function Show-PatchPlan { param($PatchPlanRecords) }
+
+    $f6Invoke = {
+        param([bool]$NonInteractive)
+        $script:f6SelectionPrompts = 0
+        $roundNumber = 0
+        $targetVMNames = @('VM-review')
+        $roundTargetVMNames = @($targetVMNames)
+        $roundSummaries = @()
+        $finalStateMap = @{}
+        $deselectedUpdateKeys = @()
+        $stoppedByRoundCap = $false
+        $sawApplyFailure = $false
+        $scriptExitCode = 0
+        $runOutputDirectory = $f6Directory
+        $MaxPatchRounds = 1
+        $SearchOnly = $false
+        $PlanOnly = $false
+        $hasExplicitSelectedUpdateKeys = $NonInteractive
+        $SelectedUpdateKeys = if ($NonInteractive) { @('66666666-6666-6666-6666-666666666666|1-not-selected') } else { @() }
+        $SkipConfirmation = $NonInteractive
+        $PromptProvider = $null
+        $managers = $null
+        $guestCredentialMap = @{}
+        $guestCredentialContext = $null
+        $guestCredentialDecisionScript = $null
+        $guestCredentialValidatedScript = $null
+        $guestCredentialInteractive = $false
+        $resolvedVIServers = @('vc.synthetic.invalid')
+        $viServerScope = @('vc.synthetic.invalid')
+        $viserverCredentialMap = @{}
+        $IgnoreVCenterCertificate = $false
+        $guestOpsLibPath = 'unused'
+        $curlPath = 'unused'
+        $AgentPath = 'unused'
+        $identityHelperPath = 'unused'
+        $workspaceScriptPath = 'unused'
+        $runGuardScriptPath = 'unused'
+        $rebootRequestScriptPath = 'unused'
+        $GuestWorkingDirectory = 'C:\unused'
+        $TimeoutMinutes = 1
+        $RebootTimeoutMinutes = 1
+        $PollSeconds = 1
+        $ThrottleLimit = 1
+        $resolvedRebootBatchSize = 1
+        $MaxUpdates = 1
+
+        # A non-interactive run reaches selection through -SelectedUpdateKeys, which must not
+        # match the unclassified group: the point is that nobody chose it either way.
+        if ($NonInteractive) {
+            function Resolve-SelectedUpdateKeys { param($UpdateGroups, [string[]]$ExplicitSelectedUpdateKeys = @()) return @() }
+        }
+
+        . ([scriptblock]::Create(($f6RoundLoop.Extent.Text + "`n" + $f6RoundFinalization.Extent.Text)))
+
+        return [pscustomobject]@{
+            ExitCode = $scriptExitCode
+            State = [string]$finalStateMap['VM-review'].state
+            Prompts = $script:f6SelectionPrompts
+            DeselectedKeys = @($deselectedUpdateKeys)
+        }
+    }
+
+    try {
+        $interactive = & $f6Invoke $false
+        Assert-Equal $interactive.Prompts 1 'F6: the operator is shown the group list once'
+        Assert-Equal $interactive.State 'GreenByOperatorChoice' 'F6: a group an operator saw and left unticked is a decision'
+        Assert-Equal $interactive.ExitCode 0 'F6: an operator-resolved review lets the run finish'
+        Assert-Equal (@($interactive.DeselectedKeys) -join ',') '66666666-6666-6666-6666-666666666666|1' 'F6: the refusal is remembered by identity so later rounds do not ask again'
+
+        $nonInteractive = & $f6Invoke $true
+        Assert-Equal $nonInteractive.Prompts 0 'F6: a non-interactive run never opens the selection'
+        Assert-Equal $nonInteractive.State 'NeedsReview' 'F6: without an operator the unclassified group leaves the VM needing review'
+        Assert-Equal $nonInteractive.ExitCode 1 'F6: a run that needed a decision nobody made is incomplete'
+        Assert-Equal (@($nonInteractive.DeselectedKeys).Count) 0 'F6: a default nobody looked at is never recorded as an operator decision'
+    }
+    finally {
+        Remove-Item Function:\Invoke-DiscoveryPhase -ErrorAction SilentlyContinue
+        Remove-Item Function:\Read-UpdateGroupSelection -ErrorAction SilentlyContinue
+        Remove-Item Function:\Confirm-PatchPlan -ErrorAction SilentlyContinue
+        Remove-Item Function:\Read-ContinuePatchingDecision -ErrorAction SilentlyContinue
+        Remove-Item Function:\Invoke-ApplyAndOptionalReboot -ErrorAction SilentlyContinue
+        Remove-Item Function:\Write-PatchRoundVerification -ErrorAction SilentlyContinue
+        Remove-Item Function:\Write-PatchRunSummary -ErrorAction SilentlyContinue
+        Remove-Item Function:\Show-UpdateGroups -ErrorAction SilentlyContinue
+        Remove-Item Function:\Show-PatchPlan -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $f6Directory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 if ($failures.Count -gt 0) {
     foreach ($failure in $failures) { Write-Host ('FAIL: ' + $failure) }
     exit 1

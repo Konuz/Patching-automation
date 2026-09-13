@@ -189,6 +189,33 @@ function Get-ComCategoryCollection {
     return $values
 }
 
+function Get-ComCategoryIdCollection {
+    param($Collection)
+
+    # Category NAMES are localised - a German guest reports "Sicherheitsupdates" - so they are
+    # display text only. The CategoryID is the stable classification GUID, and it is what the
+    # selection policy decides on.
+    $values = @()
+    if ($null -eq $Collection) {
+        return $values
+    }
+
+    for ($i = 0; $i -lt $Collection.Count; $i++) {
+        try {
+            $category = $Collection.Item($i)
+            $categoryId = [string](Get-OptionalStringPropertyValue -InputObject $category -Name 'CategoryID')
+            if (-not [string]::IsNullOrWhiteSpace($categoryId)) {
+                $values += $categoryId
+            }
+        }
+        catch {
+            Write-AgentLog -Message ('Unable to read update category id at index {0}: {1}' -f $i, $_.Exception.Message)
+        }
+    }
+
+    return $values
+}
+
 function Test-IsElevated {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -324,15 +351,26 @@ function New-UpdateRecord {
     }
 
     $categories = @()
+    $categoryIds = @()
     try {
         $categories = @(Get-ComCategoryCollection -Collection $Update.Categories)
+        $categoryIds = @(Get-ComCategoryIdCollection -Collection $Update.Categories)
     }
     catch {
         $categories = @()
+        $categoryIds = @()
     }
 
     $msrcSeverity = Get-OptionalStringPropertyValue -InputObject $Update -Name 'MsrcSeverity'
     $updateType = ConvertTo-UpdateTypeName -TypeValue (Get-OptionalPropertyValue -InputObject $Update -Name 'Type')
+
+    # IUpdate3.BrowseOnly. Three-valued on purpose: $null means WUA did not expose it (an older
+    # IUpdate, or a COM read that failed), and an absent answer must never be read as $false.
+    $browseOnly = $null
+    $browseOnlyValue = Get-OptionalPropertyValue -InputObject $Update -Name 'BrowseOnly'
+    if ($null -ne $browseOnlyValue) {
+        try { $browseOnly = [bool]$browseOnlyValue } catch { $browseOnly = $null }
+    }
 
     return [ordered]@{
         index = $Index
@@ -342,6 +380,8 @@ function New-UpdateRecord {
         revisionNumber = $revisionNumber
         identityKey = $identityKey
         categories = $categories
+        categoryIds = $categoryIds
+        browseOnly = $browseOnly
         msrcSeverity = $msrcSeverity
         updateType = $updateType
         selected = $false

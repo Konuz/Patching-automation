@@ -369,6 +369,59 @@ preference for the rest of the run. A corrected vCenter password is written unde
 `vcenter:target:<name>`, never the shared domain key, so the other servers behind that suffix do
 not inherit a credential nobody validated against them. `Remember` still defaults to ticked.
 
+### Update policy: structural, and honest about what it cannot classify
+
+The old rule read the title and the localised category names, so the *same package* was selected
+on an English guest and skipped on a German or Polish one, and any title containing the word
+"Security" was selected whatever it actually was. `Get-UpdatePolicyDecision` now decides on
+structured WUA metadata only, in this order:
+
+1. `UpdateType` `Driver` (or the raw enum `2`) → **Exclude**.
+2. `BrowseOnly = $true` → **Exclude**. This is WUA's own "do not offer automatically" flag and the
+   closest thing to a structured preview marker. It is *not* a promise that every preview package
+   carries it — see below.
+3. KB `890830` (MSRT) or KB `2267602` (Defender security intelligence) → **Include**, by KB id
+   rather than title.
+4. Classification GUID `SecurityUpdates` (`0fa1201d-…`), `CriticalUpdates` (`e6cf1350-…`) or
+   `UpdateRollups` (`28bc880e-…`) → **Include**. Braces and case do not matter.
+5. `MsrcSeverity` `Critical` or `Important` → **Include**.
+6. Anything else → **`NeedsReview`**.
+
+`NeedsReview` is the deliberate cost, stated rather than hidden: **there is no way to keep the
+English title heuristics and still call the result structural.** The old `cumulative` regex cannot
+be replaced by including the `Updates`, `FeaturePacks` or `Upgrades` classifications wholesale —
+that would sweep in feature updates and upgrades, which is worse than asking. So a package that
+cannot be classified from its metadata waits for an operator instead of being guessed at in
+either direction. Two situations end there: metadata that is *missing* (no classification GUIDs,
+no severity, no `BrowseOnly` — including every plan saved before this change, which stays
+readable), and metadata that is present but simply is not a classification this tool installs on
+its own.
+
+Consequences, all load-bearing:
+
+- **A `NeedsReview` group is not preselected, and not silently ignored either.** It gives the VM
+  its own state, `NeedsReview`, which is neither `Green` nor `Pending` and **cannot produce exit
+  0**. A real `Pending` group outranks it.
+- **Only an operator resolves it.** Ticking it installs it; leaving it unticked *after an
+  interactive selection* refuses it and the identity goes into the deselected set, so the VM ends
+  `GreenByOperatorChoice` and later rounds do not ask again (matched on the bare `updateId` too,
+  since the revision changes). A box left unticked by a run that never opened the selection —
+  `-SelectedUpdateKeys` or `-SkipConfirmation` — is **not** a decision: that run ends incomplete
+  with exit 1. There is no separate dialog for reviews; the existing group list marks them
+  `[NEEDS REVIEW]` with the reason, through `Get-UpdateGroupDisplayTitle`, shared by the console
+  list and the GUI dialog so the two cannot describe a group differently.
+- **Contradictory metadata for one identity key is `NeedsReview`, not first-wins.** Several VMs
+  report the same package; if their `categoryIds`, `browseOnly`, `msrcSeverity` or `updateType`
+  disagree, taking the first record would make the answer depend on the order of the VM list, and
+  OR-ing them would silently pick the more permissive one.
+- **Defender signatures still never decide whether a VM is finished** (see below), and that
+  exemption covers the review count too. Defender *platform* and *engine* updates are ordinary
+  packages: the word "Defender" in a title excludes nothing.
+
+Discovery therefore writes `categoryIds` (normalised GUIDs) and `browseOnly` (`true`/`false`/
+`null` — a missing answer is never `false`) alongside the existing `categories` display names, and
+both travel through grouping, the plan and the saved-plan reader.
+
 ### Patch rounds
 
 A run repeats **discovery → group selection → plan → confirm → apply → reboot** until every VM is
@@ -409,7 +462,13 @@ the verification of round N.
   emits an array as a **single** pipeline object on 5.1, so `@($raw | ConvertFrom-Json).Count`
   counts the array rather than its elements.
 - **Exit code** is 0 only when every VM ends `Green`/`GreenByOperatorChoice`/`Excluded` in the
-  state map **merged across rounds**, every apply succeeded and every reboot was confirmed. The
+  state map **merged across rounds**, every apply succeeded and every reboot was confirmed.
+  `Test-PatchRunAllGreen` holds an **allow-list** of those three states, not a deny-list of
+  `Pending`/`Failed`: every state added later — `NeedsReview`, `PendingReboot` — would otherwise
+  have passed it by default, and so would a typo. It is also given the run's expected VM names,
+  because a VM with no verdict at all is not a success: that is the shape a VM takes when it fell
+  out of the round loop without anyone recording why. `Excluded` is an acceptable ending but means
+  "outside the scope of patching", not "patched". The
   merge matters: later rounds only target VMs that were still pending, so a VM that failed
   discovery in round 1 is absent from round 2 and reading the verdict off the last round alone
   would let it vanish. `-SearchOnly`, `-PlanOnly` and `-PatchPlanPath` keep their existing
@@ -523,6 +582,10 @@ The single-VM index-selection mode is validation scaffolding, not the final prod
 
 - Update selection becomes a **checkbox group view** keyed technically on **`UpdateID` + `RevisionNumber`** (KB/title shown to humans but not authoritative).
 - **Failover Cluster detected → hard skip** the VM ("update manually one by one"). SQL/Exchange become high-risk role flags; Domain Controller and IIS are also detected as role flags. None of these auto-skip.
-- Default policy first uses structured WUA fields (`MsrcSeverity`, `Type`) when available, then falls back to title/category matching. It preselects critical/important software updates and cumulative/security/critical/rollup + MSRT; it skips driver, preview, feature, and optional updates.
+- **The default policy is structural and language-independent.** It reads the WUA classification
+  GUIDs, `MsrcSeverity`, `UpdateType`, `BrowseOnly` and the KB id — never the title and never the
+  category *names*, both of which are localised. `Get-UpdatePolicyDecision` answers
+  `Include`/`Exclude`/`NeedsReview` with a reason, and `Get-DefaultUpdateSelection` preselects only
+  on `Include`. See "Update policy" below for the full rule and for what was given up to get here.
 - **Microsoft Defender Antivirus security intelligence updates (KB2267602) are selected like anything else, but they never decide whether a VM is finished.** `Get-VMPatchCompletionStates` skips them in both the pending and the deselected count (`Test-IsDefenderDefinitionUpdate`), so installing one does not make a VM green and failing to install one does not keep it pending. WUA republishes them within hours under a new `UpdateID|RevisionNumber`, so counting them would mean round N+1 discovers a different group and a fully patched fleet never converges - every run would burn `MaxPatchRounds` and exit 1. The match is on the KB id, because the title is localised; the English title is a backstop when WUA returns no KB ids. Defender platform and engine updates are ordinary updates and are counted normally, as are SCEP and legacy Windows Defender definitions.
 ```

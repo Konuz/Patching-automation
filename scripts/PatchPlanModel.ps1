@@ -132,47 +132,158 @@ function Get-UpdateKbText {
     return ($kbValues -join ',')
 }
 
-function Get-DefaultUpdateSelection {
+# WUA update classification GUIDs. Stable across languages and Windows versions - unlike the
+# category NAMES, which are localised, and unlike the title, which is localised too. These three
+# are the only classifications this tool selects on its own.
+$script:UpdatePolicyCategoryIds = @{
+    SecurityUpdates = '0fa1201d-4330-4fa8-8ae9-b877473b6441'
+    CriticalUpdates = 'e6cf1350-c01b-414d-a61f-263d14d133b4'
+    UpdateRollups   = '28bc880e-0592-4cbf-8f95-c79b17911d5f'
+}
+
+# Two packages that are selected by KB id rather than classification. The KB id is stable; the
+# title is not (MSRT and the Defender signatures are both localised).
+$script:UpdatePolicyKbIds = @{
+    MalicousSoftwareRemovalTool = '890830'
+    DefenderSignatures          = '2267602'
+}
+
+function Test-UpdatePolicyKbMatch {
     param(
-        [string]$Title,
-        [string[]]$Categories = @(),
-        [string]$MsrcSeverity,
-        [string]$UpdateType
+        [string[]]$KbArticleIds = @(),
+        [string]$KbId
     )
 
-    $text = ('{0} {1}' -f $Title, (@($Categories) -join ' '))
-
-    # Exclusions first — these veto selection regardless of MSRC severity.
-    if ([string]$UpdateType -match '(?i)^(driver|2)$') {
-        return $false
-    }
-
-    if ($text -match '(?i)\bpreview\b') {
-        return $false
-    }
-
-    if ($text -match '(?i)\bdrivers?\b') {
-        return $false
-    }
-
-    if ($text -match '(?i)feature update') {
-        return $false
-    }
-
-    if ($text -match '(?i)browse[- ]only|\boptional\b') {
-        return $false
-    }
-
-    # Structured inclusion — selected MSRC severity, after exclusions have had their say.
-    if ([string]$MsrcSeverity -match '(?i)^(critical|important)$') {
-        return $true
-    }
-
-    if ($text -match '(?i)cumulative|security|critical|update rollup|malicious software removal tool') {
-        return $true
+    foreach ($candidate in @($KbArticleIds)) {
+        $text = ([string]$candidate).Trim()
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            continue
+        }
+        if ($text -match ('^(?i:KB)?{0}$' -f [regex]::Escape($KbId))) {
+            return $true
+        }
     }
 
     return $false
+}
+
+function Test-UpdatePolicyCategoryMatch {
+    param(
+        [string[]]$CategoryIds = @(),
+        [string]$CategoryId
+    )
+
+    foreach ($candidate in @($CategoryIds)) {
+        $text = ([string]$candidate).Trim().Trim('{', '}')
+        if ([string]::IsNullOrWhiteSpace($text)) {
+            continue
+        }
+        if ([string]::Equals($text, $CategoryId, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-UpdatePolicyDecision {
+    param($Update)
+
+    # Include / Exclude / NeedsReview, decided on structured WUA metadata only.
+    #
+    # The rule this replaces read the title and the category NAMES, which are localised: the same
+    # package was selected on an English guest and skipped on a German or Polish one, and a title
+    # containing the word "Security" in any product name was selected whatever it actually was.
+    # There is no honest way to keep the title heuristics and still call the result structural,
+    # so they are gone - and the price is admitted rather than hidden: a package this tool cannot
+    # classify from its metadata becomes NeedsReview and waits for an operator, instead of being
+    # quietly guessed at in either direction.
+    $updateType = [string](Get-ModelPropertyValue -InputObject $Update -Name 'updateType')
+    $msrcSeverity = [string](Get-ModelPropertyValue -InputObject $Update -Name 'msrcSeverity')
+    $categoryIds = @(Get-ModelPropertyValue -InputObject $Update -Name 'categoryIds' -DefaultValue @())
+    $kbArticleIds = @(Get-ModelPropertyValue -InputObject $Update -Name 'kbArticleIds' -DefaultValue @())
+    $browseOnlyValue = Get-ModelPropertyValue -InputObject $Update -Name 'browseOnly'
+
+    # 1. Drivers are out. WUA's Type is 2 for a driver; the name form is what discovery writes.
+    if ($updateType -match '(?i)^(driver|2)$') {
+        return [pscustomobject]@{ Decision = 'Exclude'; Reason = 'Driver updates are never selected automatically.' }
+    }
+
+    # 2. BrowseOnly is WUA's own "do not offer this automatically" flag, and it is the closest
+    #    thing to a structured preview marker. It is NOT a guarantee that every preview package
+    #    carries it - see NeedsReview below - but where it is set, it decides.
+    if ($null -ne $browseOnlyValue -and [bool]$browseOnlyValue) {
+        return [pscustomobject]@{ Decision = 'Exclude'; Reason = 'WUA marks this update BrowseOnly, so it is not offered automatically.' }
+    }
+
+    # 3. The two packages selected by KB id rather than classification.
+    if (Test-UpdatePolicyKbMatch -KbArticleIds $kbArticleIds -KbId $script:UpdatePolicyKbIds.MalicousSoftwareRemovalTool) {
+        return [pscustomobject]@{ Decision = 'Include'; Reason = 'Malicious Software Removal Tool (KB890830).' }
+    }
+
+    if (Test-UpdatePolicyKbMatch -KbArticleIds $kbArticleIds -KbId $script:UpdatePolicyKbIds.DefenderSignatures) {
+        return [pscustomobject]@{ Decision = 'Include'; Reason = 'Microsoft Defender security intelligence update (KB2267602).' }
+    }
+
+    # 4. Classification GUIDs, for software updates with usable metadata.
+    foreach ($categoryName in @('SecurityUpdates', 'CriticalUpdates', 'UpdateRollups')) {
+        if (Test-UpdatePolicyCategoryMatch -CategoryIds $categoryIds -CategoryId $script:UpdatePolicyCategoryIds[$categoryName]) {
+            return [pscustomobject]@{ Decision = 'Include'; Reason = ('Classification {0}.' -f $categoryName) }
+        }
+    }
+
+    # 5. MSRC severity, when WUA supplies it. A severity is only meaningful on a software update,
+    #    and drivers and BrowseOnly packages have already been excluded above.
+    if ($msrcSeverity -match '(?i)^(critical|important)$') {
+        return [pscustomobject]@{ Decision = 'Include'; Reason = ('MSRC severity {0}.' -f $msrcSeverity) }
+    }
+
+    # 6. Nothing structural said yes and nothing structural said no. Two different situations end
+    #    here and both need an operator rather than a guess:
+    #      - the metadata is missing (no classification GUIDs at all, no severity, no BrowseOnly),
+    #        so this tool cannot tell a cumulative rollup from a preview build;
+    #      - the metadata is present and simply is not one of the classifications this tool
+    #        installs on its own - Updates, FeaturePacks, Upgrades, ServicePacks, Tools.
+    #    Widening the include list to cover the old "cumulative" title regex would sweep in
+    #    feature updates and upgrades, which is worse than asking.
+    if (@($categoryIds).Count -eq 0 -and [string]::IsNullOrWhiteSpace($msrcSeverity) -and $null -eq $browseOnlyValue) {
+        return [pscustomobject]@{ Decision = 'NeedsReview'; Reason = 'WUA supplied no classification, severity or BrowseOnly flag for this update.' }
+    }
+
+    return [pscustomobject]@{ Decision = 'NeedsReview'; Reason = 'This update is not in a classification this tool installs without being asked.' }
+}
+
+function Get-DefaultUpdateSelection {
+    param($Update)
+
+    # Only an explicit Include preselects. NeedsReview stays unticked, but it is not the same as
+    # Exclude and the completion model must not treat it as one - see Get-VMPatchCompletionStates.
+    return ((Get-UpdatePolicyDecision -Update $Update).Decision -eq 'Include')
+}
+
+function Get-UpdateGroupPolicyMarker {
+    param($UpdateGroup)
+
+    # A group the policy could not classify must LOOK different in the list. Leaving it as a
+    # plain empty checkbox is what turns "nobody decided" into "the default said no", and an
+    # unticked box is only a decision if the operator could see there was something to decide.
+    if ([string](Get-ModelPropertyValue -InputObject $UpdateGroup -Name 'policyDecision') -eq 'NeedsReview') {
+        return 'NEEDS REVIEW'
+    }
+
+    return ''
+}
+
+function Get-UpdateGroupDisplayTitle {
+    param($UpdateGroup)
+
+    $title = [string](Get-ModelPropertyValue -InputObject $UpdateGroup -Name 'title')
+    $marker = Get-UpdateGroupPolicyMarker -UpdateGroup $UpdateGroup
+    if ([string]::IsNullOrWhiteSpace($marker)) {
+        return $title
+    }
+
+    return ('[{0}] {1}' -f $marker, $title)
 }
 
 function Get-RoleFlagText {
@@ -220,6 +331,10 @@ function New-UpdatePlanRecord {
         kbArticleIds = $kbArticleIds
         kbText = Get-UpdateKbText -KbArticleIds $kbArticleIds
         categories = $categories
+        # Names stay for display; the ids are what the policy decides on, and browseOnly keeps
+        # its three-valued shape - a missing answer is not $false.
+        categoryIds = @(Get-ModelPropertyValue -InputObject $Update -Name 'categoryIds' -DefaultValue @())
+        browseOnly = Get-ModelPropertyValue -InputObject $Update -Name 'browseOnly'
         msrcSeverity = $msrcSeverity
         updateType = $updateType
     }
@@ -257,6 +372,8 @@ function New-UpdateGroupRecords {
                 $kbArticleIds = @(Get-ModelPropertyValue -InputObject $update -Name 'kbArticleIds' -DefaultValue @())
                 $msrcSeverity = Get-ModelPropertyValue -InputObject $update -Name 'msrcSeverity'
                 $updateType = Get-ModelPropertyValue -InputObject $update -Name 'updateType'
+                $categoryIds = @(Get-ModelPropertyValue -InputObject $update -Name 'categoryIds' -DefaultValue @())
+                $browseOnly = Get-ModelPropertyValue -InputObject $update -Name 'browseOnly'
 
                 $groups[$identityKey] = [pscustomobject]@{
                     identityKey = $identityKey
@@ -266,8 +383,11 @@ function New-UpdateGroupRecords {
                     kbArticleIds = $kbArticleIds
                     kbText = Get-UpdateKbText -KbArticleIds $kbArticleIds
                     categories = $categories
+                    categoryIds = $categoryIds
+                    browseOnly = $browseOnly
                     msrcSeverity = $msrcSeverity
                     updateType = $updateType
+                    policyConflict = $false
                     appliesToVmNames = New-Object System.Collections.Generic.List[string]
                     patchableVmNames = New-Object System.Collections.Generic.List[string]
                     appliesToVmLookup = @{}
@@ -279,6 +399,24 @@ function New-UpdateGroupRecords {
 
             $group = $groups[$identityKey]
             [void]$group.updateRecords.Add((New-UpdatePlanRecord -Update $update -IdentityKey $identityKey))
+
+            # One identity key, several VMs. If two of them describe the same package with
+            # different structured metadata, the group cannot be classified: taking the first
+            # record would make the decision depend on the order the VM list happens to be in,
+            # and OR-ing them would silently pick whichever answer is more permissive.
+            $memberCategoryIds = @(Get-ModelPropertyValue -InputObject $update -Name 'categoryIds' -DefaultValue @())
+            $memberBrowseOnly = Get-ModelPropertyValue -InputObject $update -Name 'browseOnly'
+            $memberSeverity = [string](Get-ModelPropertyValue -InputObject $update -Name 'msrcSeverity')
+            $memberType = [string](Get-ModelPropertyValue -InputObject $update -Name 'updateType')
+            $conflicts = (
+                ((@($memberCategoryIds) -join '|') -ne (@($group.categoryIds) -join '|')) -or
+                ([string]$memberBrowseOnly -ne [string]$group.browseOnly) -or
+                (-not [string]::Equals($memberSeverity, [string]$group.msrcSeverity, [System.StringComparison]::OrdinalIgnoreCase)) -or
+                (-not [string]::Equals($memberType, [string]$group.updateType, [System.StringComparison]::OrdinalIgnoreCase))
+            )
+            if ($conflicts) {
+                $group.policyConflict = $true
+            }
 
             if (-not $group.appliesToVmLookup.ContainsKey($vmName)) {
                 $group.appliesToVmLookup[$vmName] = $true
@@ -302,7 +440,13 @@ function New-UpdateGroupRecords {
         # patchable VM. A group whose sole applicable VM is a Failover Cluster (excluded
         # from patchableVmNames) would otherwise show a checked box with "Patchable: 0 VM"
         # and produce a default plan that installs on nothing.
-        $selectedByDefault = ([bool](Get-DefaultUpdateSelection -Title ([string]$group.title) -Categories $group.categories -MsrcSeverity ([string]$group.msrcSeverity) -UpdateType ([string]$group.updateType))) -and ($patchableVmNames.Count -gt 0)
+        $policyDecision = if ([bool]$group.policyConflict) {
+            [pscustomobject]@{ Decision = 'NeedsReview'; Reason = 'The VMs that report this update describe it with different structured metadata.' }
+        }
+        else {
+            Get-UpdatePolicyDecision -Update $group
+        }
+        $selectedByDefault = ($policyDecision.Decision -eq 'Include') -and ($patchableVmNames.Count -gt 0)
 
         $records += [pscustomobject]@{
             identityKey = $group.identityKey
@@ -312,8 +456,12 @@ function New-UpdateGroupRecords {
             kbArticleIds = @($group.kbArticleIds)
             kbText = $group.kbText
             categories = @($group.categories)
+            categoryIds = @($group.categoryIds)
+            browseOnly = $group.browseOnly
             msrcSeverity = $group.msrcSeverity
             updateType = $group.updateType
+            policyDecision = [string]$policyDecision.Decision
+            policyReason = [string]$policyDecision.Reason
             selectedByDefault = $selectedByDefault
             appliesToVmNames = $appliesToVmNames
             patchableVmNames = $patchableVmNames
@@ -527,8 +675,44 @@ function Get-VMPatchCompletionStates {
     # would mean the patch round loop never converges.
     $pendingCountByVm = @{}
     $deselectedCountByVm = @{}
+    $needsReviewCountByVm = @{}
     foreach ($group in @($UpdateGroups)) {
-        if ($null -eq $group -or -not [bool](Get-ModelPropertyValue -InputObject $group -Name 'selectedByDefault' -DefaultValue $false)) {
+        if ($null -eq $group) {
+            continue
+        }
+
+        $identityKeyForState = [string](Get-ModelPropertyValue -InputObject $group -Name 'identityKey')
+        $updateIdForState = [string](Get-ModelPropertyValue -InputObject $group -Name 'updateId')
+        $resolvedByOperator = ($deselectedLookup.ContainsKey($identityKeyForState) -or (-not [string]::IsNullOrWhiteSpace($updateIdForState) -and $deselectedLookup.ContainsKey($updateIdForState)))
+
+        # A group the policy could not classify is neither installed nor ignored: the operator
+        # has to look at it. Leaving it out of the counts entirely would let a VM go Green with
+        # an unclassified package still applying, which is the quiet guess this change removes.
+        # Ticking it or explicitly refusing it both count as having looked.
+        if ([string](Get-ModelPropertyValue -InputObject $group -Name 'policyDecision') -eq 'NeedsReview') {
+            if (-not (Test-IsDefenderDefinitionUpdate -Title ([string](Get-ModelPropertyValue -InputObject $group -Name 'title')) -KbArticleIds @(Get-ModelPropertyValue -InputObject $group -Name 'kbArticleIds' -DefaultValue @()))) {
+                foreach ($reviewVmName in @(Get-ModelPropertyValue -InputObject $group -Name 'patchableVmNames' -DefaultValue @())) {
+                    $reviewKey = [string]$reviewVmName
+                    if ([string]::IsNullOrWhiteSpace($reviewKey)) {
+                        continue
+                    }
+
+                    if ($resolvedByOperator) {
+                        # A refused review is a group that still applies and was deliberately not
+                        # installed - the same thing as an unticked preselected group, and it has
+                        # to read as GreenByOperatorChoice rather than as a clean Green.
+                        if (-not $deselectedCountByVm.ContainsKey($reviewKey)) { $deselectedCountByVm[$reviewKey] = 0 }
+                        $deselectedCountByVm[$reviewKey]++
+                    }
+                    else {
+                        if (-not $needsReviewCountByVm.ContainsKey($reviewKey)) { $needsReviewCountByVm[$reviewKey] = 0 }
+                        $needsReviewCountByVm[$reviewKey]++
+                    }
+                }
+            }
+        }
+
+        if (-not [bool](Get-ModelPropertyValue -InputObject $group -Name 'selectedByDefault' -DefaultValue $false)) {
             continue
         }
 
@@ -575,6 +759,7 @@ function Get-VMPatchCompletionStates {
         $outcome = [string](Get-ModelPropertyValue -InputObject $discoveryRecord -Name 'outcome')
         $pendingCount = if ($pendingCountByVm.ContainsKey($vmName)) { [int]$pendingCountByVm[$vmName] } else { 0 }
         $deselectedCount = if ($deselectedCountByVm.ContainsKey($vmName)) { [int]$deselectedCountByVm[$vmName] } else { 0 }
+        $needsReviewCount = if ($needsReviewCountByVm.ContainsKey($vmName)) { [int]$needsReviewCountByVm[$vmName] } else { 0 }
 
         if (Test-IsFailoverClusterDiscoveryRecord -DiscoveryRecord $discoveryRecord) {
             $state = 'Excluded'
@@ -587,6 +772,12 @@ function Get-VMPatchCompletionStates {
         elseif ($pendingCount -gt 0) {
             $state = 'Pending'
             $reason = ('{0} selectable update group(s) still apply.' -f $pendingCount)
+        }
+        elseif ($needsReviewCount -gt 0) {
+            # Not Green and not Pending: nothing here can be installed without someone deciding,
+            # and pretending otherwise in either direction is what this state exists to prevent.
+            $state = 'NeedsReview'
+            $reason = ('{0} update group(s) could not be classified from WUA metadata and need an operator decision.' -f $needsReviewCount)
         }
         elseif ($deselectedCount -gt 0) {
             $state = 'GreenByOperatorChoice'
@@ -604,6 +795,7 @@ function Get-VMPatchCompletionStates {
             outcome = $outcome
             pendingSelectableCount = $pendingCount
             deselectedSelectableCount = $deselectedCount
+            needsReviewSelectableCount = $needsReviewCount
             errors = @($recordErrors)
         }
     }

@@ -253,14 +253,44 @@ Pełna lista parametrów znajduje się w nagłówku `Start-PatchingGuestOps.ps1`
 
 ## Jak wybierane są aktualizacje
 
-Domyślna polityka najpierw patrzy na pola WUA (`MsrcSeverity`, typ aktualizacji), a gdy ich
-brak — na tytuł/kategorię. Z automatu:
+Polityka domyślna opiera się **wyłącznie na strukturalnych danych WUA** — identyfikatorach
+klasyfikacji (GUID), `MsrcSeverity`, typie aktualizacji, fladze `BrowseOnly` i numerze KB. Nie
+czyta tytułu ani **nazw** kategorii, bo jedno i drugie jest tłumaczone: dotychczasowa reguła
+zaznaczała ten sam pakiet na angielskim gościu i pomijała go na niemieckim czy polskim, a każdy
+tytuł zawierający słowo „Security" trafiał do instalacji niezależnie od tego, czym naprawdę był.
 
-- **zaznacza**: aktualizacje krytyczne/ważne oraz cumulative / security / critical / rollup
-  i MSRT (Malicious Software Removal Tool),
-- **pomija**: sterowniki, aktualizacje *preview*, *feature update* oraz *optional*.
+Kolejność decyzji:
 
-Każdą grupę możesz ręcznie dozaznaczyć lub odznaczyć w kroku wyboru.
+1. sterownik (`UpdateType = Driver` lub `2`) → **pomiń**,
+2. `BrowseOnly = true` → **pomiń** (to własna flaga WUA „nie oferuj automatycznie"),
+3. KB `890830` (MSRT) lub KB `2267602` (sygnatury Microsoft Defender) → **zaznacz**,
+4. klasyfikacja `SecurityUpdates`, `CriticalUpdates` lub `UpdateRollups` → **zaznacz**,
+5. `MsrcSeverity` = `Critical` lub `Important` → **zaznacz**,
+6. wszystko inne → **wymaga przeglądu** (`NEEDS REVIEW`).
+
+**Cena tej zmiany jest jawna:** nie da się zachować heurystyk angielskiego tytułu i jednocześnie
+twierdzić, że wynik jest strukturalny. Dawnego wzorca „cumulative" nie można zastąpić włączeniem
+całych kategorii `Updates`, `FeaturePacks` czy `Upgrades` — to wciągnęłoby aktualizacje funkcji i
+uaktualnienia systemu, co jest gorsze od zapytania. Dlatego pakiet, którego nie da się bezpiecznie
+zakwalifikować z metadanych, **czeka na decyzję operatora**, a nie jest zgadywany w żadną stronę.
+
+Taka grupa jest oznaczona w liście wyboru jako `[NEEDS REVIEW]` wraz z powodem. Nie ma dla niej
+osobnego okna. Konsekwencje:
+
+- maszyna z nierozstrzygniętą grupą ma stan `NeedsReview` — **nie jest zielona** i przebieg **nie
+  może zakończyć się kodem 0**,
+- zaznaczenie instaluje pakiet; pozostawienie pola odznaczonego **po wyświetleniu listy** jest
+  świadomą odmową i prowadzi do `GreenByOperatorChoice` (decyzja jest pamiętana po tożsamości, więc
+  kolejne rundy nie pytają ponownie),
+- odznaczone pole w przebiegu, który nigdy nie otworzył listy (`-SelectedUpdateKeys`,
+  `-SkipConfirmation`), **nie jest decyzją**: taki przebieg kończy się wynikiem niepełnym i kodem 1,
+- sprzeczne metadane strukturalne dla jednego klucza tożsamości (różne maszyny opisują ten sam
+  pakiet inaczej) też dają `NeedsReview` — wybór pierwszego rekordu zależałby od kolejności listy
+  maszyn.
+
+Sygnatury Defendera nadal nie decydują o zakończeniu maszyny (patrz niżej). Aktualizacje
+**platformy** i **silnika** Defendera są zwykłymi pakietami — samo słowo „Defender" w tytule niczego
+nie wyklucza.
 
 ---
 

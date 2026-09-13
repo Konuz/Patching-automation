@@ -774,6 +774,23 @@ Merge-PatchRunStates -StateMap $greenStateMap -CompletionStates @(
 Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $greenStateMap) -Expected $true -Message 'green, operator-accepted and excluded VMs together are all green'
 Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap @{}) -Expected $true -Message 'an empty run is vacuously all green'
 
+# An allow-list, not a deny-list of Pending/Failed. Every state added after that test was written
+# would otherwise have passed it by default - and so would a typo.
+foreach ($blockingState in @('Pending', 'Failed', 'NeedsReview', 'PendingReboot', 'SomethingNobodyDefinedYet', '')) {
+    $blockingMap = @{ 'VM-state' = [pscustomobject]@{ vmName = 'VM-state'; state = $blockingState } }
+    Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $blockingMap) -Expected $false -Message ('state "' + $blockingState + '" cannot produce exit 0')
+}
+foreach ($successfulState in @('Green', 'GreenByOperatorChoice', 'Excluded')) {
+    $successfulMap = @{ 'VM-state' = [pscustomobject]@{ vmName = 'VM-state'; state = $successfulState } }
+    Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $successfulMap) -Expected $true -Message ('state "' + $successfulState + '" is an acceptable ending')
+}
+
+# A VM the run was supposed to reach but has no verdict for is not a success either: that is the
+# shape a VM takes when it fell out of the round loop without anyone recording why.
+$partialMap = @{ 'VM-known' = [pscustomobject]@{ vmName = 'VM-known'; state = 'Green' } }
+Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $partialMap -ExpectedVMNames @('VM-known')) -Expected $true -Message 'an expected VM with a green verdict is fine'
+Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $partialMap -ExpectedVMNames @('VM-known', 'VM-vanished')) -Expected $false -Message 'an expected VM with no verdict at all fails the run'
+
 $telemetryRecord = New-RebootActionRecord -VMName 'VM03' -Action 'Initiated' -ProcessId 43 -RebootReason 'Reported after apply' -BatchNumber 2 -BootTimeBaseline $baseTime -BootTimeObserved $newTime -ValidationStatus 'Timeout' -WaitSeconds 30 -AttemptCount 3 -TimeoutCount 2 -LastErrorMessage 'VMware Tools are not running' -OperatorDecision 'ABORT'
 Assert-Equal -Actual (Get-ObjectPropertyValue -InputObject $telemetryRecord -Path @('attemptCount')) -Expected 3 -Message 'reboot record stores observation attempt count'
 Assert-Equal -Actual (Get-ObjectPropertyValue -InputObject $telemetryRecord -Path @('timeoutCount')) -Expected 2 -Message 'reboot record stores timeout count'

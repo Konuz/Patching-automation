@@ -504,8 +504,12 @@ function Show-UpdateGroups {
     foreach ($group in @($UpdateGroups)) {
         $mark = if ($group.selectedByDefault) { 'x' } else { ' ' }
         $kbText = if ([string]::IsNullOrWhiteSpace([string]$group.kbText)) { 'No KB' } else { [string]$group.kbText }
-        Write-Host ('[{0}] {1}. {2} - {3}' -f $mark, $index, $kbText, $group.title)
+        Write-Host ('[{0}] {1}. {2} - {3}' -f $mark, $index, $kbText, (Get-UpdateGroupDisplayTitle -UpdateGroup $group))
         Write-Host ('    Applies to: {0} VM; Patchable: {1} VM' -f $group.appliesToVmCount, $group.patchableVmCount)
+        $policyReason = [string](Get-RuntimePropertyValue -InputObject $group -Name 'policyReason')
+        if ([string](Get-RuntimePropertyValue -InputObject $group -Name 'policyDecision') -eq 'NeedsReview' -and -not [string]::IsNullOrWhiteSpace($policyReason)) {
+            Write-Host ('    Needs review: {0} Tick it to install, or leave it unticked to refuse it for this run.' -f $policyReason)
+        }
         Write-Host ('    Key: {0}' -f $group.identityKey)
         $index++
     }
@@ -1947,6 +1951,11 @@ try {
         # Only round one can get here with explicit keys; Get-PatchRoundDecision stops the
         # loop before round two rather than letting Resolve-SelectedUpdateKeys throw on
         # revisions that no longer exist.
+        # Whether a human actually saw the group list this round. It decides what an unticked
+        # box means: after an interactive selection it is a decision, otherwise it is only a
+        # default nobody looked at - and for a group the policy could not classify those two are
+        # very different answers.
+        $operatorReviewedGroups = $false
         if ($hasExplicitSelectedUpdateKeys) {
             $selectedKeysForPlan = Resolve-SelectedUpdateKeys -UpdateGroups $updateGroups -ExplicitSelectedUpdateKeys $SelectedUpdateKeys
         }
@@ -1959,6 +1968,7 @@ try {
             }
 
             $selectedKeysForPlan = @($roundSelection.Keys)
+            $operatorReviewedGroups = $true
         }
         else {
             $selectedKeysForPlan = @()
@@ -1972,7 +1982,20 @@ try {
             $selectedKeyLookup[[string]$selectedKey] = $true
         }
         foreach ($group in @($updateGroups)) {
-            if ([bool]$group.selectedByDefault -and -not $selectedKeyLookup.ContainsKey([string]$group.identityKey)) {
+            if ($selectedKeyLookup.ContainsKey([string]$group.identityKey)) {
+                continue
+            }
+
+            if ([bool]$group.selectedByDefault) {
+                $deselectedUpdateKeys += [string]$group.identityKey
+                continue
+            }
+
+            # A group the policy could not classify only leaves NeedsReview once a human has
+            # looked at the list and left it unticked. Recording it without that - from
+            # -SelectedUpdateKeys or -SkipConfirmation, where nobody saw the marker - would be
+            # inventing an operator decision, and the run stays incomplete instead.
+            if ($operatorReviewedGroups -and [string](Get-RuntimePropertyValue -InputObject $group -Name 'policyDecision') -eq 'NeedsReview') {
                 $deselectedUpdateKeys += [string]$group.identityKey
             }
         }
@@ -2059,7 +2082,7 @@ try {
         # A VM whose discovery failed is already 'Failed' in the state map, so the all-green
         # test covers discovery failures too - no separate check needed.
         $scriptExitCode = 0
-        if ($sawApplyFailure -or $stoppedByRoundCap -or -not (Test-PatchRunAllGreen -StateMap $finalStateMap)) {
+        if ($sawApplyFailure -or $stoppedByRoundCap -or -not (Test-PatchRunAllGreen -StateMap $finalStateMap -ExpectedVMNames $targetVMNames)) {
             $scriptExitCode = 1
         }
     }

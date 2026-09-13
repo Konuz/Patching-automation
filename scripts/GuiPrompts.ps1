@@ -195,7 +195,7 @@ function Show-UpdateGroupDialog {
 
     foreach ($group in $groups) {
         $kbText = if ([string]::IsNullOrWhiteSpace([string]$group.kbText)) { 'No KB' } else { [string]$group.kbText }
-        [void]$list.Items.Add(('{0} - {1}  (applies to {2} VM, patchable {3})' -f $kbText, $group.title, $group.appliesToVmCount, $group.patchableVmCount))
+        [void]$list.Items.Add(('{0} - {1}  (applies to {2} VM, patchable {3})' -f $kbText, (Get-UpdateGroupDisplayTitle -UpdateGroup $group), $group.appliesToVmCount, $group.patchableVmCount))
     }
 
     foreach ($index in @($DefaultCheckedIndexes)) {
