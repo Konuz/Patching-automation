@@ -465,6 +465,12 @@ $status = [ordered]@{
     # for this VM in this run - even after the other process has ended.
     guestRunConflict = $false
     guestRunConflictReason = $null
+    # Approved keys that are no longer in the current search result. Not an error in itself and
+    # not a reason to install nothing: WUA revises a package between the plan and the apply, and
+    # the exact keys the operator approved are still the only ones this run may install.
+    missingUpdateKeys = @()
+    selectionDrift = $false
+    requiresVerification = $false
     errors = @()
 }
 
@@ -627,9 +633,18 @@ try {
         }
 
         if ($hasExplicitKeySelection) {
-            $missingUpdateKeys = @(@($selectedKeyLookup.Keys) | Where-Object { -not $seenSelectedLookupKeys.ContainsKey([string]$_) })
-            if ($missingUpdateKeys.Count -gt 0) {
-                throw ('Selected update key(s) not present in the current search result (search/selection drift): {0}' -f ($missingUpdateKeys -join ', '))
+            # Drift used to throw, which discarded every still-available approved update along
+            # with the one that had moved. The approved set is an exact intersection with what WUA
+            # offers right now: a revision the operator never approved is never substituted for
+            # one that vanished, and the keys that vanished are reported so somebody checks them.
+            $status.missingUpdateKeys = @(@($selectedKeyLookup.Keys) | Where-Object { -not $seenSelectedLookupKeys.ContainsKey([string]$_) })
+            $status.selectionDrift = ($status.missingUpdateKeys.Count -gt 0)
+            $status.requiresVerification = $status.selectionDrift
+            if ($status.selectionDrift) {
+                # Logged and saved BEFORE the download, so a crash mid-install still leaves the
+                # trace that this run installed less than was approved.
+                Write-AgentLog -Message ('Selection drift: approved update key(s) are no longer offered by WUA and were not installed: {0}' -f (@($status.missingUpdateKeys) -join ', '))
+                Save-Status -Status $status
             }
         }
 
@@ -639,7 +654,12 @@ try {
         if ($selectedUpdates.Count -eq 0) {
             $status.outcome = 'NoSelectedUpdates'
             $scriptExitCode = 1
-            Write-AgentLog -Message 'Applicable updates were found, but none were selected.'
+            if ($status.selectionDrift) {
+                Write-AgentLog -Message 'Every approved update has drifted; nothing was downloaded or installed.'
+            }
+            else {
+                Write-AgentLog -Message 'Applicable updates were found, but none were selected.'
+            }
         }
         else {
             Write-AgentLog -Message ('Downloading {0} selected update(s).' -f $selectedUpdates.Count)

@@ -119,7 +119,7 @@ $roundLoop = $ast.Find({ param($n) $n -is [System.Management.Automation.Language
         updates = @([pscustomobject]@{ updateId = '11111111-1111-1111-1111-111111111111'; revisionNumber = 1; title = 'Security Update'; msrcSeverity = 'Critical'; updateType = 'Software' })
     }
     $roundNumber = 0; $roundTargetVMNames = @('vm01'); $roundSummaries = @(); $finalStateMap = @{}
-    $deselectedUpdateKeys = @(); $sawApplyFailure = $false; $stoppedByRoundCap = $false
+    $deselectedUpdateKeys = @(); $sawApplyFailure = $false; $stoppedByRoundCap = $false; $outstandingVerificationByVm = @{}
     $guestCredentialContext = $null; $guestCredentialDecisionScript = $null
     $guestCredentialValidatedScript = $null; $guestCredentialInteractive = $false
     $runOutputDirectory = Join-Path $repoRoot 'out'; $MaxPatchRounds = 3; $SearchOnly = $false; $PlanOnly = $false
@@ -158,7 +158,7 @@ foreach ($planOnlyCase in @($false, $true)) {
             updates = @([pscustomobject]@{ updateId = '11111111-1111-1111-1111-111111111111'; revisionNumber = 1; title = 'Security Update'; kbArticleIds = @(); categories = @('Security Updates'); msrcSeverity = 'Critical'; updateType = 'Software' })
         }
         $roundNumber = 0; $roundTargetVMNames = @('vm01'); $roundSummaries = @(); $finalStateMap = @{}
-        $deselectedUpdateKeys = @(); $sawApplyFailure = $false; $stoppedByRoundCap = $false
+        $deselectedUpdateKeys = @(); $sawApplyFailure = $false; $stoppedByRoundCap = $false; $outstandingVerificationByVm = @{}
         $guestCredentialContext = $null; $guestCredentialDecisionScript = $null
         $guestCredentialValidatedScript = $null; $guestCredentialInteractive = $false
         $runOutputDirectory = $planRoot; $MaxPatchRounds = 1; $SearchOnly = $false; $PlanOnly = $planOnlyCase

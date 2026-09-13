@@ -253,6 +253,32 @@ Pełna lista parametrów znajduje się w nagłówku `Start-PatchingGuestOps.ps1`
 
 ## Jak wybierane są aktualizacje
 
+**Dryf zatwierdzonego wyboru.** WUA zmienia rewizje pakietów między planem a instalacją, więc
+zatwierdzony klucz `UpdateID|RevisionNumber` może już nie występować w wyniku wyszukiwania.
+Wcześniej taki przypadek przerywał cykl błędem, co **odrzucało także wszystkie pozostałe
+zatwierdzone aktualizacje**, które nadal były dostępne.
+
+Teraz agent instaluje **dokładne przecięcie** zatwierdzonego zbioru z aktualną ofertą WUA i
+raportuje różnicę (`missingUpdateKeys`, `selectionDrift`, `requiresVerification`). Dwie zasady:
+
+- **żadnych podmian** — rewizja, której operator nie zatwierdził, nigdy nie jest instalowana w
+  zamian za tę, która zniknęła; nowa rewizja pojawi się jako zwykła aktualizacja, utrzyma maszynę w
+  stanie `Pending` i przejdzie przez świeży plan oraz normalny wybór operatora,
+- **nic nie jest raportowane jako zainstalowane, jeśli nie zostało** — ostrzeżenie jest zapisywane
+  **przed** pobieraniem, więc awaria w trakcie instalacji nadal zostawia ślad, że zainstalowano
+  mniej niż zatwierdzono.
+
+Puste przecięcie nie pobiera i nie instaluje niczego (`NoSelectedUpdates`). Całkowicie puste
+wyszukiwanie zachowuje własny wynik `NoApplicableUpdates` — nie było czemu dryfować. Odrzucona
+licencja (EULA) to zwykły błąd i usuwa tylko własną aktualizację.
+
+Sam dryf **nie jest** awarią instalacji, ale jest jawnym niepełnym wykonaniem. W zwykłym przebiegu
+brakujące klucze stają się „zaległą weryfikacją": kolejne wykrywanie może wykazać, że dana
+aktualizacja nie ma już zastosowania, i wtedy przebieg może zakończyć się sukcesem z zachowanym
+ostrzeżeniem. Cokolwiek zostanie nierozstrzygnięte na koniec — kod 1 z listą kluczy. Tryb
+`-PatchPlanPath` nie ma świeżego wykrywania, więc nie może tego rozstrzygnąć: raportuje braki i
+kończy kodem 1, bez ukrytej drugiej instalacji.
+
 **Stany maszyn na koniec przebiegu.** Kod wyjścia 0 wymaga, aby **każda** maszyna skończyła w
 jednym ze stanów `Green`, `GreenByOperatorChoice` lub `Excluded` (ten ostatni oznacza „poza
 zakresem łatania", nie „załatana"). Sprawdzenie jest listą dozwolonych stanów, nie listą zakazanych

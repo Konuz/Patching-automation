@@ -1501,9 +1501,15 @@ function Invoke-ApplyAndOptionalReboot {
         Write-RebootActionArtifacts -CycleOutputDirectory $CycleOutputDirectory -RebootActions $rebootActions
     }
 
-    $exitCode = 1
-    if ((Test-ApplyResultsSuccessful -ApplyResults $applyResults) -and (Test-RebootActionsSuccessful -RebootActions $rebootActions)) {
-        $exitCode = 0
+    $hasHardFailure = -not ((Test-ApplyResultsSuccessful -ApplyResults $applyResults) -and (Test-RebootActionsSuccessful -RebootActions $rebootActions))
+    # Drift is reported separately from a hard failure. "Installed less than was approved" and
+    # "an install failed" are different facts: folding them together would either hide the drift
+    # or report a working install as broken, and only the first can still be resolved by a later
+    # discovery showing the missing updates are no longer applicable.
+    $requiresVerification = [bool](Test-ApplyResultsRequireVerification -ApplyResults $applyResults)
+    $exitCode = if ($hasHardFailure) { 1 } else { 0 }
+    foreach ($drift in @(Get-ApplyResultDriftSummary -ApplyResults $applyResults)) {
+        Write-Warning ('{0}: approved update(s) were no longer offered by WUA and were not installed: {1}. They were NOT installed under another revision.' -f $drift.vmName, (@($drift.missingUpdateKeys) -join ', '))
     }
 
     # The round loop needs more than the exit code: it has to know whether a reboot happened
@@ -1511,6 +1517,8 @@ function Invoke-ApplyAndOptionalReboot {
     # against machines that are not provably up.
     return [pscustomobject]@{
         ExitCode = $exitCode
+        HasHardFailure = $hasHardFailure
+        RequiresVerification = $requiresVerification
         ApplyResults = @($applyResults)
         RebootTargets = @($rebootTargets)
         RebootActions = @($rebootActions)
@@ -1836,6 +1844,17 @@ try {
             # where a round-two group selection prompt would simply hang.
             $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerScope $viServerScope -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -WorkspaceScriptPath $workspaceScriptPath -RunGuardScriptPath $runGuardScriptPath -RebootRequestScriptPath $rebootRequestScriptPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive
             $scriptExitCode = $applyOutcome.ExitCode
+
+            # Resume has no fresh discovery, so nothing here can establish that an approved
+            # update WUA stopped offering is genuinely no longer needed. Drift therefore stays
+            # an incomplete result: exit 1, with the missing keys named. A second install is
+            # deliberately not attempted - that would need a fresh plan and a normal selection.
+            if ([bool](Get-RuntimePropertyValue -InputObject $applyOutcome -Name 'RequiresVerification' -DefaultValue $false)) {
+                foreach ($resumeDrift in @(Get-ApplyResultDriftSummary -ApplyResults @(Get-RuntimePropertyValue -InputObject $applyOutcome -Name 'ApplyResults' -DefaultValue @()))) {
+                    Write-Warning ('{0}: approved update(s) were no longer offered by WUA and were not installed: {1}. A resume run cannot verify this; re-run discovery.' -f $resumeDrift.vmName, (@($resumeDrift.missingUpdateKeys) -join ', '))
+                }
+                $scriptExitCode = 1
+            }
         }
 
         exit $scriptExitCode
@@ -1859,6 +1878,11 @@ try {
     $deselectedUpdateKeys = @()
     $stoppedByRoundCap = $false
     $sawApplyFailure = $false
+    # vmName -> the approved keys WUA stopped offering. Deliberately NOT folded into
+    # $sawApplyFailure, which is sticky: an approved update that has become inapplicable is
+    # resolved by a later discovery, and the run may then finish successfully with the warning
+    # retained in the artifacts.
+    $outstandingVerificationByVm = @{}
 
     while ($true) {
         $roundNumber++
@@ -1870,6 +1894,10 @@ try {
         Write-Step -Message ('Patch round {0} over {1} VM(s).' -f $roundNumber, @($roundTargetVMNames).Count)
         $discoveryRecords = Invoke-DiscoveryPhase -TargetVMNames $roundTargetVMNames -VIServerScope $viServerScope -Managers $managers -GuestCredentialMap $guestCredentialMap -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -WorkspaceScriptPath $workspaceScriptPath -RunGuardScriptPath $runGuardScriptPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -MaxInFlight $ThrottleLimit -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive
         $failedDiscoveryRecords = @($discoveryRecords | Where-Object { @($_.errors).Count -gt 0 })
+
+        # A fresh discovery is the only thing that can settle an approved update WUA stopped
+        # offering: if the exact identity key is gone, that update is no longer applicable.
+        Resolve-OutstandingVerificationKeys -Outstanding $outstandingVerificationByVm -DiscoveryRecords $discoveryRecords
 
         $updateGroups = @(New-UpdateGroupRecords -DiscoveryRecords $discoveryRecords | Sort-Object kbText,title)
         $completionStates = @(Get-VMPatchCompletionStates -DiscoveryRecords $discoveryRecords -UpdateGroups $updateGroups -DeselectedUpdateKeys $deselectedUpdateKeys)
@@ -2021,13 +2049,15 @@ try {
         Merge-PatchRunStates -StateMap $finalStateMap -CompletionStates $completionStates
 
         $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerScope $viServerScope -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -WorkspaceScriptPath $workspaceScriptPath -RunGuardScriptPath $runGuardScriptPath -RebootRequestScriptPath $rebootRequestScriptPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -DiscoveryRecords $discoveryRecords -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive
-        if ($applyOutcome.ExitCode -ne 0) {
+        # Only a hard failure is sticky. Drift becomes an outstanding verification instead, which
+        # a later round's discovery can resolve.
+        if ([bool](Get-RuntimePropertyValue -InputObject $applyOutcome -Name 'HasHardFailure' -DefaultValue ($applyOutcome.ExitCode -ne 0))) {
             $sawApplyFailure = $true
         }
-
         # A missing terminal agent record is a failed VM, not a reason to let it disappear
         # from the final state when the next round is selected from apply results.
         $applyResults = @(Get-RuntimePropertyValue -InputObject $applyOutcome -Name 'ApplyResults' -DefaultValue @())
+        Add-OutstandingVerificationKeys -Outstanding $outstandingVerificationByVm -ApplyResults $applyResults
         foreach ($applyResult in $applyResults) {
             if ((Get-RuntimePropertyValue -InputObject $applyResult -Name 'action') -ne 'Install' -or
                 [bool](Get-RuntimePropertyValue -InputObject $applyResult -Name 'agentCompletionConfirmed' -DefaultValue $false)) {
@@ -2086,6 +2116,14 @@ try {
         # test covers discovery failures too - no separate check needed.
         $scriptExitCode = 0
         if ($sawApplyFailure -or $stoppedByRoundCap -or -not (Test-PatchRunAllGreen -StateMap $finalStateMap -ExpectedVMNames $targetVMNames)) {
+            $scriptExitCode = 1
+        }
+
+        # An approved update this run could not install, which no later discovery has shown to be
+        # inapplicable. The fleet may be green and every install may have worked; the run still
+        # installed less than was approved and says so rather than reporting a clean success.
+        if ($outstandingVerificationByVm.Count -gt 0) {
+            Write-Warning ('Approved update(s) were not installed and have not been verified as inapplicable: {0}' -f (Get-OutstandingVerificationText -Outstanding $outstandingVerificationByVm))
             $scriptExitCode = 1
         }
     }

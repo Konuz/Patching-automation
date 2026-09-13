@@ -568,6 +568,42 @@ The agent rejects a non-search run when it currently detects Failover Cluster, i
 
 Canonical update identity is **`UpdateID|RevisionNumber`**. Discovery writes `updateId`, `revisionNumber`, and `identityKey` for each update when WUA exposes them. The grouped flow selects update groups by `-SelectedUpdateKeys`; `-InstallSelection` is intentionally rejected. During apply, the orchestrator writes the selected `UpdateID|RevisionNumber` keys to `selection.json`, uploads it next to the guest agent, and starts the agent with `-SelectionPath`. The agent still has a legacy `-SelectedUpdateKeys` CLI path for compatibility (`-SelectionPath` is the primary apply contract), but the orchestrator no longer depends on comma-joined selected-key payloads.
 
+### Selection drift: the approved subset that is still on offer
+
+WUA revises packages between the plan and the apply, so an approved `UpdateID|RevisionNumber` can
+simply not be in the search result any more. That used to `throw`, which discarded **every** still
+available approved update along with the one that had moved.
+
+The agent now takes the **exact intersection** of the approved keys with what WUA offers right
+now, and reports the difference. Two rules make that safe:
+
+- **No substitution.** A revision the operator never approved is never installed in place of one
+  that vanished. `B|2` appearing where `B|1` was approved leaves `B|1` missing and `B|2`
+  untouched; it will show up as an ordinary applicable update, keep the VM `Pending`, and go
+  through a fresh plan and a normal selection.
+- **Nothing is reported as installed that was not.** `status.json` and the apply result carry
+  `missingUpdateKeys`, `selectionDrift` and `requiresVerification`; the warning is logged and the
+  status saved **before** the download, so a crash mid-install still leaves the trace that this
+  run installed less than was approved.
+
+An empty intersection downloads and installs nothing and reports `NoSelectedUpdates` with the
+drift flags set. A genuinely empty search result keeps its own `NoApplicableUpdates` — there was
+nothing to drift. A refused EULA is a real error and drops only its own update, exactly as before.
+
+**"Requires verification" is not the same fact as "an apply failed", and the phase result keeps
+them apart** (`HasHardFailure` / `RequiresVerification`). Folding them together would either hide
+the drift or report a working install as broken. Only the hard failure is sticky across rounds:
+
+- In a normal run the missing keys become an **outstanding verification** per VM
+  (`Add-OutstandingVerificationKeys`). A later round's discovery resolves each key that is no
+  longer in that VM's update list (`Resolve-OutstandingVerificationKeys`, matched on the **exact**
+  identity key, and a failed discovery resolves nothing). The run may then finish successfully with
+  the warning retained in the artifacts. Anything still outstanding at the end is exit 1 with the
+  keys named — a green fleet where less was installed than approved is not a clean success.
+- **`-PatchPlanPath` cannot resolve drift at all**: there is no fresh discovery to establish that
+  the missing update is no longer needed. It reports the keys and exits 1. It deliberately does not
+  attempt a second install — that would need a fresh plan and a normal operator selection.
+
 Subtle point inside the agent: it maintains `selectedSearchIndexes`, mapping a *selected-collection* index back to its *search-collection* index, so per-update download/install results land on the correct `$status.updates[$searchIndex]`.
 
 `guest/UpdateIdentity.ps1` is uploaded with the guest agent and is also dot-sourced by the offline model, so identity formatting and missing-field semantics stay shared across producer and consumer.

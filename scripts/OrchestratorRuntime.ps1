@@ -408,6 +408,12 @@ function New-ApplyResultFromCycle {
     # carried an unreconciled trace of one. It has to survive every branch below, including the
     # failure branches, because it is what blocks the reboot and the next round for this VM.
     $guestRunConflict = [bool](Get-ObjectPropertyValue -InputObject $status -Path @('guestRunConflict') -DefaultValue $false)
+    # Drift is an explicitly incomplete execution, not a failure: the approved updates that were
+    # still on offer went in, the ones that had moved did not, and somebody has to look at the
+    # difference. It must survive every branch below, including the failure branches.
+    $missingUpdateKeys = @(@(Get-ObjectPropertyValue -InputObject $status -Path @('missingUpdateKeys') -DefaultValue @()) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    $selectionDrift = [bool](Get-ObjectPropertyValue -InputObject $status -Path @('selectionDrift') -DefaultValue $false) -or ($missingUpdateKeys.Count -gt 0)
+    $requiresVerification = [bool](Get-ObjectPropertyValue -InputObject $status -Path @('requiresVerification') -DefaultValue $false) -or $selectionDrift
     if ($guestRunConflict) {
         $conflictReason = [string](Get-ObjectPropertyValue -InputObject $status -Path @('guestRunConflictReason'))
         if ([string]::IsNullOrWhiteSpace($conflictReason)) {
@@ -426,7 +432,7 @@ function New-ApplyResultFromCycle {
             -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
             -AgentCompletionConfirmed $false -AgentCompletionReason $agentCompletionReason `
             -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
-            -Errors $errors -GuestRunConflict $guestRunConflict
+            -Errors $errors -GuestRunConflict $guestRunConflict -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
     }
 
     if ($null -eq $agentResult -or -not $agentResult.Completed) {
@@ -446,7 +452,7 @@ function New-ApplyResultFromCycle {
                 -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
                 -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
                 -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
-                -Errors $errors -GuestRunConflict $guestRunConflict
+                -Errors $errors -GuestRunConflict $guestRunConflict -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
         }
     }
     # A partial install (WUA ResultCode 3) exits non-zero but is authoritative in
@@ -459,14 +465,98 @@ function New-ApplyResultFromCycle {
             -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
             -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
             -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
-            -Errors $errors -GuestRunConflict $guestRunConflict
+            -Errors $errors -GuestRunConflict $guestRunConflict -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
     }
 
     return New-ApplyResultRecord -VMName $VMName -Outcome $outcome -InstallResult $installResult `
         -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
         -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
         -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
-        -Errors $errors -GuestRunConflict $guestRunConflict
+        -Errors $errors -GuestRunConflict $guestRunConflict -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
+}
+
+function Add-OutstandingVerificationKeys {
+    param(
+        [hashtable]$Outstanding,
+        $ApplyResults
+    )
+
+    # An approved key that WUA no longer offered. It stays outstanding until a later discovery
+    # shows it is genuinely not applicable to that VM any more - see
+    # Resolve-OutstandingVerificationKeys. Until then the run is explicitly incomplete: it
+    # installed less than was approved, and nobody has established that this was harmless.
+    foreach ($result in @($ApplyResults)) {
+        $vmName = [string](Get-RuntimePropertyValue -InputObject $result -Name 'vmName')
+        if ([string]::IsNullOrWhiteSpace($vmName)) {
+            continue
+        }
+
+        foreach ($key in @(Get-RuntimePropertyValue -InputObject $result -Name 'missingUpdateKeys' -DefaultValue @())) {
+            $keyText = ([string]$key).Trim()
+            if ([string]::IsNullOrWhiteSpace($keyText)) {
+                continue
+            }
+
+            if (-not $Outstanding.ContainsKey($vmName)) {
+                $Outstanding[$vmName] = @{}
+            }
+            $Outstanding[$vmName][$keyText] = $true
+        }
+    }
+}
+
+function Resolve-OutstandingVerificationKeys {
+    param(
+        [hashtable]$Outstanding,
+        $DiscoveryRecords
+    )
+
+    # Matched on the EXACT identity key, not the bare updateId. A key that has disappeared from
+    # the VM's update list is no longer applicable, and that is the verification: the approved
+    # update this run could not install is not needed. A revised package reappearing under a new
+    # revision is a different thing entirely - it is an ordinary applicable update, it keeps the
+    # VM pending, and it goes through a fresh plan and a normal operator selection rather than
+    # being quietly accepted as a substitute for the revision that was approved.
+    foreach ($record in @($DiscoveryRecords)) {
+        $vmName = [string](Get-RuntimePropertyValue -InputObject $record -Name 'vmName')
+        if ([string]::IsNullOrWhiteSpace($vmName) -or -not $Outstanding.ContainsKey($vmName)) {
+            continue
+        }
+
+        # A discovery that failed says nothing about applicability, so it resolves nothing.
+        if (@(Get-ObjectPropertyValue -InputObject $record -Path @('errors') -DefaultValue @() | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count -gt 0) {
+            continue
+        }
+
+        $presentKeys = @{}
+        foreach ($update in @(Get-ObjectPropertyValue -InputObject $record -Path @('updates') -DefaultValue @())) {
+            $identityKey = [string](Get-ObjectPropertyValue -InputObject $update -Path @('identityKey'))
+            if (-not [string]::IsNullOrWhiteSpace($identityKey)) {
+                $presentKeys[$identityKey] = $true
+            }
+        }
+
+        foreach ($outstandingKey in @($Outstanding[$vmName].Keys)) {
+            if (-not $presentKeys.ContainsKey([string]$outstandingKey)) {
+                $Outstanding[$vmName].Remove([string]$outstandingKey)
+            }
+        }
+
+        if ($Outstanding[$vmName].Count -eq 0) {
+            $Outstanding.Remove($vmName)
+        }
+    }
+}
+
+function Get-OutstandingVerificationText {
+    param([hashtable]$Outstanding)
+
+    $lines = @()
+    foreach ($vmName in @($Outstanding.Keys | Sort-Object)) {
+        $lines += ('{0}: {1}' -f $vmName, ((@($Outstanding[$vmName].Keys) | Sort-Object) -join ', '))
+    }
+
+    return ($lines -join '; ')
 }
 
 function Test-IsApplyResultError {
@@ -523,6 +613,43 @@ function Test-ApplyResultsSuccessful {
 
     $errors = @($ApplyResults | Where-Object { Test-IsApplyResultError -ApplyResult $_ })
     return ($errors.Count -eq 0)
+}
+
+function Test-ApplyResultsRequireVerification {
+    param($ApplyResults)
+
+    # Separate from Test-ApplyResultsSuccessful on purpose. "Installed less than was approved"
+    # and "an install failed" are different facts, and folding them into one flag would either
+    # hide the drift or report a working install as broken. Both make the run exit 1; only the
+    # second one means something went wrong on the guest.
+    foreach ($result in @($ApplyResults)) {
+        if ([bool](Get-RuntimePropertyValue -InputObject $result -Name 'requiresVerification' -DefaultValue $false)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-ApplyResultDriftSummary {
+    param($ApplyResults)
+
+    # vmName -> the approved keys that were no longer on offer. Used by the summary and by the
+    # resume path, both of which have to name them rather than say "something drifted".
+    $summary = @()
+    foreach ($result in @($ApplyResults)) {
+        $keys = @(@(Get-RuntimePropertyValue -InputObject $result -Name 'missingUpdateKeys' -DefaultValue @()) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+        if ($keys.Count -eq 0) {
+            continue
+        }
+
+        $summary += [pscustomobject]@{
+            vmName = [string](Get-RuntimePropertyValue -InputObject $result -Name 'vmName')
+            missingUpdateKeys = @($keys)
+        }
+    }
+
+    return @($summary)
 }
 function Test-CredentialRefusalErrorKind {
     param([string]$ErrorKind)

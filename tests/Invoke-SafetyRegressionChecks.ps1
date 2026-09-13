@@ -191,7 +191,13 @@ function Invoke-AgentFixture {
     param([int]$SearchCode = 2, [bool]$Cluster = $false, [bool]$Empty = $false, [switch]$SearchOnly, [bool]$PendingReboot = $false,
         # The one-run-per-guest lock, as the agent sees it: acquired, refused because another run
         # holds this guest, or refused because the coordination directory is unusable.
-        [ValidateSet('Acquired', 'Conflict', 'Unavailable')][string]$GuardResult = 'Acquired')
+        [ValidateSet('Acquired', 'Conflict', 'Unavailable')][string]$GuardResult = 'Acquired',
+        # What WUA currently offers, and what the plan approved. Separate on purpose: the gap
+        # between them is selection drift, and the point of these tests is which updates end up
+        # in the collection handed to Install.
+        $SearchUpdateIdentities = $null,
+        $SelectedKeys = $null,
+        [string]$EulaFailureKey = '')
     # Only external effects are mocked: local probes, artifact I/O, and WUA COM.
     function Write-AgentLog { param($Message) }
     function Save-Status { param($Status) }
@@ -216,15 +222,34 @@ function Invoke-AgentFixture {
     function Get-SystemDriveFreeGB { 100 }
     function Test-PendingReboot { [pscustomobject]@{ isPending = $PendingReboot } }
     function Get-RoleFlags { [pscustomobject]@{ failoverCluster = $Cluster } }
-    function Read-SelectionDocumentKeys { param($Path) '11111111-1111-1111-1111-111111111111|1' }
-    $update = [pscustomobject]@{
-        Identity = [pscustomobject]@{ UpdateID = '11111111-1111-1111-1111-111111111111'; RevisionNumber = 1 }
-        Title = 'Security Update'; KBArticleIDs = $null; Categories = $null
-        InstallationBehavior = [pscustomobject]@{ RebootBehavior = 0 }
-        EulaAccepted = $true; IsDownloaded = $true; Type = 1; MsrcSeverity = 'Critical'
+    $effectiveSelectedKeys = if ($null -eq $SelectedKeys) { @('11111111-1111-1111-1111-111111111111|1') } else { @($SelectedKeys) }
+    function Read-SelectionDocumentKeys { param($Path) return @($effectiveSelectedKeys) }
+
+    $effectiveSearchIdentities = if ($null -eq $SearchUpdateIdentities) {
+        @([pscustomobject]@{ UpdateID = '11111111-1111-1111-1111-111111111111'; RevisionNumber = 1 })
     }
-    $updates = [pscustomobject]@{ Count = $(if ($Empty) { 0 } else { 1 }); Value = $update }
-    $updates | Add-Member ScriptMethod Item { param($Index) $this.Value }
+    else {
+        @($SearchUpdateIdentities)
+    }
+    $searchUpdateObjects = @()
+    foreach ($identity in $effectiveSearchIdentities) {
+        $identityKeyText = ('{0}|{1}' -f [string]$identity.UpdateID, [int]$identity.RevisionNumber)
+        $searchUpdate = [pscustomobject]@{
+            Identity = [pscustomobject]@{ UpdateID = [string]$identity.UpdateID; RevisionNumber = [int]$identity.RevisionNumber }
+            IdentityKeyText = $identityKeyText
+            Title = 'Security Update'; KBArticleIDs = $null; Categories = $null
+            InstallationBehavior = [pscustomobject]@{ RebootBehavior = 0 }
+            EulaAccepted = $($identityKeyText -ne $EulaFailureKey); IsDownloaded = $true; Type = 1; MsrcSeverity = 'Critical'
+        }
+        # One update whose EULA cannot be accepted, to prove a single bad package does not
+        # discard the rest of an otherwise valid batch.
+        $searchUpdate | Add-Member ScriptMethod AcceptEula { if (-not $this.EulaAccepted) { throw 'synthetic EULA failure' } }
+        $searchUpdateObjects += $searchUpdate
+    }
+    if ($Empty) { $searchUpdateObjects = @() }
+
+    $updates = [pscustomobject]@{ Count = @($searchUpdateObjects).Count; Value = @($searchUpdateObjects) }
+    $updates | Add-Member ScriptMethod Item { param($Index) $this.Value[$Index] }
     $warnings = [pscustomobject]@{ Count = $(if ($SearchCode -eq 3) { 1 } else { 0 }) }
     $warnings | Add-Member ScriptMethod Item { param($Index) [pscustomobject]@{ Message = 'Search results incomplete'; HResult = -2145124338; Context = 1 } }
     $searcher = [pscustomobject]@{ ClientApplicationID = ''; Value = [pscustomobject]@{ ResultCode = $SearchCode; Updates = $updates; Warnings = $warnings } }
@@ -239,8 +264,10 @@ function Invoke-AgentFixture {
     $session | Add-Member ScriptMethod CreateUpdateSearcher { $this.Searcher }
     $session | Add-Member ScriptMethod CreateUpdateDownloader { $this.Downloader }
     $session | Add-Member ScriptMethod CreateUpdateInstaller { $this.Installer }
-    $collection = [pscustomobject]@{ Count = 0 }
-    $collection | Add-Member ScriptMethod Add { param($Value) $this.Count++; return ($this.Count - 1) }
+    # Records WHICH updates were added, not just how many: the whole point of the drift tests is
+    # the exact collection handed to Download and Install.
+    $collection = [pscustomobject]@{ Count = 0; AddedKeys = @() }
+    $collection | Add-Member ScriptMethod Add { param($Value) $this.AddedKeys += [string]$Value.IdentityKeyText; $this.Count++; return ($this.Count - 1) }
     function New-Object {
         param([Parameter(Position = 0)][string]$TypeName, [string]$ComObject)
         if (-not $PSBoundParameters.ContainsKey('ComObject')) {
@@ -265,7 +292,14 @@ function Invoke-AgentFixture {
     $groups = @(New-UpdateGroupRecords -DiscoveryRecords @($discovery))
     $states = @(Get-VMPatchCompletionStates -DiscoveryRecords @($discovery) -UpdateGroups $groups)
     $applyResult = New-ApplyResultFromCycle -VMName 'fixture' -Cycle $cycle 3>$null
-    [pscustomobject]@{ Status = $payload; ExitCode = $scriptExitCode; InstallCalled = $installer.Called; DownloadCalled = $downloader.Called; State = $states[0].state; Cycle = $cycle; ApplyResult = $applyResult; GuardCompletions = @($script:guardCompletions); GuardReleases = $script:guardReleases }
+    [pscustomobject]@{
+        Status = $payload; ExitCode = $scriptExitCode; InstallCalled = $installer.Called; DownloadCalled = $downloader.Called
+        State = $states[0].state; Cycle = $cycle; ApplyResult = $applyResult
+        GuardCompletions = @($script:guardCompletions); GuardReleases = $script:guardReleases
+        InstalledKeys = @($collection.AddedKeys)
+        DownloaderKeys = @(if ($null -eq $downloader.Updates) { @() } else { @($downloader.Updates.AddedKeys) })
+        InstallerKeys = @(if ($null -eq $installer.Updates) { @() } else { @($installer.Updates.AddedKeys) })
+    }
 }
 
 foreach ($searchCode in @(0, 1, 3, 4, 5, 99)) {
@@ -294,6 +328,62 @@ $ordinaryApply = Invoke-AgentFixture -PendingReboot $true
 Assert-Equal $ordinaryApply.InstallCalled $true 'ordinary selected updates still reach WUA install'
 Assert-Equal $ordinaryApply.Status.outcome 'InstallSucceeded' 'ordinary successful installation stays successful'
 Assert-Equal $ordinaryApply.ExitCode 0 'ordinary successful installation exits zero'
+
+# --- selection drift: install the approved subset that is still on offer (task 7) ------------
+# Drift used to throw, which discarded every still-available approved update along with the one
+# that had moved. These assertions are on the exact collection handed to Download and Install,
+# not on the outcome text: substituting a revision the operator never approved would otherwise
+# look identical from outside.
+
+$keyA1 = 'aaaaaaaa-1111-1111-1111-111111111111|1'
+$keyB1 = 'bbbbbbbb-2222-2222-2222-222222222222|1'
+$keyB2 = 'bbbbbbbb-2222-2222-2222-222222222222|2'
+$identityA1 = [pscustomobject]@{ UpdateID = 'aaaaaaaa-1111-1111-1111-111111111111'; RevisionNumber = 1 }
+$identityB1 = [pscustomobject]@{ UpdateID = 'bbbbbbbb-2222-2222-2222-222222222222'; RevisionNumber = 1 }
+$identityB2 = [pscustomobject]@{ UpdateID = 'bbbbbbbb-2222-2222-2222-222222222222'; RevisionNumber = 2 }
+
+# Approved A|1 and B|1; WUA now offers A|1 and B|2.
+$partialDrift = Invoke-AgentFixture -SearchUpdateIdentities @($identityA1, $identityB2) -SelectedKeys @($keyA1, $keyB1)
+Assert-Equal (@($partialDrift.InstallerKeys) -join ',') $keyA1 'drift installs exactly the approved update that is still offered'
+Assert-Equal (@($partialDrift.InstallerKeys) -contains $keyB2) $false 'a revision the operator never approved is never substituted'
+Assert-Equal (@($partialDrift.DownloaderKeys) -join ',') $keyA1 'the download collection matches the install collection'
+Assert-Equal $partialDrift.InstallCalled $true 'the still-available approved update is installed rather than discarded'
+Assert-Equal (@($partialDrift.Status.missingUpdateKeys) -join ',') $keyB1 'the key that moved is reported as missing'
+Assert-Equal ([bool]$partialDrift.Status.selectionDrift) $true 'partial drift is recorded as drift'
+Assert-Equal ([bool]$partialDrift.Status.requiresVerification) $true 'partial drift requires verification'
+Assert-Equal ([bool]$partialDrift.ApplyResult.selectionDrift) $true 'the apply result carries the drift flag'
+Assert-Equal (@($partialDrift.ApplyResult.missingUpdateKeys) -join ',') $keyB1 'the apply result names the missing key'
+Assert-Equal ([bool]$partialDrift.ApplyResult.requiresVerification) $true 'the apply result requires verification'
+Assert-Equal (Test-ApplyResultsRequireVerification -ApplyResults @($partialDrift.ApplyResult)) $true 'the phase reports that verification is required'
+Assert-Equal (Test-IsApplyResultError -ApplyResult $partialDrift.ApplyResult) $false 'drift alone is not a hard apply failure'
+
+# Every approved key has drifted: nothing is downloaded and nothing is installed.
+$totalDrift = Invoke-AgentFixture -SearchUpdateIdentities @($identityB2) -SelectedKeys @($keyA1, $keyB1)
+Assert-Equal $totalDrift.DownloadCalled $false 'an empty intersection downloads nothing'
+Assert-Equal $totalDrift.InstallCalled $false 'an empty intersection installs nothing'
+Assert-Equal $totalDrift.Status.outcome 'NoSelectedUpdates' 'an empty intersection reports NoSelectedUpdates'
+Assert-Equal ((@($totalDrift.Status.missingUpdateKeys) | Sort-Object) -join ',') (((@($keyA1, $keyB1)) | Sort-Object) -join ',') 'an empty intersection reports every missing key'
+Assert-Equal ([bool]$totalDrift.Status.requiresVerification) $true 'an empty intersection requires verification'
+Assert-Equal ([bool]$totalDrift.ApplyResult.installResult) $false 'nothing is reported as installed for the missing keys'
+
+# A genuinely empty search is still NoApplicableUpdates, not drift: there was nothing to drift.
+$emptySearch = Invoke-AgentFixture -Empty $true -SelectedKeys @($keyA1)
+Assert-Equal $emptySearch.Status.outcome 'NoApplicableUpdates' 'an empty search keeps its own outcome'
+Assert-Equal ([bool]$emptySearch.Status.selectionDrift) $false 'an empty search is not drift'
+Assert-Equal ([bool]$emptySearch.Status.requiresVerification) $false 'an empty search needs no verification'
+
+# No drift at all: the flags stay false and nothing new appears in the result.
+$noDrift = Invoke-AgentFixture -SearchUpdateIdentities @($identityA1, $identityB1) -SelectedKeys @($keyA1, $keyB1)
+Assert-Equal ((@($noDrift.InstallerKeys) | Sort-Object) -join ',') (((@($keyA1, $keyB1)) | Sort-Object) -join ',') 'both approved updates are installed when both are still offered'
+Assert-Equal ([bool]$noDrift.Status.selectionDrift) $false 'no drift means no drift flag'
+Assert-Equal ([bool]$noDrift.Status.requiresVerification) $false 'no drift means no verification'
+Assert-Equal (@($noDrift.Status.missingUpdateKeys).Count) 0 'no drift means no missing keys'
+
+# One EULA that cannot be accepted must not discard the rest of the batch, and is a real error.
+$eulaFailure = Invoke-AgentFixture -SearchUpdateIdentities @($identityA1, $identityB1) -SelectedKeys @($keyA1, $keyB1) -EulaFailureKey $keyB1
+Assert-Equal (@($eulaFailure.InstallerKeys) -join ',') $keyA1 'a refused EULA drops only its own update'
+Assert-Equal (@($eulaFailure.Status.errors).Count -gt 0) $true 'a refused EULA is a real error, not drift'
+Assert-Equal ([bool]$eulaFailure.Status.selectionDrift) $false 'a refused EULA is not selection drift'
 
 # --- one run per guest, as the orchestrator sees it (task 4) ---------------------------------
 # The agent reports guestRunConflict when the guest was already busy with another run of this
@@ -695,6 +785,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $finalStateMap = @{}
         $deselectedUpdateKeys = @()
         $stoppedByRoundCap = $false
+        $outstandingVerificationByVm = @{}
         $sawApplyFailure = $false
         $scriptExitCode = 0
         $runOutputDirectory = $roundRunDirectory
@@ -909,6 +1000,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $finalStateMap = @{}
         $deselectedUpdateKeys = @()
         $stoppedByRoundCap = $false
+        $outstandingVerificationByVm = @{}
         $sawApplyFailure = $false
         $scriptExitCode = 0
         $runOutputDirectory = $cycleDirectory
@@ -1750,6 +1842,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         $finalStateMap = @{}
         $deselectedUpdateKeys = @()
         $stoppedByRoundCap = $false
+        $outstandingVerificationByVm = @{}
         $sawApplyFailure = $false
         $scriptExitCode = 0
         $runOutputDirectory = $f6Directory
@@ -1921,6 +2014,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         $finalStateMap = @{}
         $deselectedUpdateKeys = @()
         $stoppedByRoundCap = $false
+        $outstandingVerificationByVm = @{}
         $sawApplyFailure = $false
         $scriptExitCode = 0
         $runOutputDirectory = $f7Directory
