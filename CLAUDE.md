@@ -391,7 +391,13 @@ genuinely diverge: a replacement entered with Remember unticked serves the run w
 `credentials.json` keeps the password already there. An explicit refusal outranks the startup
 preference for the rest of the run. A corrected vCenter password is written under
 `vcenter:target:<name>`, never the shared domain key, so the other servers behind that suffix do
-not inherit a credential nobody validated against them. `Remember` still defaults to ticked.
+not inherit a credential nobody validated against them. **`Remember` defaults to unticked**
+(`Test-CredentialDialogDefaultsToNotRemember` in the static gate, since exercising a WinForms
+dialog needs an STA host and a desktop the gates cannot assume): writing a password to disk is a
+decision the operator makes, not one they have to notice and undo. DPAPI binds `credentials.json`
+to one Windows account on one machine and nothing more, so anything running as that account can
+read it back. Unticking never deletes a password already in the store — that would be silent loss
+of something somebody saved on purpose — and the save stays atomic.
 
 ### Update policy: structural, and honest about what it cannot classify
 

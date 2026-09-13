@@ -53,7 +53,12 @@ function Show-CredentialDialog {
     $remember.Left = 220
     $remember.Top = 118
     $remember.Width = 300
-    $remember.Checked = $true
+    # Unticked by default. Writing a password to disk is a decision an operator makes, not one
+    # they have to notice and undo: DPAPI binds the file to this Windows account on this machine
+    # and nothing more, so anything running as that account can read it back. Unticking it does
+    # not delete a password already in the store - see Write-CredentialStore - so the default
+    # cannot silently drop credentials the operator saved earlier on purpose.
+    $remember.Checked = $false
 
     $ok = New-Object System.Windows.Forms.Button
     $ok.Text = 'OK'

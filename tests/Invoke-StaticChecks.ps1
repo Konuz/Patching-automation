@@ -985,6 +985,36 @@ function Test-GuestUploadsAreGuarded {
     return 'ok'
 }
 
+# Writing a password to disk is a decision the operator makes, not one they have to notice and
+# undo. DPAPI binds credentials.json to this Windows account on this machine and nothing more, so
+# anything running as that account can read it back. The checkbox therefore starts unticked.
+# Structural rather than behavioural because the dialog is WinForms: exercising it needs an STA
+# host and a desktop, which the gates cannot assume. Returns 'ok', 'missing' or the offending value.
+function Test-CredentialDialogDefaultsToNotRemember {
+    param($Ast)
+
+    $assignments = @($Ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.AssignmentStatementAst]
+            }, $true) | Where-Object {
+            $left = [string]$_.Left.Extent.Text
+            return ($left -match '(?i)^\$[a-z0-9_]*remember[a-z0-9_]*\.Checked$')
+        })
+
+    if (@($assignments).Count -eq 0) {
+        return 'missing'
+    }
+
+    foreach ($assignment in $assignments) {
+        $value = ([string]$assignment.Right.Extent.Text).Trim()
+        if ($value -ine '$false') {
+            return ('line {0}: {1}' -f $assignment.Extent.StartLineNumber, $value)
+        }
+    }
+
+    return 'ok'
+}
+
 function Test-ScriptTailHasReturn {
     param($Ast)
 
@@ -1089,6 +1119,13 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     $finalReportVerdict = Test-FinalReportContract -Ast $orchestratorAstForChecks
     if ($finalReportVerdict -ne 'ok') {
         $failures += ('{0}: the Write-FinalReport contract is not met ({1})' -f $orchestratorPath, $finalReportVerdict)
+    }
+}
+
+if ($existingScripts.ContainsKey($guiPromptsPath)) {
+    $rememberVerdict = Test-CredentialDialogDefaultsToNotRemember -Ast (Get-ScriptAst -RelativePath $guiPromptsPath -Path $existingScripts[$guiPromptsPath])
+    if ($rememberVerdict -ne 'ok') {
+        $failures += ('{0}: the credential dialog must not offer to save a new password by default ({1})' -f $guiPromptsPath, $rememberVerdict)
     }
 }
 
@@ -1227,6 +1264,36 @@ $exitRule = {
     param($Ast)
     return (Test-ScriptExitsWithComputedCode -Ast $Ast)
 }
+
+# The remember-default rule, probed the same way.
+$rememberRule = {
+    param($Ast)
+    return (Test-CredentialDialogDefaultsToNotRemember -Ast $Ast)
+}
+
+$rememberOkSource = @'
+$remember = New-Object System.Windows.Forms.CheckBox
+$remember.Checked = $false
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $rememberOkSource -Rule $rememberRule) -Expected 'ok' -Message 'an unticked remember checkbox satisfies the remember-default rule'
+
+$rememberViolationSource = @'
+$remember = New-Object System.Windows.Forms.CheckBox
+$remember.Checked = $true
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $rememberViolationSource -Rule $rememberRule) -Expected 'line 2: $true' -Message 'a ticked remember checkbox trips the remember-default rule'
+
+$rememberMissingSource = @'
+$other = New-Object System.Windows.Forms.CheckBox
+$other.Checked = $true
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $rememberMissingSource -Rule $rememberRule) -Expected 'missing' -Message 'a dialog with no remember checkbox at all is reported, not silently accepted'
+
+$rememberCommentSource = @'
+# $remember.Checked = $true
+$remember.Checked = $false
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $rememberCommentSource -Rule $rememberRule) -Expected 'ok' -Message 'a ticked remember checkbox in a comment does not trip the remember-default rule'
 
 # The scoped-lookup rule, probed the same way: a call with the scope passes, one without fails,
 # an abbreviation still counts, and a splat is left to the runtime gates rather than guessed at.

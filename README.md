@@ -429,9 +429,10 @@ z podanym powodem, trafia do `summary.md`, a **cały przebieg kończy się kodem
 
 ### Zapamiętywanie poprawionych danych (GUI)
 
-W trybie GUI okno z nowymi danymi ma **domyślnie zaznaczone** „Remember on this machine" — tak
-samo jak przy pytaniu o hasła na starcie. Po udanej walidacji poprawione hasło trafia do
-`credentials.json` pod klucz tego konta, więc następnym razem nie trzeba go wpisywać ponownie.
+W trybie GUI okno z nowymi danymi ma **domyślnie odznaczone** „Remember on this machine". Zapis
+hasła na dysk jest decyzją operatora, a nie czymś, co trzeba zauważyć i cofnąć. Po zaznaczeniu pola
+i **udanej walidacji** poprawione hasło trafia do `credentials.json` pod klucz tego konta, więc
+następnym razem nie trzeba go wpisywać ponownie.
 
 Odznaczenie „Remember" oznacza, że dane posłużą **tylko temu przebiegowi** — plik zostaje z tym,
 co już w nim było, a jawna odmowa ma pierwszeństwo do końca przebiegu (kolejna maszyna z tego
@@ -597,7 +598,20 @@ Gdy korzystasz z launchera GUI (`Start-PatchingGuestOpsGui.ps1`), w profilu uży
 `%LOCALAPPDATA%\PatchingGuestOps\`
 
 - **`settings.json`** — zapamiętane domyślne parametry formularza (ostatnio używane vCenter, limity, katalog wyjściowy, flagi). Lista maszyn VM celowo **nie** jest w nim zapisywana.
-- **`credentials.json`** — zaszyfrowane poświadczenia vCenter i gości (szyfrowanie DPAPI per-klucz, powiązane z kontem zalogowanego użytkownika Windows). Poświadczenia trafiają tu tylko wtedy, gdy w oknie dialogowym zaznaczysz *Remember on this machine*.
+- **`credentials.json`** — zaszyfrowane poświadczenia vCenter i gości (szyfrowanie DPAPI per-klucz, powiązane z kontem zalogowanego użytkownika Windows). Poświadczenia trafiają tu **tylko** wtedy, gdy w oknie dialogowym **sam zaznaczysz** *Remember on this machine* — pole jest domyślnie odznaczone.
+
+  **Zakres ochrony DPAPI.** Szyfrowanie wiąże plik z **kontem Windows** na **tej maszynie**: odczytać
+  go może wszystko, co działa jako to konto — inny skrypt, zadanie harmonogramu, ktoś z dostępem do
+  tej sesji. DPAPI nie chroni przed kimś, kto ma to konto; chroni przed skopiowaniem pliku na inną
+  maszynę lub odczytaniem go z innego profilu. Dodawanie „dodatkowej entropii" zapisanej obok
+  programu nie zmieniałoby tego obrazu — byłaby to ochrona pozorna, bo leżałaby tam, gdzie atakujący
+  już jest.
+
+  **Zapisane wcześniej dane pozostają na dysku**, dopóki operator sam ich nie usunie. Odznaczenie
+  pola *Remember* nie kasuje hasła, które już było w pliku (to byłaby cicha utrata danych, które ktoś
+  zapisał świadomie), a zapis jest wykonywany atomowo — podmianą pliku — żeby błąd w połowie zapisu
+  nie zniszczył haseł pozostałych kont. Aby usunąć zapamiętane poświadczenia, usuń
+  `%LOCALAPPDATA%\PatchingGuestOps\credentials.json`.
 
 ---
 
