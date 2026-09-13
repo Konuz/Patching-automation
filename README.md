@@ -184,6 +184,10 @@ Krok po kroku:
    `CONTINUE` (wymuszone, niezweryfikowane przejście) albo `ABORT`. Te decyzje są wymagane także
    przy braku wartości bazowej lub błędzie inicjacji; błąd wysłania restartu nie jest automatycznie
    ponawiany. `CONTINUE` i `ABORT` pozostawiają ślad w raporcie i kończą przebieg kodem 1.
+   Zadanie restartu, które przekroczyło swój limit czasu albo nie oddało wyniku, nie jest
+   traktowane jako błąd inicjacji: mogło już wysłać `shutdown.exe`, więc maszyna przechodzi przez
+   bramkę boot time i wstrzymuje kolejną paczkę (`errorKind` = `JobResultLost`). Jeśli restart
+   rzeczywiście nie poszedł, operator zobaczy pytanie dopiero po `-RebootTimeoutMinutes`.
 
 > `-RebootBatchSize` określa równoległość wewnątrz jednej paczki rebootu i nie pozwala rozpocząć
 > następnej przed przejściem bramki boot time. `-ThrottleLimit` to osobna gałka — steruje wyłącznie
@@ -318,7 +322,10 @@ Każdy cykl agenta pracuje we własnym podkatalogu `C:\ProgramData\PatchingGuest
 Narzędzie kasuje ten katalog **tylko wtedy**, gdy potrafi udowodnić, że cykl się zakończył:
 terminalny status agenta, wynik procesu mówiący „zakończony", oba artefakty pobrane **w tej**
 kolekcji i oba pliki obecne na maszynie sterującej. W przeciwnym razie katalog zostaje, a powód
-trafia do logu i do rekordu maszyny (`cleanupStatus`, `cleanupReason`).
+jest wyświetlany jako ostrzeżenie z nazwą VM i `runId`, również przy wyciszonych komunikatach
+postępu. Odebrany wynik cyklu zachowuje `cleanupStatus` i `cleanupReason` w `discovery.json`
+oraz `apply-results.json`, także dla nieudanych cykli. Te pola pozwalają policzyć udział wyników
+`Removed`, `Retained` i `Warning`; brak odebranego wyniku nie oznacza usunięcia katalogu.
 
 **Część katalogów zostanie na stałe — i tak ma być.** vSphere pamięta zakończony proces tylko
 przez krótką chwilę. Gość, który skończy pracę zanim pętla odpytywania do niego wróci, wypada
@@ -356,6 +363,19 @@ certyfikat jest zaufany.
 
 W praktyce: zaimportuj na maszynie sterującej certyfikat CA, który podpisał certyfikaty ESXi,
 i upewnij się, że hosty figurują w vCenter pod nazwami zgodnymi z tymi certyfikatami.
+
+Przed każdą fazą wykrywania lub instalacji narzędzie sprawdza HTTPS każdego unikalnego hosta
+ESXi gotowych celów, zanim utworzy katalogi cyklu lub uruchomi agentów. Próba używa tego samego
+`curl.exe` i nazwy ESXi, ma limit 30 sekund i nie wyłącza walidacji certyfikatów. Błąd dotyczy
+tylko maszyn na tym hoście: każda dostaje własny błąd startu z nazwą hosta i wskazówką dotyczącą
+zaufania, nazwy certyfikatu oraz łączności, a maszyny na pozostałych hostach są przetwarzane
+dalej. Wynik próby jest pamiętany do końca fazy, więc kolejne VM na tym samym hoście nie czekają
+ponownie 30 sekund. Rozstrzygnięcie poświadczeń celu poprzedza tę próbę: pominięte konto lub
+przerwana obsługa poświadczeń zachowują wynik dla danej VM i nie powodują sprawdzania jej hosta.
+Żądanie `HEAD` dotyczy głównego adresu HTTPS hosta, bez biletu transferowego i plików gościa;
+odpowiedzi HTTP takie jak 401, 403 lub 405 po poprawnym TLS nie oznaczają błędu certyfikatu.
+To kontrola aktualnego punktu końcowego, a nie gwarancja późniejszego transferu: każdy transfer
+nadal niezależnie sprawdza certyfikat, również po zmianie hosta VM.
 
 ---
 

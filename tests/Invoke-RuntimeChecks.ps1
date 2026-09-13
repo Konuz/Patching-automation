@@ -309,6 +309,26 @@ try { Invoke-ThrottledJobs -Items @() -ThrottleLimit 1 -JobTimeoutSeconds 0 -Scr
 catch { $timeoutGuardThrew = $true }
 Assert-Equal -Actual $timeoutGuardThrew -Expected $true -Message 'Invoke-ThrottledJobs throws on JobTimeoutSeconds below 1'
 
+# Reboot initiation is the last Start-Job path, and the reboot coordinator reads this
+# classification. A job that was stopped at its deadline, or whose output could not be read, may
+# already have sent shutdown.exe; only a job that never started provably sent nothing.
+$stoppedJobResult = @(Invoke-ThrottledJobs -Items @([pscustomobject]@{ Sequence = 1; VMName = 'VM-stopped-job' }) -ThrottleLimit 1 -JobTimeoutSeconds 1 -ScriptBlock {
+    param($JobInput)
+    Start-Sleep -Seconds 30
+})[0]
+Assert-Equal -Actual (Get-ObjectPropertyValue -InputObject $stoppedJobResult -Path @('ErrorKind')) -Expected 'JobResultLost' -Message 'a job stopped at its deadline reports a lost result'
+Assert-Equal -Actual (Get-ObjectPropertyValue -InputObject $stoppedJobResult -Path @('RejectedBeforeStart') -DefaultValue $true) -Expected $false -Message 'a job stopped at its deadline is never reported as rejected before start'
+
+$crashedJobResult = @(Invoke-ThrottledJobs -Items @([pscustomobject]@{ Sequence = 1; VMName = 'VM-crashed-job' }) -ThrottleLimit 1 -JobTimeoutSeconds 60 -ScriptBlock {
+    param($JobInput)
+    throw 'synthetic job crash after the guest call'
+})[0]
+Assert-Equal -Actual (Get-ObjectPropertyValue -InputObject $crashedJobResult -Path @('ErrorKind')) -Expected 'JobResultLost' -Message 'a job whose output cannot be received reports a lost result'
+Assert-Equal -Actual (Get-ObjectPropertyValue -InputObject $crashedJobResult -Path @('RejectedBeforeStart') -DefaultValue $true) -Expected $false -Message 'a job whose output cannot be received is never reported as rejected before start'
+
+$unstartedJobResult = @(Invoke-ThrottledJobs -Items @([pscustomobject]@{ Sequence = 1; VMName = 'VM-unstarted-job' }) -ThrottleLimit 1 -JobTimeoutSeconds 60 -ScriptBlock $null)[0]
+Assert-Equal -Actual (Get-ObjectPropertyValue -InputObject $unstartedJobResult -Path @('RejectedBeforeStart') -DefaultValue $false) -Expected $true -Message 'a job that never started is reported as rejected before start'
+
 # --- in-process agent fleet ---
 
 $fleetEvents = New-Object System.Collections.Generic.List[string]
@@ -1179,6 +1199,56 @@ Assert-Equal -Actual $ambiguousRestartRecord.action -Expected 'Initiated' -Messa
 Assert-Equal -Actual $ambiguousRestartRecord.validationStatus -Expected 'Confirmed' -Message 'ambiguous reboot is confirmed from the later boot time'
 Assert-Equal -Actual (Get-RuntimePropertyValue -InputObject $ambiguousRestartRecord -Name 'errorKind') -Expected 'Transient' -Message 'ambiguous reboot record preserves its typed error'
 Assert-Equal -Actual (Get-RuntimePropertyValue -InputObject $ambiguousRestartRecord -Name 'rejectedBeforeStart') -Expected $false -Message 'ambiguous reboot record preserves non-rejection'
+
+# A reboot job that never answered is the same ambiguity one level up. Reported as a failed
+# initiation it would offer CONTINUE, and the next batch would restart while this guest may be
+# going down - so it has to hold the batch gate until its boot time moves.
+Reset-RebootTestState
+$lostJobEvents = New-Object System.Collections.Generic.List[string]
+$lostJobDecisionCalls = 0
+$lostJobRecords = @(Invoke-RebootBatchCoordinator -RebootTargets @((New-RebootTestTarget -Sequence 1 -VMName 'VM-lost-job'), (New-RebootTestTarget -Sequence 2 -VMName 'VM-next-batch')) -BatchSize 1 -WaitTimeoutSeconds 60 -PollSeconds 1 -GraceSeconds 0 -ReadBootTimeScript {
+        param($Items)
+        $results = @()
+        foreach ($item in @($Items)) {
+            $vmName = [string]$item.VMName
+            if (-not $script:readAttempts.ContainsKey($vmName)) {
+                $script:readAttempts[$vmName] = 0
+            }
+            $attempt = $script:readAttempts[$vmName]
+            $script:readAttempts[$vmName]++
+            $lostJobEvents.Add(('read:{0}:{1}' -f $vmName, $attempt))
+            $results += [pscustomobject]@{
+                VMName = $vmName
+                BootTimeUtc = if ($attempt -eq 0) { $baseTime } else { $newTime }
+                Error = $null
+            }
+        }
+        return @($results)
+    } -InitiateRebootScript {
+        param($Items)
+        return @($Items | ForEach-Object {
+                $lostJobEvents.Add(('restart:{0}' -f $_.VMName))
+                if ([string]$_.VMName -eq 'VM-lost-job') {
+                    [pscustomobject]@{ VMName = $_.VMName; ProcessId = $null; Error = 'Job timed out after 300 seconds.'; ErrorKind = 'JobResultLost'; RejectedBeforeStart = $false }
+                }
+                else {
+                    [pscustomobject]@{ VMName = $_.VMName; ProcessId = 205; Error = $null }
+                }
+            })
+    } -DecisionPromptScript {
+        param($Context)
+        $script:lostJobDecisionCalls++
+        Add-Failure -Message ('Unexpected operator prompt for a lost reboot job: {0}' -f $Context.Stage)
+        return 'ABORT'
+    } -SleepScript { param($Seconds) $null = $Seconds })
+$lostJobRecord = @($lostJobRecords | Where-Object { $_.vmName -eq 'VM-lost-job' })[0]
+Assert-Equal -Actual $lostJobDecisionCalls -Expected 0 -Message 'a lost reboot job is observed instead of being offered as a failed initiation'
+Assert-Equal -Actual (Get-RuntimePropertyValue -InputObject $lostJobRecord -Name 'action') -Expected 'Initiated' -Message 'a lost reboot job remains an observed reboot'
+Assert-Equal -Actual (Get-RuntimePropertyValue -InputObject $lostJobRecord -Name 'validationStatus') -Expected 'Confirmed' -Message 'a lost reboot job is confirmed from the later boot time'
+Assert-Equal -Actual (Get-RuntimePropertyValue -InputObject $lostJobRecord -Name 'errorKind') -Expected 'JobResultLost' -Message 'a lost reboot job record keeps the job-level error kind'
+$lostJobConfirmIndex = $lostJobEvents.IndexOf('read:VM-lost-job:1')
+$nextBatchRestartIndex = $lostJobEvents.IndexOf('restart:VM-next-batch')
+Assert-Equal -Actual ($lostJobConfirmIndex -ge 0 -and $nextBatchRestartIndex -gt $lostJobConfirmIndex) -Expected $true -Message 'the next reboot batch starts only after the lost job VM confirmed its reboot'
 
 
 # --- Shared VM-target parsing (scripts/VMTargetLib.ps1 + launcher prompt wrapper) ---
@@ -2528,6 +2598,9 @@ if ($failures.Count -gt 0) {
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Invoke-SafetyRegressionChecks.ps1')
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Invoke-AuditFollowupChecks.ps1')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host 'Runtime checks passed.'

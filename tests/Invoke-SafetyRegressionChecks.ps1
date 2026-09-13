@@ -156,7 +156,8 @@ function Invoke-AgentFixture {
     . ([scriptblock]::Create($agentTry.Extent.Text))
     # Model the same JSON boundary as a downloaded status.json.
     $payload = $status | ConvertTo-Json -Depth 12 | ConvertFrom-Json
-    $cycle = [pscustomobject]@{ Status = $payload; AgentResult = [pscustomobject]@{ Completed = $true; ExitCode = $scriptExitCode } }
+    $cycleMode = if ($SearchOnly) { 'SearchOnly' } else { 'Apply' }
+    $cycle = [pscustomobject]@{ Status = $payload; AgentCompletionConfirmed = (Test-AgentCycleCompletion -Status $payload -RunId $RunId -Mode $cycleMode); AgentResult = [pscustomobject]@{ Completed = $true; ExitCode = $scriptExitCode } }
     $discovery = New-DiscoveryRecordFromAgentRun -VMName 'fixture' -AgentRun $cycle -OutputDirectory 'unused'
     $groups = @(New-UpdateGroupRecords -DiscoveryRecords @($discovery))
     $states = @(Get-VMPatchCompletionStates -DiscoveryRecords @($discovery) -UpdateGroups $groups)
@@ -627,6 +628,11 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
     $script:f5CredentialPrompts = 0
     $script:f5DiscoveryCall = 0
     $script:f5DiscoveryTargets = @()
+
+    function Get-ExactVM { param($Name) return [pscustomobject]@{ ExtensionData = [pscustomobject]@{} } }
+    function Assert-VMReadyForGuestOps { param($VM) }
+    function Get-VMHostNameForTransfer { param($VMView) return 'esxi-f5.invalid' }
+    function Invoke-Curl { param($CurlPath, $Arguments, $Description) }
 
     $f5UpdateId = '33333333-3333-3333-3333-333333333333'
     $f5Update = [pscustomobject]@{
@@ -1124,6 +1130,11 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
     $script:f5StagePolls = 0
     $script:f5StageCompletes = 0
     $script:f5StagePrompts = 0
+
+    function Get-ExactVM { param($Name) return [pscustomobject]@{ ExtensionData = [pscustomobject]@{} } }
+    function Assert-VMReadyForGuestOps { param($VM) }
+    function Get-VMHostNameForTransfer { param($VMView) return 'esxi-stage.invalid' }
+    function Invoke-Curl { param($CurlPath, $Arguments, $Description) }
 
     function New-InvalidGuestLoginError {
         param([string]$Message)

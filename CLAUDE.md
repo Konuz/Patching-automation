@@ -89,6 +89,17 @@ start/poll/complete scriptblocks, so it is tested offline. Three consequences ar
   end the whole phase.
 - **Every transfer carries `-TimeoutSeconds`.** `JobTimeoutSeconds` used to bound a hung curl;
   nothing else does now.
+- **Every phase checks its ESXi endpoints before starting agents.** `Invoke-GuestAgentFleet`
+  resolves ready targets and calls `Assert-GuestTransferEndpoint` once per host before dispatch.
+  The curl HEAD probe checks HTTPS at the host root with a 30s deadline, no guest file ticket,
+  and no `--fail`: HTTP access/method errors after successful TLS are not trust failures.
+  A host that fails its check (certificate, DNS, TCP or the deadline) fails only the VMs on it:
+  each becomes its own `StartError` naming the host, the verdict is reused for the rest of the
+  phase, and VMs on other hosts proceed. Aborting the phase instead turned one slow host into a
+  fleet-wide stop and, in a verification round, discarded the run summary. Inventory/readiness
+  failures remain per-VM results too. Credential recovery runs before each target's probe, so
+  skipped or aborted accounts never cost a probe. Transfers still verify TLS themselves if a VM
+  changes hosts.
 - **A timed-out item still runs the completion script.** `status.json` is the primary result, the
   job path always downloaded the artifacts even when the process result timed out, and dropping
   them would turn a guest run that actually finished into a reported failure. The timeout error is
@@ -105,6 +116,10 @@ artifact, `Complete-VMAgentCycle` requires its `runId` to match the current hand
 foreign IDs fail the cycle; timestamps alone do not establish ownership. Each cycle uploads
 its agent, identity helper and selection into a separate guest directory under the configured
 working directory, so later cycles cannot overwrite a still-running agent's files.
+
+Discovery also requires the shared `AgentCompletionConfirmed` verdict even when the process
+reported completion. Missing/invalid `finishedAt` cannot be accepted as successful discovery or
+turn into `Green`; timeout recovery only accepts an artifact with confirmed completion.
 
 ### Guest-side cleanup: the only destructive operation
 
@@ -142,8 +157,9 @@ to accumulate directories on busy fleets and clear them out of band.
 
 Cleanup runs after the downloads and the parse, never from a `finally`: a cycle that failed half
 way through is exactly the one whose guest-side files someone will want to read. A refused delete
-is a `Warning` that never touches the WUA result, and a `Retained` directory says why - in the log
-and in the per-VM apply record (`cleanupStatus`/`cleanupReason`), because that is the outcome this
+is a `Warning` that never touches the WUA result, and a `Retained` directory says why in a warning
+with the VM and run id, even when discovery suppresses step messages. Collected discovery and
+apply records preserve `cleanupStatus`/`cleanupReason`, including failures, because this is the outcome this
 feature's own failure modes produce.
 
 `-GuestWorkingDirectory` is validated at the orchestrator's preflight through the same function.
@@ -284,6 +300,14 @@ does not bypass these prompts. `RETRY` observes against the original baseline wi
 `CONTINUE`/`ABORT`. `CONTINUE` records an unverified/forced result and `ABORT` records remaining
 targets as `NotStartedAfterAbort`; either outcome makes the final exit code `1`.
 
+A reboot job that `Invoke-ThrottledJobs` stopped at its deadline, or whose output it could not
+receive, is **not** a failed initiation: it reports `ErrorKind = 'JobResultLost'`, because the
+child may have sent `shutdown.exe` before it went quiet. The coordinator observes it through the
+boot-time gate exactly like an ambiguous transport failure, so it holds the next batch instead of
+offering a `CONTINUE` that would restart the next batch alongside it. Only `Start-Job` itself
+failing (`JobNotStarted`, `RejectedBeforeStart`) provably sent nothing. The cost is deliberate: a
+job that died before the guest call waits out `-RebootTimeoutMinutes` before the operator is asked.
+
 Each `reboot-actions.json` record retains the existing reboot fields and adds the batch number,
 the target sequence (records are ordered by `batchNumber, sequence` because `Sort-Object` is not
 stable on 5.1), the baseline/observed uptime pair,
@@ -315,7 +339,7 @@ These are not style preferences — the static check **fails the build** on them
 - **Orchestrator must not use `$kbArticleIds.Count`** — `ConvertFrom-Json` collapses a single KB id to a scalar under StrictMode. Wrap in `@(...)` first.
 - **Orchestrator apply must pass selected updates by `UpdateID|RevisionNumber` keys through `-SelectedUpdateKeys`** — never by display index. Guest argument values are joined into one comma-delimited argument to avoid PowerShell binding extra tokens as positional `SearchCriteria`.
 - **No orphaned `elseif`/`else`** — detaching one from its `if` while restructuring a long flow is *not* a parse error: PowerShell reads it as a call to a command named `elseif`. All three gates stay green and the run dies at runtime with `CommandNotFoundException`, which the top-level catch turns into a bare exit 1. `Assert-NoOrphanedBranchKeyword` scans for it.
-- **No `return` at script scope in the orchestrator below the `-PatchPlanPath` branch** — `Test-ScriptTailHasReturn` walks the AST of every top-level statement from that branch onward and rejects a `return` that is not inside a nested function or scriptblock, and `Test-ScriptExitsWithComputedCode` requires the file's last statement to be `exit $scriptExitCode`. A `return` there ends the script: `finally` still runs, but `Write-PatchRunSummary`, the all-green evaluation and the final exit do not, so the process leaves on a stale `$LASTEXITCODE` and a failed run reports success with no run-level artifacts. Use `break`/assignments in the round loop; a `return` inside a function or an injected scriptblock is fine.
+- **No `return` at script scope in the orchestrator below the `-PatchPlanPath` branch** — `Test-ScriptTailHasReturn` walks the AST of every top-level statement from that branch onward and rejects a `return` that is not inside a nested function or scriptblock, and `Test-ScriptExitsWithComputedCode` requires the file's last statement to be `exit $scriptExitCode`. A `return` there ends the script: `finally` still runs, but `Write-PatchRunSummary`, the all-green evaluation and the final exit do not, so the process leaves on a stale `$LASTEXITCODE` and a failed run reports success with no run-level artifacts. Use `break`/assignments in the round loop; a `return` inside a function or an injected scriptblock is fine. The top-level `catch` has the same failure mode: under the script's `Stop` preference a bare `Write-Error` re-throws, so it must stay `Write-Error ... -ErrorAction Continue` (behavior check N2 in `tests/Invoke-AuditFollowupChecks.ps1` runs that catch body).
 - Static checks protect hard constraints and architectural boundaries. Behavior belongs in `Invoke-ModelChecks.ps1` and `Invoke-RuntimeChecks.ps1`; do not add a text needle when a small offline behavior test can cover the rule.
 
 Runtime and model scripts run under `Set-StrictMode -Version 2.0` + `$ErrorActionPreference = 'Stop'`. That is *why* the defensive property-access helpers exist — keep using them rather than touching COM/JSON properties directly.

@@ -437,7 +437,6 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "return (`$Outcome -in @('SearchOnly', 'NoApplicableUpdates'))"
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Discovery returned outcome'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$agentRun.AgentResult.Completed'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'successful discovery outcome and finishedAt'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)if\s*\(\$targetVMNames\.Count\s+-gt\s+1\).*?\breturn\b' -Reason 'multi-VM discovery must fall through to the final exit'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Role flags:'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Skipped: Failover Cluster detected. Please update manually one by one.'

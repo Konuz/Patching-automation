@@ -224,6 +224,7 @@ function Invoke-Curl {
 
     $script:capturedCurlArguments = @($Arguments)
     $script:curlCalls += [pscustomobject]@{ Arguments = @($Arguments); Description = $Description }
+    if ($Arguments -contains '--head') { return }
 
     $outputIndex = [array]::IndexOf(@($Arguments), '--output')
     if ($outputIndex -ge 0) {
@@ -301,6 +302,7 @@ try {
     Assert-Equal -Actual ($script:capturedCurlArguments -contains '--insecure') -Expected $false -Message 'send transfer has no alternate insecure flag'
     $limitIndex = [array]::IndexOf($script:capturedCurlArguments, '--max-time')
     Assert-Equal -Actual ($limitIndex -ge 0) -Expected $true -Message 'send transfer always has a deadline'
+    Assert-Equal -Actual @($script:capturedCurlArguments | Where-Object { $_ -eq '--max-time' }).Count -Expected 1 -Message 'send transfer specifies its deadline once'
     if ($limitIndex -ge 0) {
         Assert-Equal -Actual $script:capturedCurlArguments[$limitIndex + 1] -Expected '300' -Message 'send transfer uses the default budget'
     }
@@ -311,6 +313,7 @@ try {
     Assert-Equal -Actual ($script:capturedCurlArguments -contains '--insecure') -Expected $false -Message 'receive transfer has no alternate insecure flag'
     $limitIndex = [array]::IndexOf($script:capturedCurlArguments, '--max-time')
     Assert-Equal -Actual ($limitIndex -ge 0) -Expected $true -Message 'receive transfer always has a deadline'
+    Assert-Equal -Actual @($script:capturedCurlArguments | Where-Object { $_ -eq '--max-time' }).Count -Expected 1 -Message 'receive transfer specifies its deadline once'
     if ($limitIndex -ge 0) {
         Assert-Equal -Actual $script:capturedCurlArguments[$limitIndex + 1] -Expected '300' -Message 'receive transfer uses the default budget'
     }

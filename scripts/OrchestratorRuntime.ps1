@@ -4,7 +4,9 @@ $ErrorActionPreference = 'Stop'
 function New-ThrottledJobErrorResult {
     param(
         $InputObject,
-        [string]$ErrorMessage
+        [string]$ErrorMessage,
+        [string]$ErrorKind,
+        [bool]$RejectedBeforeStart = $false
     )
 
     # Job inputs differ per phase (apply carries VMOutputDirectory, boot-time reads do not),
@@ -17,6 +19,8 @@ function New-ThrottledJobErrorResult {
         Status = $null
         AgentResult = $null
         Error = $ErrorMessage
+        ErrorKind = $ErrorKind
+        RejectedBeforeStart = $RejectedBeforeStart
     }
 }
 
@@ -59,7 +63,8 @@ function Invoke-ThrottledJobs {
                     }
                 }
                 catch {
-                    $results += New-ThrottledJobErrorResult -InputObject $item -ErrorMessage ('Start-Job failed: {0}' -f $_.Exception.Message)
+                    # The one job failure that provably ran nothing: no child process exists.
+                    $results += New-ThrottledJobErrorResult -InputObject $item -ErrorMessage ('Start-Job failed: {0}' -f $_.Exception.Message) -ErrorKind 'JobNotStarted' -RejectedBeforeStart $true
                 }
             }
 
@@ -88,7 +93,9 @@ function Invoke-ThrottledJobs {
             foreach ($entry in $timedOut) {
                 $timedOutJobIds[[string]$entry.Job.Id] = $true
                 Stop-Job -Job $entry.Job -ErrorAction SilentlyContinue
-                $results += New-ThrottledJobErrorResult -InputObject $entry.Input -ErrorMessage ('Job timed out after {0} seconds.' -f $JobTimeoutSeconds)
+                # The child may have finished its guest call before it was stopped; all this
+                # process knows is that no answer came back, so the outcome is lost, not refused.
+                $results += New-ThrottledJobErrorResult -InputObject $entry.Input -ErrorMessage ('Job timed out after {0} seconds.' -f $JobTimeoutSeconds) -ErrorKind 'JobResultLost'
             }
 
             # All terminal states are handled uniformly: the job scriptblock self-reports
@@ -100,14 +107,14 @@ function Invoke-ThrottledJobs {
                 try {
                     $output = Receive-Job -Job $entry.Job -ErrorAction Stop
                     if ($null -eq $output) {
-                        $results += New-ThrottledJobErrorResult -InputObject $entry.Input -ErrorMessage 'Receive-Job returned no output.'
+                        $results += New-ThrottledJobErrorResult -InputObject $entry.Input -ErrorMessage 'Receive-Job returned no output.' -ErrorKind 'JobResultLost'
                     }
                     else {
                         $results += $output
                     }
                 }
                 catch {
-                    $results += New-ThrottledJobErrorResult -InputObject $entry.Input -ErrorMessage ('Receive-Job failed: {0}' -f $_.Exception.Message)
+                    $results += New-ThrottledJobErrorResult -InputObject $entry.Input -ErrorMessage ('Receive-Job failed: {0}' -f $_.Exception.Message) -ErrorKind 'JobResultLost'
                 }
             }
 
@@ -234,6 +241,8 @@ function Invoke-InProcessAgentFleet {
             catch {
                 # There is no job boundary around a start, so a throwing guest would end the
                 # whole phase. Every failure has to become this VM's error instead.
+                # A lost start response does not prove the guest rejected the request. Retrying
+                # here could launch a second agent; only polling the existing handle is retryable.
                 $errorMetadata = & $getErrorMetadata $_ 'Start'
                 $results += New-FleetErrorResult -InputObject $item -ErrorMessage ('Agent start failed: {0}' -f $_.Exception.Message) -ResultKind 'StartError' -ErrorMetadata $errorMetadata
             }
@@ -365,6 +374,8 @@ function New-ApplyResultFromCycle {
             rebootRequired = $rebootRequired
             agentCompletionConfirmed = $false
             agentCompletionReason = $agentCompletionReason
+            cleanupStatus = Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus'
+            cleanupReason = Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason'
             errors = @($errors)
         }
     }
@@ -392,6 +403,8 @@ function New-ApplyResultFromCycle {
                 rebootRequired = $rebootRequired
                 agentCompletionConfirmed = $agentCompletionConfirmed
                 agentCompletionReason = $agentCompletionReason
+                cleanupStatus = Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus'
+                cleanupReason = Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason'
                 errors = @($errors)
             }
         }
@@ -412,6 +425,8 @@ function New-ApplyResultFromCycle {
             rebootRequired = $rebootRequired
             agentCompletionConfirmed = $agentCompletionConfirmed
             agentCompletionReason = $agentCompletionReason
+            cleanupStatus = Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus'
+            cleanupReason = Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason'
             errors = @($errors)
         }
     }
@@ -961,7 +976,7 @@ function Write-PatchRunSummary {
     $lines += ('- VMs up to date: {0}' -f $green.Count)
     $lines += ('- VMs up to date except operator-deselected updates: {0}' -f $greenByChoice.Count)
     $lines += ('- VMs still having selectable updates: {0}' -f $pending.Count)
-    $lines += ('- VMs whose discovery failed: {0}' -f $failed.Count)
+    $lines += ('- VMs with failed or unconfirmed patching: {0}' -f $failed.Count)
     $lines += ('- VMs excluded from patching: {0}' -f $excluded.Count)
     $lines += ''
 
@@ -978,7 +993,7 @@ function Write-PatchRunSummary {
 
     foreach ($section in @(
         [pscustomobject]@{ Title = 'VMs still having selectable updates'; Rows = $pending },
-        [pscustomobject]@{ Title = 'VMs whose discovery failed'; Rows = $failed },
+        [pscustomobject]@{ Title = 'VMs with failed or unconfirmed patching'; Rows = $failed },
         [pscustomobject]@{ Title = 'VMs excluded from patching'; Rows = $excluded },
         [pscustomobject]@{ Title = 'VMs up to date except operator-deselected updates'; Rows = $greenByChoice },
         [pscustomobject]@{ Title = 'VMs up to date'; Rows = $green }
@@ -1288,7 +1303,10 @@ function Invoke-RebootBatchCoordinator {
             if (Test-CredentialRefusalErrorKind -ErrorKind $errorKind) {
                 $credentialInitFailures += $item
             }
-            elseif ($errorKind -eq 'Transient' -and -not [bool](Get-RuntimePropertyValue -InputObject $result -Name 'RejectedBeforeStart' -DefaultValue $false)) {
+            # A reboot job that never answered is the same ambiguity as a transport failure after
+            # the guest call: shutdown.exe may be running, so it is observed, never offered as a
+            # failed initiation whose CONTINUE would let the next batch restart alongside it.
+            elseif ($errorKind -in @('Transient', 'JobResultLost') -and -not [bool](Get-RuntimePropertyValue -InputObject $result -Name 'RejectedBeforeStart' -DefaultValue $false)) {
                 $ambiguousInitiations += $item
             }
             else {

@@ -268,8 +268,49 @@ function Invoke-GuestAgentFleet {
         [bool]$CredentialInteractive = $false
     )
 
+    # Finish every endpoint check before the fleet creates directories or starts agents. A host
+    # that fails its check fails only the VMs on it, each as its own start error naming the host;
+    # inventory/readiness failures stay per-VM too. One bad host must not stop the whole fleet.
+    $preflightErrors = @()
+    $readyItems = @()
+    # Host name -> $null when the check passed, or the exception it failed with. Checked once per
+    # phase: the next VM on a failing host reuses the verdict instead of paying another probe.
+    $hostCheckResults = @{}
     $credentialRecoveryEnabled = ($null -ne $CredentialContext)
-    return @(Invoke-InProcessAgentFleet -Items $FleetItems -MaxInFlight $MaxInFlight -PollSeconds $PollSeconds -ItemTimeoutSeconds ($TimeoutSeconds + 300) `
+    foreach ($item in @($FleetItems)) {
+        try {
+            # Resolve skipped/aborted accounts first, so their host is never probed for nothing.
+            # Successful validation is cached; the start still uses normal credential recovery.
+            if ($credentialRecoveryEnabled) {
+                $null = Invoke-GuestOperationWithCredentialRecovery -VMName $item.VMName -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive -OperationScript { param($ItemAuth) }
+            }
+            $vm = Get-ExactVM -Name $item.VMName
+            Assert-VMReadyForGuestOps -VM $vm
+            $hostName = Get-VMHostNameForTransfer -VMView $vm.ExtensionData
+
+            if (-not $hostCheckResults.ContainsKey($hostName)) {
+                $hostCheckResults[$hostName] = $null
+                try {
+                    Assert-GuestTransferEndpoint -HostName $hostName -CurlPath $CurlPath
+                }
+                catch {
+                    $hostCheckResults[$hostName] = $_.Exception
+                }
+            }
+            if ($null -ne $hostCheckResults[$hostName]) {
+                throw $hostCheckResults[$hostName]
+            }
+        }
+        catch {
+            $errorMetadata = Get-GuestOperationFailureMetadata -ErrorRecord $_ -Stage 'Start'
+            $preflightErrors += New-FleetErrorResult -InputObject $item -ErrorMessage ('Agent preflight failed: {0}' -f $_.Exception.Message) -ResultKind 'StartError' -ErrorMetadata $errorMetadata
+            continue
+        }
+
+        $readyItems += $item
+    }
+
+    $fleetResults = @(Invoke-InProcessAgentFleet -Items $readyItems -MaxInFlight $MaxInFlight -PollSeconds $PollSeconds -ItemTimeoutSeconds ($TimeoutSeconds + 300) `
         -StartScript {
             param($Item)
             if (-not $credentialRecoveryEnabled) {
@@ -323,6 +364,7 @@ function Invoke-GuestAgentFleet {
             param($ErrorRecord, $Stage)
             return Get-GuestOperationFailureMetadata -ErrorRecord $ErrorRecord -Stage $Stage
         })
+    return @($preflightErrors) + @($fleetResults)
 }
 
 function Get-GuestRebootJobScript {
@@ -785,7 +827,9 @@ function New-DiscoveryRecord {
         [string]$VMName,
         $Status,
         [string]$OutputDirectory,
-        [string[]]$Errors = @()
+        [string[]]$Errors = @(),
+        [string]$CleanupStatus,
+        [string]$CleanupReason
     )
 
     $outcome = Get-ObjectPropertyValue -InputObject $Status -Path @('outcome')
@@ -803,6 +847,8 @@ function New-DiscoveryRecord {
         pendingRebootBefore = Get-ObjectPropertyValue -InputObject $Status -Path @('pendingRebootBefore')
         updates = @(Get-ObjectPropertyValue -InputObject $Status -Path @('updates') -DefaultValue @())
         outputDirectory = $OutputDirectory
+        cleanupStatus = $CleanupStatus
+        cleanupReason = $CleanupReason
         errors = @($Errors)
     }
 }
@@ -814,21 +860,18 @@ function New-DiscoveryRecordFromAgentRun {
         [string]$OutputDirectory
     )
 
-    $record = New-DiscoveryRecord -VMName $VMName -Status $AgentRun.Status -OutputDirectory $OutputDirectory
+    $record = New-DiscoveryRecord -VMName $VMName -Status $AgentRun.Status -OutputDirectory $OutputDirectory -CleanupStatus (Get-ObjectPropertyValue -InputObject $AgentRun -Path @('CleanupStatus')) -CleanupReason (Get-ObjectPropertyValue -InputObject $AgentRun -Path @('CleanupReason'))
     $recordErrors = @($record.errors)
 
     if (-not (Test-IsSuccessfulDiscoveryOutcome -Outcome $record.outcome)) {
         $recordErrors += ('Discovery returned outcome {0}.' -f $record.outcome)
     }
 
-    if ($null -eq $AgentRun.AgentResult -or -not $AgentRun.AgentResult.Completed) {
-        $finishedAt = Get-ObjectPropertyValue -InputObject $AgentRun.Status -Path @('finishedAt')
-        if ((Test-IsSuccessfulDiscoveryOutcome -Outcome $record.outcome) -and -not [string]::IsNullOrWhiteSpace([string]$finishedAt)) {
-            Write-Warning ('Discovery guest process result timed out for {0}. status.json has a successful discovery outcome and finishedAt, so the JSON artifact remains the primary discovery result.' -f $VMName)
-        }
-        else {
-            $recordErrors += 'Discovery guest process result timed out and status.json did not contain both a successful discovery outcome and finishedAt.'
-        }
+    if (-not [bool](Get-ObjectPropertyValue -InputObject $AgentRun -Path @('AgentCompletionConfirmed') -DefaultValue $false)) {
+        $recordErrors += 'Discovery agent completion was not confirmed for the current run.'
+    }
+    elseif ($null -eq $AgentRun.AgentResult -or -not $AgentRun.AgentResult.Completed) {
+        Write-Warning ('Discovery guest process result was lost for {0}. The current run has a confirmed terminal status, so status.json remains the primary discovery result.' -f $VMName)
     }
 
     $record.errors = @($recordErrors)
@@ -1511,8 +1554,8 @@ function Invoke-DiscoveryPhase {
 
             if ($hasError) {
                 # Only the explicitly typed timeout path may fall back to the downloaded status
-                # and hand it to the normal record
-                # builder, which decides on the outcome plus finishedAt in status.json.
+                # and hand it to the normal record builder, which still requires the shared
+                # completion verdict for this run as well as a successful discovery outcome.
                 Write-Warning ('Discovery process result timed out for {0}; falling back to the downloaded status.json.' -f $fleetResult.VMName)
             }
 
@@ -1935,7 +1978,9 @@ try {
     }
 }
 catch {
-    Write-Error $_.Exception.Message
+    # -ErrorAction Continue is load-bearing: under the script's 'Stop' preference a bare
+    # Write-Error re-throws, and the run would leave without reaching the exit code below.
+    Write-Error $_.Exception.Message -ErrorAction Continue
     $scriptExitCode = 1
 }
 finally {

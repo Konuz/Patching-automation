@@ -313,6 +313,24 @@ function Invoke-Curl {
     }
 }
 
+function Assert-GuestTransferEndpoint {
+    param(
+        [string]$HostName,
+        [string]$CurlPath
+    )
+
+    # Probe the same ESXi name used in wildcard transfer URLs, without allocating a transfer
+    # ticket or touching a guest. HTTP 401/403/405 still prove TLS worked, so omit --fail.
+    $url = Resolve-GuestFileTransferUrl -Url 'https://*/' -HostName $HostName
+    $arguments = @('--disable', '--silent', '--show-error', '--head', '--output', 'NUL', '--max-time', '30', $url)
+    try {
+        $null = Invoke-Curl -CurlPath $CurlPath -Arguments $arguments -Description ('Checking ESXi HTTPS endpoint {0}' -f $HostName)
+    }
+    catch {
+        throw (New-Object System.InvalidOperationException -ArgumentList ('ESXi transfer preflight failed for {0}. Check certificate trust and the ESXi host name on the stepping stone, DNS and TCP 443 connectivity. IgnoreVCenterCertificate does not apply to file transfers. {1}' -f $HostName, $_.Exception.Message), $_.Exception)
+    }
+}
+
 function New-GuestDirectory {
     param(
         $ProcessManager,
@@ -399,9 +417,6 @@ function Send-GuestFile {
         $LocalPath,
         $resolvedUrl
     )
-    if ($TimeoutSeconds -gt 0) {
-        $curlArguments += @('--max-time', [string]$TimeoutSeconds)
-    }
     Invoke-Curl -CurlPath $CurlPath -Description ('Uploading {0} to guest path {1}' -f $LocalPath, $GuestPath) -Arguments $curlArguments
 }
 
@@ -435,9 +450,6 @@ function Receive-GuestFile {
         $LocalPath,
         $resolvedUrl
     )
-    if ($TimeoutSeconds -gt 0) {
-        $curlArguments += @('--max-time', [string]$TimeoutSeconds)
-    }
     Invoke-Curl -CurlPath $CurlPath -Description ('Downloading guest path {0} to {1}' -f $GuestPath, $LocalPath) -Arguments $curlArguments
 }
 
@@ -1237,7 +1249,7 @@ function Complete-VMAgentCycle {
     # A directory left behind is the symptom this cleanup exists to remove, so it is never
     # silent: without this line the only way to notice is to go and look at the guest.
     if ($cleanup.CleanupStatus -eq 'Retained') {
-        Write-Step -Message ('Guest cycle directory kept on {0}: {1}' -f (Get-ObjectPropertyValue -InputObject $Handle -Path @('VMName')), $cleanup.CleanupReason)
+        Write-Warning ('Guest cycle directory kept on {0} (runId {1}): {2}' -f (Get-ObjectPropertyValue -InputObject $Handle -Path @('VMName')), $Handle.RunId, $cleanup.CleanupReason)
     }
 
     if ($cleanup.CleanupStatus -eq 'Warning') {
