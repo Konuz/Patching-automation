@@ -389,6 +389,26 @@ przerwana obsługa poświadczeń zachowują wynik dla danej VM i nie powodują s
 Żądanie `HEAD` dotyczy głównego adresu HTTPS hosta, bez biletu transferowego i plików gościa;
 odpowiedzi HTTP takie jak 401, 403 lub 405 po poprawnym TLS nie oznaczają błędu certyfikatu.
 
+**Katalog narzędzia w gościu jest zabezpieczany przed pierwszym uploadem.** W katalogu
+`C:\ProgramData\PatchingGuestOps` lądują agent WUA, helper tożsamości, plik wyboru aktualizacji
+i helper czasu rozruchu — i z niego agent jest uruchamiany. Gdyby zwykły użytkownik mógł tam
+pisać, mógłby podmienić agenta między uploadem a startem i wykonać własny kod na koncie
+używanym do patchingu. Dlatego katalog (wraz z brakującymi poziomami pośrednimi) jest tworzony z
+własną, niedziedziczoną listą ACL: właściciel to lokalni Administratorzy, pełne prawa mają
+wyłącznie `SYSTEM` i `Administratorzy`. Kontrola jest wykonywana **za każdym razem** i obejmuje
+właściciela, reguły dostępu, punkty ponownej analizy (reparse points) na całej ścieżce oraz
+uprawnienia katalogu nadrzędnego — konkretnie to, czy ktoś niezaufany może podmienić ten katalog.
+Prawo utworzenia nowego elementu obok nie jest błędem (`C:\ProgramData` daje je grupie
+Użytkownicy z założenia) i ACL katalogów wspólnych nie jest zmieniane.
+
+Skrypt kontrolny nie jest wysyłany do gościa — jest uruchamiany z zaufanej kopii lokalnej przez
+`powershell.exe -EncodedCommand`, a ścieżka podróżuje jako dane (base64), nie jako kod. Narzędzie
+niczego nie „naprawia”: katalog, który nie spełnia warunków, zatrzymuje **tę** maszynę, bez
+przejmowania własności, zmiany uprawnień i bez usuwania czegokolwiek. Nieudana kontrola oznacza
+zero transferów i zero uruchomień agenta na tej maszynie. Brak odpowiedzi od gościa (utracony kod
+wyjścia, przekroczony czas) też jest błędem, nie sukcesem. `-SkipHelperUpload` oszczędza transfer,
+nie kontrolę: przy ponownym użyciu helpera czasu rozruchu sprawdzany jest także sam plik.
+
 **Konfiguracja curl jest ignorowana.** Każde wywołanie `curl.exe` przechodzi przez jeden
 wrapper, który wymusza `--disable` jako **pierwszy** argument — dla próby HTTPS, wysyłki i
 pobrania. Bez tego curl czyta `%APPDATA%\_curlrc`, `CURL_HOME/.curlrc` lub `~/.curlrc`, więc

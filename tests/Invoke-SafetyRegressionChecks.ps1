@@ -642,6 +642,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $curlPath = 'unused'
         $AgentPath = 'unused'
         $identityHelperPath = 'unused'
+        $workspaceScriptPath = 'unused'
         $GuestWorkingDirectory = 'C:\unused'
         $TimeoutMinutes = 1
         $RebootTimeoutMinutes = 1
@@ -848,6 +849,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $curlPath = 'unused'
         $AgentPath = 'unused'
         $identityHelperPath = 'unused'
+        $workspaceScriptPath = 'unused'
         $GuestWorkingDirectory = 'C:\unused'
         $TimeoutMinutes = 1
         $RebootTimeoutMinutes = 1

@@ -83,7 +83,8 @@ Execution flows through layered runtime scripts plus the offline planning model 
 4. **`scripts/PatchPlanModel.ps1`** (offline model) — pure planning/reporting logic for update identity validation, default group selection, Failover Cluster skips, per-VM patch plans, summaries, and PlanOnly exit semantics. Keep it free of PowerCLI, GuestOps calls, `Read-Host`, and top-level runtime flow.
 5. **`scripts/GuestOpsLib.ps1`** (GuestOps helpers) — shared PowerCLI/GuestOps file transfer and process-run helpers. The guest agent cycle is split into `Start-VMAgentCycle` (upload + `StartProgramInGuest`), `Test-VMAgentCycleComplete` (one `ListProcessesInGuest`) and `Complete-VMAgentCycle` (download + parse). Those three are the whole cycle; the single-shot `Invoke-VMAgentCycle`/`Invoke-GuestAgentRun` that preceded them are gone, along with the needles that were keeping them alive after their last caller disappeared.
 6. **`guest/Run-LocalPatch.ps1`** (agent, runs *inside* the guest) — WUA COM only: `Microsoft.Update.Session` → searcher → downloader → installer. Writes `status.json` + `agent.log` to a unique cycle directory (`C:\ProgramData\PatchingGuestOps\<runId>`). **Never reboots** — it only reports `pendingReboot`.
-7. **`guest/Read-BootTime.ps1`** (helper, runs *inside* the guest) — reads `Win32_OperatingSystem.LastBootUpTime` and writes a UTC/ISO 8601 result for the reboot validation gate.
+7. **`guest/GuestWorkspace.ps1`** (guard, runs *inside* the guest, **never uploaded**) — creates the tool directory with a protected DACL and verifies owner, access rules, reparse points and the parent before anything is written to it. Executed through `powershell.exe -EncodedCommand`; see "Securing the guest directory before the first upload".
+8. **`guest/Read-BootTime.ps1`** (helper, runs *inside* the guest) — reads `Win32_OperatingSystem.LastBootUpTime` and writes a UTC/ISO 8601 result for the reboot validation gate.
 
 ### Inventory scope: which vCenter may answer a lookup
 
@@ -165,6 +166,65 @@ working directory, so later cycles cannot overwrite a still-running agent's file
 Discovery also requires the shared `AgentCompletionConfirmed` verdict even when the process
 reported completion. Missing/invalid `finishedAt` cannot be accepted as successful discovery or
 turn into `Green`; timeout recovery only accepts an artifact with confirmed completion.
+
+### Securing the guest directory before the first upload
+
+`guest/GuestWorkspace.ps1` runs **inside the guest and is never uploaded**. The orchestrator
+reads the trusted local copy, prepends a request object and runs the whole text through
+`powershell.exe -NoProfile -NonInteractive -EncodedCommand`. Uploading the guard into the
+directory it is meant to be guarding would mean writing a file into an unverified location and
+then trusting what came back from it. The requested path travels **base64-encoded as data** and
+is decoded inside the guest: a directory name is operator input, and interpolating it into the
+command text would make it a place where PowerShell syntax can be written.
+
+Why it exists: the tool directory holds `Run-LocalPatch.ps1`, `UpdateIdentity.ps1`,
+`selection.json`, `status.json` and the boot-time helper, and the agent is then started from it.
+An ordinary user who can write there replaces the agent between the upload and the start and has
+it run under the patching account. So `Assert-GuestWorkspaceReady` replaces the old
+`cmd.exe /c mkdir` and must finish before the first transfer — pinned by
+`Test-GuestUploadsAreGuarded` in the static gate, and asserted by behaviour (zero uploads, zero
+agent starts) in `tests/Invoke-GuestWorkspaceChecks.ps1` and the harness.
+
+Two entry points, and nothing else: `Initialize-GuestWorkspace` creates what is missing and then
+verifies; `Assert-GuestWorkspacePath` only verifies. **Nothing is ever adopted, re-permissioned,
+taken ownership of or deleted** — the static gate forbids `Set-Acl` and `Remove-Item` in that
+file. An existing directory that does not meet the contract stops that VM.
+
+Creation is `Directory.CreateDirectory(path, DirectorySecurity)` with
+`SetAccessRuleProtection($true, $false)` so the inherited rules from `C:\ProgramData` — which let
+ordinary users create entries — are not copied in. Owner is set to the local Administrators, and
+only `S-1-5-18` (SYSTEM) and `S-1-5-32-544` (Administrators) get FullControl, inherited by
+children. **Every missing level is created that way in its own right**: letting
+`CreateDirectory` make the intermediate levels would give them their parent's inherited
+permissions, and being able to write to an intermediate level is enough to move the leaf. The
+verify pass runs afterwards regardless — including on a directory another process created in the
+same instant, because then this code did not choose the permissions.
+
+What the verify refuses:
+
+- a path that is not an absolute, canonical, non-root local path (settled before `GetFullPath`);
+- an owner that is neither SYSTEM nor the local Administrators — an owner can rewrite the DACL
+  whenever they like, so a correct DACL right now proves nothing;
+- any *allow* ACE granting write, delete, ChangePermissions or TakeOwnership to a SID outside the
+  allow-list. Read and execute for ordinary users is fine: this directory is not secret;
+- a reparse point on the directory **or any ancestor** — it redirects the whole subtree;
+- a parent that lets an untrusted account **replace** the directory (Delete,
+  DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership). Creating a *new* entry beside
+  it is deliberately not refused, because `C:\ProgramData` grants exactly that to Users, and its
+  ACL is never modified here;
+- a security descriptor that cannot be read at all. No evidence of safety is a per-VM failure,
+  never a reason to carry on.
+
+`-SkipHelperUpload` saves a transfer, not the security check. The boot-time read verifies the
+directory on every round, and when the upload is skipped it also verifies the **helper file**
+already in the guest (`Assert-GuestWorkspaceFilePath`) — a safe root does not vouch for a file
+that was already sitting in it, and that file is a script this tool is about to run.
+
+The channel back is a process exit code and nothing else, so the guest's status table and the
+orchestrator's reason table must agree: 10 path, 11 owner, 12 access rule, 13 reparse point,
+14 parent, 15 unreadable descriptor, 16 create failed, 17 unexpected. An **unrecognised code, and
+a lost exit code, both fail the VM** — vSphere forgets exit codes shortly after a process ends,
+and "no answer" is the one thing that must never read as success.
 
 ### Guest-side cleanup: the only destructive operation
 

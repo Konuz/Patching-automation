@@ -451,20 +451,127 @@ function Assert-GuestTransferEndpoint {
     }
 }
 
-function New-GuestDirectory {
+# The guest-side statuses, mapped back from the only thing GuestOps returns: an exit code.
+# Kept next to the guest file's own table on purpose - if the two ever drift, an unknown code
+# lands on the catch-all below and fails the VM rather than being read as success.
+$script:GuestWorkspaceExitCodeReasons = @{
+    0  = $null
+    10 = 'the path is not an acceptable guest directory'
+    11 = 'the directory is owned by an account that is neither SYSTEM nor the local Administrators'
+    12 = 'an access rule lets an untrusted account modify the directory or its contents'
+    13 = 'a reparse point redirects the directory or one of its parents'
+    14 = 'the parent directory lets an untrusted account replace it'
+    15 = 'its security descriptor could not be read'
+    16 = 'it could not be created'
+    17 = 'the guest reported an unexpected error'
+}
+
+function Get-GuestWorkspaceFailureReason {
+    param($ExitCode)
+
+    if ($null -eq $ExitCode) {
+        # vSphere forgets an exit code shortly after the process ends, and the bootstrap is the
+        # one thing whose success may never be assumed: no answer is a failure.
+        return 'the guest never reported an exit code for the workspace check'
+    }
+
+    $code = [int]$ExitCode
+    if ($script:GuestWorkspaceExitCodeReasons.ContainsKey($code)) {
+        $reason = $script:GuestWorkspaceExitCodeReasons[$code]
+        if ($null -eq $reason) {
+            return $null
+        }
+        return $reason
+    }
+
+    return ('the guest reported an unrecognised workspace exit code {0}' -f $code)
+}
+
+function New-GuestWorkspaceBootstrapCommand {
+    param(
+        [string]$WorkspaceScriptText,
+        [string]$Path,
+        [ValidateSet('Initialize', 'Assert')][string]$Mode = 'Initialize',
+        # Optional: one file inside that directory whose owner and rules must also hold. A safe
+        # root does not vouch for a file that was already sitting in it.
+        [string]$FilePath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($WorkspaceScriptText)) {
+        throw 'The guest workspace helper source is empty.'
+    }
+
+    # The path travels as base64 DATA, decoded inside the guest. Interpolating it into the
+    # command text would make a directory name - which an operator supplies - a place where
+    # PowerShell syntax can be written.
+    $pathBase64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$Path))
+    $fileBase64 = ''
+    if (-not [string]::IsNullOrWhiteSpace($FilePath)) {
+        $fileBase64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$FilePath))
+    }
+    $preamble = @(
+        "`$GuestWorkspaceRequest = [pscustomobject]@{ Mode = '$Mode'; PathBase64 = '$pathBase64'; FileBase64 = '$fileBase64' }"
+    ) -join [Environment]::NewLine
+
+    $commandText = $preamble + [Environment]::NewLine + $WorkspaceScriptText
+    return [System.Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($commandText))
+}
+
+function Get-GuestWorkspaceScriptText {
+    param([string]$WorkspaceScriptPath)
+
+    if ([string]::IsNullOrWhiteSpace($WorkspaceScriptPath) -or -not (Test-Path -LiteralPath $WorkspaceScriptPath -PathType Leaf)) {
+        throw ('The guest workspace helper was not found: {0}' -f $WorkspaceScriptPath)
+    }
+
+    return [string](Get-Content -LiteralPath $WorkspaceScriptPath -Raw)
+}
+
+function Start-GuestWorkspaceBootstrap {
     param(
         $ProcessManager,
         $VMView,
         $GuestAuth,
-        [string]$DirectoryPath
+        [string]$EncodedCommand
     )
 
     $programSpec = New-Object VMware.Vim.GuestProgramSpec
-    $programSpec.ProgramPath = 'C:\Windows\System32\cmd.exe'
-    $programSpec.Arguments = ('/c if not exist "{0}" mkdir "{0}"' -f $DirectoryPath)
+    $programSpec.ProgramPath = 'C:\Windows\System32\WindowsPowerShell1.0\powershell.exe'
+    $programSpec.Arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {0}' -f $EncodedCommand)
+    $programSpec.WorkingDirectory = 'C:\Windows\System32'
 
-    $processId = $ProcessManager.StartProgramInGuest($VMView.MoRef, $GuestAuth, $programSpec)
-    return $processId
+    return $ProcessManager.StartProgramInGuest($VMView.MoRef, $GuestAuth, $programSpec)
+}
+
+function Assert-GuestWorkspaceReady {
+    param(
+        $ProcessManager,
+        $VMView,
+        $GuestAuth,
+        [string]$VMName,
+        [string]$Path,
+        [string]$WorkspaceScriptPath,
+        [ValidateSet('Initialize', 'Assert')][string]$Mode = 'Initialize',
+        [string]$FilePath,
+        [int]$TimeoutSeconds = 120,
+        [int]$PollSeconds = 5
+    )
+
+    # Executed straight from the trusted local copy through -EncodedCommand. Uploading the
+    # guard into the directory it is supposed to be guarding would mean writing a file into an
+    # unverified location and then trusting what came back from it.
+    $encodedCommand = New-GuestWorkspaceBootstrapCommand -WorkspaceScriptText (Get-GuestWorkspaceScriptText -WorkspaceScriptPath $WorkspaceScriptPath) -Path $Path -Mode $Mode -FilePath $FilePath
+    $processId = Start-GuestWorkspaceBootstrap -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -EncodedCommand $encodedCommand
+    $result = Wait-GuestProcess -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -ProcessId $processId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
+
+    if (-not $result.Completed) {
+        throw ('Guest directory "{0}" on {1} could not be secured: the workspace check did not finish within {2} seconds.' -f $Path, $VMName, $TimeoutSeconds)
+    }
+
+    $reason = Get-GuestWorkspaceFailureReason -ExitCode $result.ExitCode
+    if ($null -ne $reason) {
+        throw ('Guest directory "{0}" on {1} cannot be used: {2}. Nothing was uploaded to it.' -f $Path, $VMName, $reason)
+    }
 }
 
 function Wait-GuestProcess {
@@ -922,7 +1029,10 @@ function Start-VMAgentCycle {
         [string]$LocalSelectionPath,
         [string]$SelectionPath,
         [switch]$SearchOnly,
-        [int]$TransferTimeoutSeconds = 300
+        [int]$TransferTimeoutSeconds = 300,
+        # Read from the trusted local copy and executed in the guest through -EncodedCommand.
+        # Defaulted here rather than at the call sites so every caller gets the guard.
+        [string]$WorkspaceScriptPath = (Join-Path $PSScriptRoot '..\guest\GuestWorkspace.ps1')
     )
 
     $vm = Get-ExactVM -Name $VMName -Servers $Servers
@@ -950,11 +1060,11 @@ function Start-VMAgentCycle {
     $localStatusPath = Join-Path $VMOutputDirectory 'status.json'
     $localLogPath = Join-Path $VMOutputDirectory 'agent.log'
 
-    $mkdirProcessId = New-GuestDirectory -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -DirectoryPath $guestCycleDirectory
-    $mkdirResult = Wait-GuestProcess -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -ProcessId $mkdirProcessId -TimeoutSeconds 120 -PollSeconds 5
-    if (-not $mkdirResult.Completed -or ($null -ne $mkdirResult.ExitCode -and $mkdirResult.ExitCode -ne 0)) {
-        throw ('Failed to create guest working directory. Completed={0}; ExitCode={1}' -f $mkdirResult.Completed, $mkdirResult.ExitCode)
-    }
+    # Creates every missing level of the chain with a protected DACL and verifies the result,
+    # including a directory that was already there. This replaces the plain mkdir: an ordinary
+    # user who can write here could swap Run-LocalPatch.ps1 between the upload and the start and
+    # have it run under the patching account. A failure throws before the first transfer.
+    Assert-GuestWorkspaceReady -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -VMName $VMName -Path $guestCycleDirectory -WorkspaceScriptPath $WorkspaceScriptPath -Mode 'Initialize' -TimeoutSeconds 120 -PollSeconds 5
 
     # Every transfer carries a budget. The fleet puts no job wrapper around these calls, so
     # nothing else bounds a curl hanging against an unresponsive ESXi data plane.
@@ -1455,7 +1565,8 @@ function Invoke-VMGuestBootTimeRead {
         [string]$BootTimeHelperPath,
         [int]$TimeoutSeconds = 120,
         [int]$PollSeconds = 5,
-        [switch]$SkipHelperUpload
+        [switch]$SkipHelperUpload,
+        [string]$WorkspaceScriptPath = (Join-Path $PSScriptRoot '..\guest\GuestWorkspace.ps1')
     )
 
     $vm = Get-ExactVM -Name $VMName -Servers $Servers
@@ -1497,14 +1608,17 @@ function Invoke-VMGuestBootTimeRead {
         # the WUA agent uses - so re-creating and re-uploading them on every observation round is
         # pure waste on the data plane. The caller drops the switch again after any failed read,
         # so a guest that lost the file self-heals on the next attempt.
-        if (-not $SkipHelperUpload) {
-            $mkdirProcessId = New-GuestDirectory -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -DirectoryPath $GuestWorkingDirectory
-            $mkdirTimeoutSeconds = [int][math]::Min(120, (& $getRemainingSeconds))
-            $mkdirResult = Wait-GuestProcess -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -ProcessId $mkdirProcessId -TimeoutSeconds $mkdirTimeoutSeconds -PollSeconds $shortOperationPollSeconds
-            if (-not $mkdirResult.Completed -or ($null -ne $mkdirResult.ExitCode -and $mkdirResult.ExitCode -ne 0)) {
-                throw ('Failed to create guest working directory. Completed={0}; ExitCode={1}' -f $mkdirResult.Completed, $mkdirResult.ExitCode)
-            }
+        # The directory is verified on EVERY read, upload or not. -SkipHelperUpload exists to
+        # save a transfer, not to skip the security check: the helper it reuses is a script this
+        # tool is about to run in the guest, and a directory that became writable between two
+        # observation rounds is exactly the window worth closing.
+        $workspaceTimeoutSeconds = [int][math]::Min(120, (& $getRemainingSeconds))
+        # When the upload is skipped the helper already in the guest is the one about to run,
+        # so it is checked too. A fresh upload replaces whatever is there, so it is not.
+        $workspaceFilePath = if ($SkipHelperUpload) { $guestHelperPath } else { '' }
+        Assert-GuestWorkspaceReady -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -VMName $VMName -Path $GuestWorkingDirectory -WorkspaceScriptPath $WorkspaceScriptPath -Mode 'Initialize' -FilePath $workspaceFilePath -TimeoutSeconds $workspaceTimeoutSeconds -PollSeconds $shortOperationPollSeconds
 
+        if (-not $SkipHelperUpload) {
             Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $BootTimeHelperPath -GuestPath $guestHelperPath -TimeoutSeconds (& $getRemainingSeconds)
         }
 

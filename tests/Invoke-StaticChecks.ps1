@@ -214,6 +214,7 @@ function Assert-NoReservedVariableName {
 $agentPath = 'guest\Run-LocalPatch.ps1'
 $identityHelperPath = 'guest\UpdateIdentity.ps1'
 $bootTimeHelperPath = 'guest\Read-BootTime.ps1'
+$workspaceHelperPath = 'guest\GuestWorkspace.ps1'
 $orchestratorPath = 'scripts\Invoke-GuestOpsPatchValidation.ps1'
 $runtimeHelperPath = 'scripts\OrchestratorRuntime.ps1'
 $guestOpsLibPath = 'scripts\GuestOpsLib.ps1'
@@ -223,12 +224,13 @@ $modelPath = 'scripts\PatchPlanModel.ps1'
 $modelTestPath = 'tests\Invoke-ModelChecks.ps1'
 $runtimeTestPath = 'tests\Invoke-RuntimeChecks.ps1'
 $harnessTestPath = 'tests\Invoke-GuestOpsHarnessChecks.ps1'
+$workspaceTestPath = 'tests\Invoke-GuestWorkspaceChecks.ps1'
 $settingsStorePath = 'scripts\SettingsStore.ps1'
 $guiPromptsPath = 'scripts\GuiPrompts.ps1'
 $guiLauncherPath = 'Start-PatchingGuestOpsGui.ps1'
 
 $existingScripts = @{}
-foreach ($relativePath in @($agentPath, $identityHelperPath, $bootTimeHelperPath, $orchestratorPath, $runtimeHelperPath, $guestOpsLibPath, $vmTargetLibPath, $launcherPath, $modelPath, $modelTestPath, $runtimeTestPath, $harnessTestPath)) {
+foreach ($relativePath in @($agentPath, $identityHelperPath, $bootTimeHelperPath, $workspaceHelperPath, $orchestratorPath, $runtimeHelperPath, $guestOpsLibPath, $vmTargetLibPath, $launcherPath, $modelPath, $modelTestPath, $runtimeTestPath, $harnessTestPath, $workspaceTestPath)) {
     $path = Assert-FileExists -RelativePath $relativePath
     if ($path) {
         $existingScripts[$relativePath] = $path
@@ -282,6 +284,22 @@ if ($existingScripts.ContainsKey($agentPath)) {
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'roleFlags'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'failoverCluster'
     Assert-TextDoesNotMatch -RelativePath $agentPath -Text $agentText -Pattern '(?i)\$[a-z_][a-z0-9_]*\.HResult\b' -Reason 'WUA COM HResult can be absent under StrictMode'
+}
+
+if ($existingScripts.ContainsKey($workspaceHelperPath)) {
+    $workspaceHelperAst = Get-ScriptAst -RelativePath $workspaceHelperPath -Path $existingScripts[$workspaceHelperPath]
+    $workspaceHelperText = Get-ScriptText -Path $existingScripts[$workspaceHelperPath]
+
+    Assert-NoForbiddenCommand -Ast $workspaceHelperAst -RelativePath $workspaceHelperPath -ForbiddenNames $forbiddenCommands
+    Assert-NoForbiddenCommandLiteral -RelativePath $workspaceHelperPath -Text $workspaceHelperText -ForbiddenNames $forbiddenCommands
+    Assert-NoReservedVariableName -Ast $workspaceHelperAst -RelativePath $workspaceHelperPath -ReservedNames $reservedVariableNames
+    Assert-NoOrphanedBranchKeyword -Ast $workspaceHelperAst -RelativePath $workspaceHelperPath
+    Assert-TextDoesNotMatch -RelativePath $workspaceHelperPath -Text $workspaceHelperText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
+
+    # The guard never repairs what it finds. Taking ownership or rewriting an ACL would turn a
+    # refusal - the one safe answer - into a silent adoption of somebody else's directory.
+    Assert-TextDoesNotMatch -RelativePath $workspaceHelperPath -Text $workspaceHelperText -Pattern '(?i)\bSet-Acl\b' -Reason 'the guest workspace guard reports, it never re-permissions what it finds'
+    Assert-TextDoesNotMatch -RelativePath $workspaceHelperPath -Text $workspaceHelperText -Pattern '(?i)\bRemove-Item\b' -Reason 'the guest workspace guard never deletes anything'
 }
 
 if ($existingScripts.ContainsKey($bootTimeHelperPath)) {
@@ -890,6 +908,46 @@ function Test-VMLookupsAreScoped {
     return 'ok'
 }
 
+# The tool directory has to be proven safe before the first byte lands in it: an ordinary user
+# who can write there replaces the agent between the upload and the start, and it runs as the
+# patching account. Structural, because "throws on a refusal" is not the property that matters -
+# "nothing was transferred on the way to throwing" is. Returns 'ok', or what is out of order.
+function Test-GuestUploadsAreGuarded {
+    param($Ast, [string[]]$FunctionNames)
+
+    foreach ($functionName in @($FunctionNames)) {
+        $definition = @($Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+                }, $true) | Where-Object { $_.Name -eq $functionName })
+        if (@($definition).Count -eq 0) {
+            continue
+        }
+
+        $body = @($definition)[0]
+        $guardLines = @(Get-CommandAstsByName -Ast $body -Name 'Assert-GuestWorkspaceReady' | ForEach-Object { $_.Extent.StartLineNumber })
+        $transferLines = @(@('Send-GuestFile', 'Start-GuestAgent', 'Start-GuestBootTimeQuery') | ForEach-Object {
+                Get-CommandAstsByName -Ast $body -Name $_ | ForEach-Object { $_.Extent.StartLineNumber }
+            })
+
+        if (@($transferLines).Count -eq 0) {
+            continue
+        }
+
+        if (@($guardLines).Count -eq 0) {
+            return ('{0} transfers to the guest without checking the workspace first' -f $functionName)
+        }
+
+        $firstGuard = (@($guardLines) | Sort-Object)[0]
+        $firstTransfer = (@($transferLines) | Sort-Object)[0]
+        if ($firstGuard -gt $firstTransfer) {
+            return ('{0} transfers to the guest at line {1}, before the workspace check at line {2}' -f $functionName, $firstTransfer, $firstGuard)
+        }
+    }
+
+    return 'ok'
+}
+
 function Test-ScriptTailHasReturn {
     param($Ast)
 
@@ -994,6 +1052,13 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     $finalReportVerdict = Test-FinalReportContract -Ast $orchestratorAstForChecks
     if ($finalReportVerdict -ne 'ok') {
         $failures += ('{0}: the Write-FinalReport contract is not met ({1})' -f $orchestratorPath, $finalReportVerdict)
+    }
+}
+
+if ($existingScripts.ContainsKey($guestOpsLibPath)) {
+    $guardedUploadVerdict = Test-GuestUploadsAreGuarded -Ast (Get-ScriptAst -RelativePath $guestOpsLibPath -Path $existingScripts[$guestOpsLibPath]) -FunctionNames @('Start-VMAgentCycle', 'Invoke-VMGuestBootTimeRead')
+    if ($guardedUploadVerdict -ne 'ok') {
+        $failures += ('{0}: the guest workspace must be secured before anything is written to it or run from it ({1})' -f $guestOpsLibPath, $guardedUploadVerdict)
     }
 }
 
@@ -1158,6 +1223,45 @@ $scopedLookupCommentSource = @'
 $vm = Get-ExactVM -Name $VMName -Servers $VIServerScope
 '@
 Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $scopedLookupCommentSource -Rule $scopedLookupRule) -Expected 'ok' -Message 'an unscoped lookup in a comment does not trip the scoped-lookup rule'
+
+# The guarded-upload rule, probed the same way.
+$guardedUploadRule = {
+    param($Ast)
+    return (Test-GuestUploadsAreGuarded -Ast $Ast -FunctionNames @('Start-VMAgentCycle'))
+}
+
+$guardedUploadOkSource = @'
+function Start-VMAgentCycle {
+    Assert-GuestWorkspaceReady -Path $guestCycleDirectory
+    Send-GuestFile -LocalPath $AgentPath
+    Start-GuestAgent -GuestAgentPath $guestAgentPath
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $guardedUploadOkSource -Rule $guardedUploadRule) -Expected 'ok' -Message 'a cycle that secures the workspace first satisfies the guarded-upload rule'
+
+$guardedUploadMissingSource = @'
+function Start-VMAgentCycle {
+    Send-GuestFile -LocalPath $AgentPath
+    Start-GuestAgent -GuestAgentPath $guestAgentPath
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $guardedUploadMissingSource -Rule $guardedUploadRule) -Expected 'Start-VMAgentCycle transfers to the guest without checking the workspace first' -Message 'an unguarded upload trips the guarded-upload rule'
+
+$guardedUploadLateSource = @'
+function Start-VMAgentCycle {
+    Send-GuestFile -LocalPath $AgentPath
+    Assert-GuestWorkspaceReady -Path $guestCycleDirectory
+    Start-GuestAgent -GuestAgentPath $guestAgentPath
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $guardedUploadLateSource -Rule $guardedUploadRule) -Expected 'Start-VMAgentCycle transfers to the guest at line 2, before the workspace check at line 3' -Message 'a workspace check after the first transfer trips the guarded-upload rule'
+
+$guardedUploadNoTransferSource = @'
+function Start-VMAgentCycle {
+    $handle = New-VMAgentCycleHandle
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $guardedUploadNoTransferSource -Rule $guardedUploadRule) -Expected 'ok' -Message 'a function that transfers nothing needs no workspace check'
 
 $exitSource = @'
 $scriptExitCode = 1

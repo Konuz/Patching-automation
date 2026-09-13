@@ -86,7 +86,7 @@ function New-FakeGuest {
         VanishesFromProcessList = [bool]$VanishesFromProcessList
         TransientPollFailures = 0
         FailsToResolve = [bool]$FailsToResolve
-        MkdirProcessIds = @{}
+        SetupProcessIds = @{}
         ListProcessCallCount = 0
         StartProgramCallCount = 0
         RunId = ''
@@ -94,6 +94,9 @@ function New-FakeGuest {
         AgentSpec = $null
         UploadedPaths = @()
         Client = $null
+        # The workspace guard runs before the first upload and reports through its exit code.
+        WorkspaceSpecs = @()
+        WorkspaceExitCode = 0
     }
 }
 
@@ -108,9 +111,11 @@ function New-FakeManagers {
         param($MoRef, $Auth, $Spec)
         $this.State.StartProgramCallCount++
         $this.State.NextProcessId++
-        # cmd.exe is the mkdir call; it always finishes at once so the cycle can get past setup.
-        if ([string]$Spec.ProgramPath -like '*cmd.exe') {
-            $this.State.MkdirProcessIds[[string]$this.State.NextProcessId] = $true
+        # The workspace guard is an -EncodedCommand run that has to finish before anything is
+        # uploaded; it reports through its exit code, which this fixture can steer.
+        if ([string]$Spec.Arguments -like '*-EncodedCommand*') {
+            $this.State.WorkspaceSpecs += $Spec
+            $this.State.SetupProcessIds[[string]$this.State.NextProcessId] = [int]$this.State.WorkspaceExitCode
         }
         else {
             $this.State.AgentSpec = $Spec
@@ -126,8 +131,8 @@ function New-FakeManagers {
         $this.State.ListProcessCallCount++
         $processId = @($ProcessIds)[0]
 
-        if ($this.State.MkdirProcessIds.ContainsKey([string]$processId)) {
-            return @([pscustomobject]@{ Pid = $processId; EndTime = (Get-Date); ExitCode = 0 })
+        if ($this.State.SetupProcessIds.ContainsKey([string]$processId)) {
+            return @([pscustomobject]@{ Pid = $processId; EndTime = (Get-Date); ExitCode = $this.State.SetupProcessIds[[string]$processId] })
         }
 
         if ($this.State.VanishesFromProcessList) {
@@ -371,6 +376,59 @@ finally {
     Set-Item Function:\Invoke-Curl -Value $originalInvokeCurl
     Set-Item Function:\Start-GuestAgent -Value $originalStartGuestAgent
     Remove-Item -LiteralPath $failureWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# The workspace guard, against the real Start-VMAgentCycle. Its point is not that a refused
+# directory throws, but that nothing was uploaded and no agent was started on the way to
+# throwing: an ordinary user who can write to the tool directory could otherwise replace
+# Run-LocalPatch.ps1 between the upload and the start and have it run as the patching account.
+$workspaceGuardWorkspace = New-HarnessWorkspace
+try {
+    $script:guestState = @{}
+    New-FakeGuest -VMName 'VM-workspace-ok'
+    $okManagers = New-FakeManagers -VMName 'VM-workspace-ok'
+    $okHandle = Start-VMAgentCycle -VMName 'VM-workspace-ok' -Servers $harnessServerScope -Managers $okManagers -GuestAuth (New-GuestAuthentication -Credential $harnessCredential) -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -VMOutputDirectory (Join-Path $workspaceGuardWorkspace 'VM-workspace-ok') -MaxUpdates 1
+    $okState = $script:guestState['VM-workspace-ok']
+    Assert-Equal -Actual @($okState.WorkspaceSpecs).Count -Expected 1 -Message 'harness: the workspace guard runs once per cycle'
+    Assert-Equal -Actual ([string]@($okState.WorkspaceSpecs)[0].ProgramPath -like '*powershell.exe') -Expected $true -Message 'harness: the workspace guard runs through powershell.exe'
+    Assert-Contains -Text ([string]@($okState.WorkspaceSpecs)[0].Arguments) -Needle '-EncodedCommand' -Message 'harness: the workspace guard is never uploaded, it is encoded into the command'
+    Assert-Equal -Actual ($okState.UploadedPaths.Count -gt 0) -Expected $true -Message 'harness: a secured workspace still uploads the agent'
+    Assert-Equal -Actual ($okHandle.GuestCycleDirectory -like ($guestWorkingDirectory + '*')) -Expected $true -Message 'harness: the secured path is the cycle directory'
+
+    # The guest reports "an untrusted account may modify this directory" (exit code 12).
+    $script:guestState = @{}
+    New-FakeGuest -VMName 'VM-workspace-refused'
+    $script:guestState['VM-workspace-refused'].WorkspaceExitCode = 12
+    $refusedManagers = New-FakeManagers -VMName 'VM-workspace-refused'
+    $workspaceError = ''
+    try {
+        Start-VMAgentCycle -VMName 'VM-workspace-refused' -Servers $harnessServerScope -Managers $refusedManagers -GuestAuth (New-GuestAuthentication -Credential $harnessCredential) -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -VMOutputDirectory (Join-Path $workspaceGuardWorkspace 'VM-workspace-refused') -MaxUpdates 1 | Out-Null
+    }
+    catch {
+        $workspaceError = [string]$_.Exception.Message
+    }
+    $refusedState = $script:guestState['VM-workspace-refused']
+    Assert-Contains -Text $workspaceError -Needle 'cannot be used' -Message 'harness: a refused workspace stops the cycle'
+    Assert-Contains -Text $workspaceError -Needle 'Nothing was uploaded' -Message 'harness: the refusal says nothing was uploaded'
+    Assert-Equal -Actual @($refusedState.UploadedPaths).Count -Expected 0 -Message 'harness: a refused workspace transfers nothing'
+    Assert-Equal -Actual ($null -eq $refusedState.AgentSpec) -Expected $true -Message 'harness: a refused workspace starts no agent'
+
+    # A guest that never answers about the guard is not a pass either.
+    $script:guestState = @{}
+    New-FakeGuest -VMName 'VM-workspace-silent' -NeverFinishes
+    $silentManagers = New-FakeManagers -VMName 'VM-workspace-silent'
+    $silentError = ''
+    try {
+        Start-VMAgentCycle -VMName 'VM-workspace-silent' -Servers $harnessServerScope -Managers $silentManagers -GuestAuth (New-GuestAuthentication -Credential $harnessCredential) -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -VMOutputDirectory (Join-Path $workspaceGuardWorkspace 'VM-workspace-silent') -MaxUpdates 1 | Out-Null
+    }
+    catch {
+        $silentError = [string]$_.Exception.Message
+    }
+    Assert-Contains -Text $silentError -Needle 'could not be secured' -Message 'harness: a workspace check that never finishes fails the cycle'
+    Assert-Equal -Actual @($script:guestState['VM-workspace-silent'].UploadedPaths).Count -Expected 0 -Message 'harness: a silent workspace check transfers nothing'
+}
+finally {
+    Remove-Item -LiteralPath $workspaceGuardWorkspace -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # The PUT path, asserted at the program-execution boundary with the real Invoke-Curl. The
