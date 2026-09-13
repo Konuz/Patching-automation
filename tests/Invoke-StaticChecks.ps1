@@ -482,7 +482,10 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextMatches -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)function\s+Write-FinalReport\b.*?\$errors\s*=\s*@\(\$ApplyResults\s*\|\s*Where-Object\s*\{\s*Test-IsApplyResultError\s+-ApplyResult\s+\$_\s*\}\)' -Reason 'final report errors use shared apply-result error semantics'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'New-ApplyResultFromCycle'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'No selected update keys were available for apply.'
-    Assert-TextMatches -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)if\s*\(\$record\.action\s+-ne\s+''Install''\).*?outcome\s*=\s*''Skipped''.*?installResult\s*=\s*\$null.*?continue' -Reason 'skipped apply results include installResult'
+    # This used to be a text needle pinning one field of one branch. Every branch now goes through
+    # New-ApplyResultRecord, which cannot omit a field, and the structural rule below says so for
+    # all of them - pinning a single field only invites the next one to be forgotten.
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'New-ApplyResultRecord'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '\$applyResults\s*\|\s*Where-Object\s*\{\s*\$_\.outcome\s+-in\s+@\(''Failed'',\s*''InstallFailed'',\s*''InstallSucceededWithErrors'',\s*''DownloadFailed''\)' -Reason 'apply exit must use explicit success criteria, not an outcome deny-list'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'New-UniqueOutputDirectory'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle "'{0:D3}-{1}' -f"
@@ -749,6 +752,38 @@ function Get-CommandAstsByName {
     }, $true) | Where-Object { ([string]$_.GetCommandName()) -eq $Name })
 }
 
+# The text of the value bound to one named parameter, or $null when the parameter is absent.
+# Handles both spellings PowerShell accepts: -Name Value (the value is the next element) and
+# -Name:Value (the parser attaches it to the parameter itself). Abbreviations bind here too, for
+# the same reason Test-CommandAstHasParameter accepts them.
+function Get-NamedArgumentText {
+    param($Command, [string]$ParameterName)
+
+    $elements = @($Command.CommandElements)
+    for ($index = 0; $index -lt $elements.Count; $index++) {
+        $element = $elements[$index]
+        if ($element -isnot [System.Management.Automation.Language.CommandParameterAst]) {
+            continue
+        }
+
+        $written = [string]$element.ParameterName
+        if ([string]::IsNullOrWhiteSpace($written) -or -not $ParameterName.StartsWith($written, [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+
+        if ($null -ne $element.Argument) {
+            return [string]$element.Argument.Extent.Text
+        }
+        if ($index + 1 -lt $elements.Count -and $elements[$index + 1] -isnot [System.Management.Automation.Language.CommandParameterAst]) {
+            return [string]$elements[$index + 1].Extent.Text
+        }
+        # Written, but with nothing after it: a switch, or a call that will not bind.
+        return ''
+    }
+
+    return $null
+}
+
 # PowerShell binds abbreviations, so -SkipConfirm reaches -SkipConfirmation. A rule that only
 # matched the full spelling would be trivially avoidable without meaning to avoid it.
 function Test-CommandAstHasParameter {
@@ -985,6 +1020,63 @@ function Test-GuestUploadsAreGuarded {
     return 'ok'
 }
 
+# The seal is what turns "this directory was safe when the bootstrap checked it" into "this is
+# still the directory the bootstrap secured". It only works if ONE token spans all three calls:
+# the bootstrap writes it, and the guest program started afterwards is asked to verify that same
+# token. Dropping -WorkspaceSealToken from the start would leave every earlier check in place and
+# silently remove the only cover over the upload-to-start window, and the harness that exercises
+# the coupling end to end needs PowerCLI types, so it skips on most machines. Structural for that
+# reason. Returns 'ok' or the first function whose chain is broken.
+function Test-GuestWorkspaceSealsSpanTheCycle {
+    param($Ast, $Pairs)
+
+    foreach ($pair in @($Pairs)) {
+        $definition = @($Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+                }, $true) | Where-Object { $_.Name -eq $pair.FunctionName })
+        if (@($definition).Count -eq 0) {
+            continue
+        }
+
+        $body = @($definition)[0]
+        $starts = @(Get-CommandAstsByName -Ast $body -Name $pair.StartCommand)
+        if (@($starts).Count -eq 0) {
+            continue
+        }
+
+        # The token must be generated here, not passed in: a caller-supplied token would be one
+        # the bootstrap of this cycle never wrote.
+        $mintedTokens = @()
+        foreach ($assignment in @($body.FindAll({
+                        param($node)
+                        $node -is [System.Management.Automation.Language.AssignmentStatementAst]
+                    }, $true))) {
+            if (([string]$assignment.Right.Extent.Text) -match '(?i)New-GuestWorkspaceSealToken') {
+                $mintedTokens += ([string]$assignment.Left.Extent.Text).Trim()
+            }
+        }
+        if (@($mintedTokens).Count -eq 0) {
+            return ('{0} starts a guest program without minting a workspace seal token' -f $pair.FunctionName)
+        }
+
+        foreach ($commandName in @($pair.GuardCommand, $pair.StartCommand)) {
+            $parameterName = if ($commandName -eq $pair.GuardCommand) { 'SealToken' } else { 'WorkspaceSealToken' }
+            foreach ($command in @(Get-CommandAstsByName -Ast $body -Name $commandName)) {
+                $argument = Get-NamedArgumentText -Command $command -ParameterName $parameterName
+                if ($null -eq $argument) {
+                    return ('{0}: {1} is called without -{2}' -f $pair.FunctionName, $commandName, $parameterName)
+                }
+                if (@($mintedTokens) -notcontains $argument.Trim()) {
+                    return ('{0}: {1} -{2} is {3}, not the token minted in this cycle' -f $pair.FunctionName, $commandName, $parameterName, $argument.Trim())
+                }
+            }
+        }
+    }
+
+    return 'ok'
+}
+
 # Writing a password to disk is a decision the operator makes, not one they have to notice and
 # undo. DPAPI binds credentials.json to this Windows account on this machine and nothing more, so
 # anything running as that account can read it back. The checkbox therefore starts unticked.
@@ -1009,6 +1101,51 @@ function Test-CredentialDialogDefaultsToNotRemember {
         $value = ([string]$assignment.Right.Extent.Text).Trim()
         if ($value -ine '$false') {
             return ('line {0}: {1}' -f $assignment.Extent.StartLineNumber, $value)
+        }
+    }
+
+    return 'ok'
+}
+
+# Every apply-result branch has to come from one constructor. Four hand-written literals drifted
+# apart before New-ApplyResultRecord existed: a property one branch happens not to set is a
+# terminating error under StrictMode for whoever reads apply-results.json back, and a field
+# silently missing from the timeout branch is a field the summary and the reboot selection
+# disagree about. Returns 'ok' or the first branch that builds one by hand.
+function Test-ApplyResultsUseSharedRecord {
+    param($Ast)
+
+    # The constructor's own literal is the one that is allowed to exist.
+    $constructorExtents = @($Ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'New-ApplyResultRecord'
+            }, $true) | ForEach-Object { $_.Extent })
+
+    foreach ($literal in @($Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.HashtableAst]
+                }, $true))) {
+        $keys = @()
+        foreach ($pair in @($literal.KeyValuePairs)) {
+            $keys += ([string]$pair.Item1.Extent.Text).Trim("'", '"')
+        }
+
+        # An apply result is recognised by the fields only an apply result has, so a per-VM
+        # completion state or a fleet item is not mistaken for one.
+        if (-not (($keys -contains 'vmName') -and ($keys -contains 'action') -and ($keys -contains 'outcome') -and ($keys -contains 'agentCompletionConfirmed'))) {
+            continue
+        }
+
+        $insideConstructor = $false
+        foreach ($constructorExtent in $constructorExtents) {
+            if ($literal.Extent.StartOffset -ge $constructorExtent.StartOffset -and $literal.Extent.EndOffset -le $constructorExtent.EndOffset) {
+                $insideConstructor = $true
+                break
+            }
+        }
+
+        if (-not $insideConstructor) {
+            return ('line {0}: an apply result built by hand instead of through New-ApplyResultRecord' -f $literal.Extent.StartLineNumber)
         }
     }
 
@@ -1122,6 +1259,17 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     }
 }
 
+foreach ($applyRecordPath in @($orchestratorPath, $runtimeHelperPath)) {
+    if (-not $existingScripts.ContainsKey($applyRecordPath)) {
+        continue
+    }
+
+    $applyRecordVerdict = Test-ApplyResultsUseSharedRecord -Ast (Get-ScriptAst -RelativePath $applyRecordPath -Path $existingScripts[$applyRecordPath])
+    if ($applyRecordVerdict -ne 'ok') {
+        $failures += ('{0}: every apply result must be built by New-ApplyResultRecord ({1})' -f $applyRecordPath, $applyRecordVerdict)
+    }
+}
+
 if ($existingScripts.ContainsKey($guiPromptsPath)) {
     $rememberVerdict = Test-CredentialDialogDefaultsToNotRemember -Ast (Get-ScriptAst -RelativePath $guiPromptsPath -Path $existingScripts[$guiPromptsPath])
     if ($rememberVerdict -ne 'ok') {
@@ -1133,6 +1281,14 @@ if ($existingScripts.ContainsKey($guestOpsLibPath)) {
     $guardedUploadVerdict = Test-GuestUploadsAreGuarded -Ast (Get-ScriptAst -RelativePath $guestOpsLibPath -Path $existingScripts[$guestOpsLibPath]) -FunctionNames @('Start-VMAgentCycle', 'Invoke-VMGuestBootTimeRead')
     if ($guardedUploadVerdict -ne 'ok') {
         $failures += ('{0}: the guest workspace must be secured before anything is written to it or run from it ({1})' -f $guestOpsLibPath, $guardedUploadVerdict)
+    }
+
+    $sealSpanVerdict = Test-GuestWorkspaceSealsSpanTheCycle -Ast (Get-ScriptAst -RelativePath $guestOpsLibPath -Path $existingScripts[$guestOpsLibPath]) -Pairs @(
+        [pscustomobject]@{ FunctionName = 'Start-VMAgentCycle'; GuardCommand = 'Assert-GuestWorkspaceReady'; StartCommand = 'Start-GuestAgent' },
+        [pscustomobject]@{ FunctionName = 'Invoke-VMGuestBootTimeRead'; GuardCommand = 'Assert-GuestWorkspaceReady'; StartCommand = 'Start-GuestBootTimeQuery' }
+    )
+    if ($sealSpanVerdict -ne 'ok') {
+        $failures += ('{0}: the seal the bootstrap writes must be the seal the guest program verifies ({1})' -f $guestOpsLibPath, $sealSpanVerdict)
     }
 }
 
@@ -1265,6 +1421,34 @@ $exitRule = {
     return (Test-ScriptExitsWithComputedCode -Ast $Ast)
 }
 
+# The shared-apply-record rule, probed the same way.
+$applyRecordRule = {
+    param($Ast)
+    return (Test-ApplyResultsUseSharedRecord -Ast $Ast)
+}
+
+$applyRecordOkSource = @'
+$result = New-ApplyResultRecord -VMName $vmName -Outcome 'Failed' -Reason $reason
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $applyRecordOkSource -Rule $applyRecordRule) -Expected 'ok' -Message 'building an apply result through the constructor satisfies the shared-record rule'
+
+$applyRecordViolationSource = @'
+$result = [pscustomobject]@{ vmName = $vmName; action = 'Install'; outcome = 'Failed'; agentCompletionConfirmed = $false }
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $applyRecordViolationSource -Rule $applyRecordRule) -Expected 'line 1: an apply result built by hand instead of through New-ApplyResultRecord' -Message 'a hand-built apply result trips the shared-record rule'
+
+$applyRecordConstructorSource = @'
+function New-ApplyResultRecord {
+    return [pscustomobject]@{ vmName = $VMName; action = $Action; outcome = $Outcome; agentCompletionConfirmed = $AgentCompletionConfirmed }
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $applyRecordConstructorSource -Rule $applyRecordRule) -Expected 'ok' -Message 'the constructor itself is allowed to build the object'
+
+$applyRecordUnrelatedSource = @'
+$state = [pscustomobject]@{ vmName = $vmName; state = 'Green'; reason = 'No selectable updates remain.' }
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $applyRecordUnrelatedSource -Rule $applyRecordRule) -Expected 'ok' -Message 'an unrelated per-VM object is not mistaken for an apply result'
+
 # The remember-default rule, probed the same way.
 $rememberRule = {
     param($Ast)
@@ -1366,6 +1550,75 @@ function Start-VMAgentCycle {
 }
 '@
 Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $guardedUploadNoTransferSource -Rule $guardedUploadRule) -Expected 'ok' -Message 'a function that transfers nothing needs no workspace check'
+
+# The seal-span rule, probed the same way.
+$sealSpanRule = {
+    param($Ast)
+    return (Test-GuestWorkspaceSealsSpanTheCycle -Ast $Ast -Pairs @(
+            [pscustomobject]@{ FunctionName = 'Start-VMAgentCycle'; GuardCommand = 'Assert-GuestWorkspaceReady'; StartCommand = 'Start-GuestAgent' }
+        ))
+}
+
+$sealSpanOkSource = @'
+function Start-VMAgentCycle {
+    $workspaceSealToken = New-GuestWorkspaceSealToken
+    Assert-GuestWorkspaceReady -Path $guestCycleDirectory -SealToken $workspaceSealToken
+    Start-GuestAgent -GuestAgentPath $guestAgentPath -WorkspaceSealToken $workspaceSealToken -SearchOnly:$SearchOnly
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $sealSpanOkSource -Rule $sealSpanRule) -Expected 'ok' -Message 'one minted token across the bootstrap and the start satisfies the seal-span rule'
+
+$sealSpanUnsealedStartSource = @'
+function Start-VMAgentCycle {
+    $workspaceSealToken = New-GuestWorkspaceSealToken
+    Assert-GuestWorkspaceReady -Path $guestCycleDirectory -SealToken $workspaceSealToken
+    Start-GuestAgent -GuestAgentPath $guestAgentPath
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $sealSpanUnsealedStartSource -Rule $sealSpanRule) -Expected 'Start-VMAgentCycle: Start-GuestAgent is called without -WorkspaceSealToken' -Message 'a guest program started without the seal trips the seal-span rule'
+
+$sealSpanUnsealedGuardSource = @'
+function Start-VMAgentCycle {
+    $workspaceSealToken = New-GuestWorkspaceSealToken
+    Assert-GuestWorkspaceReady -Path $guestCycleDirectory
+    Start-GuestAgent -GuestAgentPath $guestAgentPath -WorkspaceSealToken $workspaceSealToken
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $sealSpanUnsealedGuardSource -Rule $sealSpanRule) -Expected 'Start-VMAgentCycle: Assert-GuestWorkspaceReady is called without -SealToken' -Message 'a bootstrap that writes no seal trips the seal-span rule'
+
+$sealSpanForeignTokenSource = @'
+function Start-VMAgentCycle {
+    $workspaceSealToken = New-GuestWorkspaceSealToken
+    Assert-GuestWorkspaceReady -Path $guestCycleDirectory -SealToken $workspaceSealToken
+    Start-GuestAgent -GuestAgentPath $guestAgentPath -WorkspaceSealToken $CallerSuppliedToken
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $sealSpanForeignTokenSource -Rule $sealSpanRule) -Expected 'Start-VMAgentCycle: Start-GuestAgent -WorkspaceSealToken is $CallerSuppliedToken, not the token minted in this cycle' -Message 'a token this cycle did not mint trips the seal-span rule'
+
+$sealSpanNoTokenSource = @'
+function Start-VMAgentCycle {
+    Assert-GuestWorkspaceReady -Path $guestCycleDirectory
+    Start-GuestAgent -GuestAgentPath $guestAgentPath
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $sealSpanNoTokenSource -Rule $sealSpanRule) -Expected 'Start-VMAgentCycle starts a guest program without minting a workspace seal token' -Message 'a cycle that mints no token trips the seal-span rule'
+
+$sealSpanNoStartSource = @'
+function Start-VMAgentCycle {
+    $handle = New-VMAgentCycleHandle
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $sealSpanNoStartSource -Rule $sealSpanRule) -Expected 'ok' -Message 'a function that starts no guest program needs no seal'
+
+# The colon spelling binds the same way, so the rule must read it.
+$sealSpanColonSource = @'
+function Start-VMAgentCycle {
+    $workspaceSealToken = New-GuestWorkspaceSealToken
+    Assert-GuestWorkspaceReady -Path $guestCycleDirectory -SealToken:$workspaceSealToken
+    Start-GuestAgent -GuestAgentPath $guestAgentPath -WorkspaceSealToken:$workspaceSealToken
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $sealSpanColonSource -Rule $sealSpanRule) -Expected 'ok' -Message 'the -Name:Value spelling of the seal token is recognised'
 
 $exitSource = @'
 $scriptExitCode = 1

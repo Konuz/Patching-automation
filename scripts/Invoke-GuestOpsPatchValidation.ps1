@@ -948,20 +948,14 @@ function Invoke-ApplyPhase {
         $recordNumber++
 
         if ($record.action -ne 'Install') {
+            # roleFlags come from the plan: no cycle ran, so there is no guest status to read them
+            # from, and the reboot selection needs them to keep excluding a cluster. Cleanup is
+            # $null rather than a made-up verdict - nothing was created to clean up.
             $resultEntries += [pscustomobject]@{
                 Sequence = $recordNumber
-                Result = [pscustomobject]@{
-                    vmName = $record.vmName
-                    action = $record.action
-                    outcome = 'Skipped'
-                    installResult = $null
-                    reason = $record.reason
-                    roleFlags = Get-ObjectPropertyValue -InputObject $record -Path @('roleFlags')
-                    rebootRequired = $false
-                    agentCompletionConfirmed = $false
-                    agentCompletionReason = ''
-                    errors = @()
-                }
+                Result = New-ApplyResultRecord -VMName ([string]$record.vmName) -Action ([string]$record.action) -Outcome 'Skipped' `
+                    -Reason ([string]$record.reason) -RoleFlags (Get-ObjectPropertyValue -InputObject $record -Path @('roleFlags')) `
+                    -RebootRequired $false -AgentCompletionConfirmed $false
             }
             continue
         }
@@ -978,17 +972,10 @@ function Invoke-ApplyPhase {
             $reason = 'No selected update keys were available for apply.'
             $resultEntries += [pscustomobject]@{
                 Sequence = $recordNumber
-                Result = [pscustomobject]@{
-                    vmName = $record.vmName
-                    action = 'Install'
-                    outcome = 'Failed'
-                    installResult = $null
-                    reason = $reason
-                    rebootRequired = $false
-                    agentCompletionConfirmed = $false
-                    agentCompletionReason = 'No agent cycle was started.'
-                    errors = @($reason)
-                }
+                Result = New-ApplyResultRecord -VMName ([string]$record.vmName) -Outcome 'Failed' -Reason $reason `
+                    -RoleFlags (Get-ObjectPropertyValue -InputObject $record -Path @('roleFlags')) `
+                    -RebootRequired $false -AgentCompletionConfirmed $false -AgentCompletionReason 'No agent cycle was started.' `
+                    -Errors @($reason)
             }
             continue
         }
@@ -1015,19 +1002,15 @@ function Invoke-ApplyPhase {
             $resultKind = [string](Get-ObjectPropertyValue -InputObject $fleetResult -Path @('ResultKind'))
 
             if ($hasError -and $null -eq $payload) {
+                # No payload at all, so nothing can be read from the guest - including whether a
+                # cycle directory was created. An invented cleanup verdict here would be a claim
+                # about a guest this run never heard back from.
                 $resultEntries += [pscustomobject]@{
                     Sequence = $fleetResult.Sequence
-                    Result = [pscustomobject]@{
-                        vmName = $fleetResult.VMName
-                        action = 'Install'
-                        outcome = 'Failed'
-                        installResult = $null
-                        reason = $fleetResult.Error
-                        rebootRequired = $false
-                        agentCompletionConfirmed = $false
-                        agentCompletionReason = 'Agent cycle did not return a completion record.'
-                        errors = @($fleetResult.Error)
-                    }
+                    Result = New-ApplyResultRecord -VMName ([string]$fleetResult.VMName) -Outcome 'Failed' -Reason ([string]$fleetResult.Error) `
+                        -RebootRequired $false -AgentCompletionConfirmed $false -AgentCompletionReason 'Agent cycle did not return a completion record.' `
+                        -Errors @([string]$fleetResult.Error) `
+                        -GuestRunConflict ([bool](Get-ObjectPropertyValue -InputObject $fleetResult -Path @('GuestRunConflict') -DefaultValue $false))
                 }
                 continue
             }
@@ -1892,6 +1875,11 @@ try {
     # resolved by a later discovery, and the run may then finish successfully with the warning
     # retained in the artifacts.
     $outstandingVerificationByVm = @{}
+    # Proven writable before the first agent start: a run that cannot be audited says so up front.
+    $runEventLog = New-RunEventLogState -Path (Join-Path $runOutputDirectory 'events.jsonl')
+    if (-not (Initialize-RunEventLog -State $runEventLog)) {
+        Write-Warning ([string]$runEventLog.AuditError)
+    }
 
     while ($true) {
         $roundNumber++
@@ -1901,8 +1889,16 @@ try {
         New-Item -ItemType Directory -Force -Path $roundOutputDirectory | Out-Null
 
         Write-Step -Message ('Patch round {0} over {1} VM(s).' -f $roundNumber, @($roundTargetVMNames).Count)
+        Write-RunEvent -State $runEventLog -Event 'RoundStarted' -Phase 'Round' -Round $roundNumber -Detail ('{0} target(s)' -f @($roundTargetVMNames).Count)
+        Write-RunEvent -State $runEventLog -Event 'PhaseStarted' -Phase 'Discovery' -Round $roundNumber
         $discoveryRecords = Invoke-DiscoveryPhase -TargetVMNames $roundTargetVMNames -VIServerScope $viServerScope -Managers $managers -GuestCredentialMap $guestCredentialMap -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -WorkspaceScriptPath $workspaceScriptPath -RunGuardScriptPath $runGuardScriptPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -TimeoutSeconds ($DiscoveryTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -MaxInFlight $ThrottleLimit -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive
         $failedDiscoveryRecords = @($discoveryRecords | Where-Object { @($_.errors).Count -gt 0 })
+        Write-RunEvent -State $runEventLog -Event 'PhaseFinished' -Phase 'Discovery' -Round $roundNumber -Detail ('{0} record(s), {1} failed' -f @($discoveryRecords).Count, $failedDiscoveryRecords.Count)
+        foreach ($discoveryRecord in @($discoveryRecords)) {
+            Write-RunEvent -State $runEventLog -Event 'VMDiscovered' -Phase 'Discovery' -Round $roundNumber `
+                -VMName ([string](Get-RuntimePropertyValue -InputObject $discoveryRecord -Name 'vmName')) `
+                -Outcome ([string](Get-RuntimePropertyValue -InputObject $discoveryRecord -Name 'outcome'))
+        }
 
         # A fresh discovery is the only thing that can settle an approved update WUA stopped
         # offering: if the exact identity key is gone, that update is no longer applicable.
@@ -2039,6 +2035,9 @@ try {
         }
 
         Write-Step -Message ('Selected update group key(s): {0}' -f @($selectedKeysForPlan).Count)
+        Write-RunEvent -State $runEventLog -Event 'SelectionResolved' -Phase 'Selection' -Round $roundNumber `
+            -OperatorDecision $(if ($operatorReviewedGroups) { 'Interactive' } else { 'NonInteractive' }) `
+            -Detail ('{0} group key(s) selected' -f @($selectedKeysForPlan).Count)
 
         $patchPlanRecords = @(New-PatchPlanRecords -DiscoveryRecords $discoveryRecords -SelectedUpdateKeys $selectedKeysForPlan)
         $patchPlanRecords = @(Update-PatchPlanWithDiscoveryFailures -PatchPlanRecords $patchPlanRecords -DiscoveryRecords $discoveryRecords)
@@ -2067,6 +2066,25 @@ try {
         # from the final state when the next round is selected from apply results.
         $applyResults = @(Get-RuntimePropertyValue -InputObject $applyOutcome -Name 'ApplyResults' -DefaultValue @())
         Add-OutstandingVerificationKeys -Outstanding $outstandingVerificationByVm -ApplyResults $applyResults
+        foreach ($applyEventResult in $applyResults) {
+            $applyEventVmName = [string](Get-RuntimePropertyValue -InputObject $applyEventResult -Name 'vmName')
+            Write-RunEvent -State $runEventLog -Event 'VMApplied' -Phase 'Apply' -Round $roundNumber -VMName $applyEventVmName `
+                -Outcome ([string](Get-RuntimePropertyValue -InputObject $applyEventResult -Name 'outcome'))
+            if ([bool](Get-RuntimePropertyValue -InputObject $applyEventResult -Name 'guestRunConflict' -DefaultValue $false)) {
+                Write-RunEvent -State $runEventLog -Event 'GuestRunConflict' -Phase 'Apply' -Round $roundNumber -VMName $applyEventVmName -ErrorKind 'GuestRunConflict'
+            }
+            if ([bool](Get-RuntimePropertyValue -InputObject $applyEventResult -Name 'selectionDrift' -DefaultValue $false)) {
+                Write-RunEvent -State $runEventLog -Event 'SelectionDrift' -Phase 'Apply' -Round $roundNumber -VMName $applyEventVmName `
+                    -Detail ((@(Get-RuntimePropertyValue -InputObject $applyEventResult -Name 'missingUpdateKeys' -DefaultValue @()) -join ', '))
+            }
+        }
+        foreach ($rebootEventAction in @(Get-RuntimePropertyValue -InputObject $applyOutcome -Name 'RebootActions' -DefaultValue @())) {
+            Write-RunEvent -State $runEventLog -Event 'VMRebootAction' -Phase 'Reboot' -Round $roundNumber `
+                -VMName ([string](Get-RuntimePropertyValue -InputObject $rebootEventAction -Name 'vmName')) `
+                -Outcome ([string](Get-RuntimePropertyValue -InputObject $rebootEventAction -Name 'action')) `
+                -OperatorDecision ([string](Get-RuntimePropertyValue -InputObject $rebootEventAction -Name 'operatorDecision')) `
+                -Detail ([string](Get-RuntimePropertyValue -InputObject $rebootEventAction -Name 'validationStatus'))
+        }
         foreach ($applyResult in $applyResults) {
             if ((Get-RuntimePropertyValue -InputObject $applyResult -Name 'action') -ne 'Install' -or
                 [bool](Get-RuntimePropertyValue -InputObject $applyResult -Name 'agentCompletionConfirmed' -DefaultValue $false)) {
@@ -2120,7 +2138,11 @@ try {
     }
 
     if (-not ($SearchOnly -or $PlanOnly)) {
-        Write-PatchRunSummary -RunOutputDirectory $runOutputDirectory -RoundSummaries $roundSummaries -FinalStateMap $finalStateMap
+        foreach ($finalVmName in @($finalStateMap.Keys | Sort-Object)) {
+            Write-RunEvent -State $runEventLog -Event 'VMFinalState' -Phase 'Finalization' -VMName ([string]$finalVmName) `
+                -Outcome ([string]$finalStateMap[$finalVmName].state)
+        }
+        Write-PatchRunSummary -RunOutputDirectory $runOutputDirectory -RoundSummaries $roundSummaries -FinalStateMap $finalStateMap -OutstandingVerificationByVm $outstandingVerificationByVm -AuditError ([string]$runEventLog.AuditError)
         # A VM whose discovery failed is already 'Failed' in the state map, so the all-green
         # test covers discovery failures too - no separate check needed.
         $scriptExitCode = 0
@@ -2135,6 +2157,16 @@ try {
             Write-Warning ('Approved update(s) were not installed and have not been verified as inapplicable: {0}' -f (Get-OutstandingVerificationText -Outstanding $outstandingVerificationByVm))
             $scriptExitCode = 1
         }
+
+        # A run nobody can audit is not a successful run, but the failure is recorded only after
+        # the results have been collected: abandoning guests mid-install to protect a log file
+        # would be the wrong trade.
+        if (-not [string]::IsNullOrWhiteSpace([string]$runEventLog.AuditError)) {
+            Write-Warning ([string]$runEventLog.AuditError)
+            $scriptExitCode = 1
+        }
+
+        Write-RunEvent -State $runEventLog -Event 'RunFinished' -Phase 'Finalization' -Outcome ([string]$scriptExitCode)
     }
 }
 catch {

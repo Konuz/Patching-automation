@@ -820,6 +820,148 @@ Assert-Equal -Actual $rebootStateMap['VM-skipped'].state -Expected 'PendingReboo
 Assert-Equal -Actual $rebootStateMap['VM-reboot-only'].state -Expected 'Green' -Message 'a confirmed restart is not marked pending; the next discovery decides'
 Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $rebootStateMap) -Expected $false -Message 'a VM pending a reboot cannot produce exit 0'
 
+# --- one shape for every apply branch, and one audit log (task 11) ------------------------------
+# Compared after a JSON round trip, because that is where a missing property actually bites: under
+# StrictMode, reading a field one branch happened not to set is a terminating error for whoever
+# reads apply-results.json back.
+
+& {
+    $requiredApplyFields = @(
+        'vmName', 'action', 'outcome', 'installResult', 'reason', 'roleFlags', 'rebootRequired',
+        'agentCompletionConfirmed', 'agentCompletionReason', 'cleanupStatus', 'cleanupReason',
+        'errors', 'guestRunConflict', 'workspaceSealVerified', 'missingUpdateKeys', 'selectionDrift',
+        'requiresVerification'
+    )
+
+    $applyVariants = @(
+        [pscustomobject]@{ Name = 'an empty selection'; Record = (New-ApplyResultRecord -VMName 'VM-empty' -Action 'NoSelectedUpdates' -Outcome 'NoSelectedUpdates' -Reason 'nothing selected') },
+        [pscustomobject]@{ Name = 'a start error'; Record = (New-ApplyResultRecord -VMName 'VM-start' -Outcome 'Failed' -Reason 'start failed' -Errors @('start failed')) },
+        [pscustomobject]@{ Name = 'no payload at all'; Record = (New-ApplyResultRecord -VMName 'VM-nopayload' -Outcome 'Failed' -AgentCompletionConfirmed $false -AgentCompletionReason 'no completion record') },
+        [pscustomobject]@{ Name = 'a timeout'; Record = (New-ApplyResultRecord -VMName 'VM-timeout' -Outcome 'Failed' -Reason 'timed out' -CleanupStatus 'Retained' -CleanupReason 'process result lost') },
+        [pscustomobject]@{ Name = 'a guest run conflict'; Record = (New-ApplyResultRecord -VMName 'VM-conflict' -Outcome 'Failed' -GuestRunConflict $true) },
+        [pscustomobject]@{ Name = 'selection drift'; Record = (New-ApplyResultRecord -VMName 'VM-drift' -Outcome 'InstallSucceeded' -MissingUpdateKeys @('aaaa|1') -SelectionDrift $true -RequiresVerification $true) },
+        [pscustomobject]@{ Name = 'a refused workspace seal'; Record = (New-ApplyResultRecord -VMName 'VM-seal' -Outcome 'Failed' -WorkspaceSealVerified $false -Errors @('seal refused')) },
+        [pscustomobject]@{ Name = 'a success'; Record = (New-ApplyResultRecord -VMName 'VM-ok' -Outcome 'InstallSucceeded' -AgentCompletionConfirmed $true -RebootRequired $true) },
+        [pscustomobject]@{ Name = 'a skip'; Record = (New-ApplyResultRecord -VMName 'VM-skip' -Action 'Skipped' -Outcome 'Skipped' -Reason 'excluded' -RoleFlags ([pscustomobject]@{ failoverCluster = $true })) }
+    )
+
+    foreach ($variant in $applyVariants) {
+        foreach ($fieldName in $requiredApplyFields) {
+            Assert-Equal -Actual ($null -ne $variant.Record.PSObject.Properties[$fieldName]) -Expected $true -Message ('field ' + $fieldName + ' is present for ' + $variant.Name)
+        }
+    }
+
+    # 0, 1 and 2+ records all serialise as an array at the root, and every field survives.
+    $applyDir = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-applyshape-' + [guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Path $applyDir)
+    try {
+        foreach ($count in @(0, 1, 2, 9)) {
+            $subset = @($applyVariants | Select-Object -First $count | ForEach-Object { $_.Record })
+            $shapePath = Join-Path $applyDir ('apply-{0}.json' -f $count)
+            ConvertTo-Json -InputObject @($subset) -Depth 12 | Set-Content -LiteralPath $shapePath -Encoding UTF8
+            $raw = Get-Content -LiteralPath $shapePath -Raw
+            # Assign before wrapping: ConvertFrom-Json emits an array as a single pipeline object
+            # on 5.1, so @($raw | ConvertFrom-Json).Count would count the array, not its elements.
+            $roundTripped = $raw | ConvertFrom-Json
+            Assert-Equal -Actual @($roundTripped).Count -Expected $count -Message ('apply-results.json holds ' + $count + ' record(s) as an array at the root')
+            foreach ($record in @($roundTripped)) {
+                foreach ($fieldName in $requiredApplyFields) {
+                    Assert-Equal -Actual ($null -ne $record.PSObject.Properties[$fieldName]) -Expected $true -Message ('field ' + $fieldName + ' survives the JSON round trip')
+                }
+            }
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $applyDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# The audit log: an allow-list of fields, a disk failure that does not stop the phase, and a
+# marked secret that must not appear in the file whatever route it was offered by.
+& {
+    $eventDir = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-events-' + [guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Path $eventDir)
+    try {
+        $eventPath = Join-Path $eventDir 'events.jsonl'
+        $eventState = New-RunEventLogState -Path $eventPath
+        Assert-Equal -Actual (Initialize-RunEventLog -State $eventState) -Expected $true -Message 'the event log is proven writable before any agent starts'
+        Assert-Equal -Actual $eventState.Enabled -Expected $true -Message 'a writable event log is enabled'
+
+        $canary = 'SECRET-CANARY-b3f1'
+        $canaryCredential = New-Object System.Management.Automation.PSCredential('CORP\svc', (ConvertTo-SecureString $canary -AsPlainText -Force))
+        Write-RunEvent -State $eventState -Event 'RoundStarted' -Phase 'Round' -Round 1 -Detail '2 target(s)'
+        Write-RunEvent -State $eventState -Event 'VMApplied' -Phase 'Apply' -Round 1 -VMName 'VM01' -RunId 'abc123' -Outcome 'InstallSucceeded'
+        Write-RunEvent -State $eventState -Event 'SelectionDrift' -Phase 'Apply' -Round 1 -VMName 'VM02' -Detail 'aaaa|1'
+        Write-RunEvent -State $eventState -Event 'VMRebootAction' -Phase 'Reboot' -Round 1 -VMName 'VM01' -Outcome 'Initiated' -OperatorDecision 'REBOOT' -Detail 'Confirmed'
+        Write-RunEvent -State $eventState -Event 'GuestRunConflict' -Phase 'Apply' -Round 1 -VMName 'VM03' -ErrorKind 'GuestRunConflict'
+        Write-RunEvent -State $eventState -Event 'RunFinished' -Phase 'Finalization' -Outcome '1'
+
+        $eventLines = @(Get-Content -LiteralPath $eventPath | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        Assert-Equal -Actual $eventLines.Count -Expected 6 -Message 'every event is one line of JSON'
+        foreach ($line in $eventLines) {
+            $parsed = $line | ConvertFrom-Json
+            foreach ($property in @($parsed.PSObject.Properties)) {
+                Assert-Equal -Actual ($property.Name -in @('timestampUtc', 'event', 'phase', 'round', 'vmName', 'runId', 'outcome', 'errorKind', 'operatorDecision', 'detail')) -Expected $true -Message ('the event log writes only allowed fields, not ' + $property.Name)
+            }
+        }
+        Assert-Equal -Actual (@($eventLines | Where-Object { $_ -like '*RoundStarted*' }).Count) -Expected 1 -Message 'a round start is recorded'
+        Assert-Equal -Actual (@($eventLines | Where-Object { $_ -like '*GuestRunConflict*' }).Count) -Expected 1 -Message 'a guest run conflict is recorded'
+        Assert-Equal -Actual (@($eventLines | Where-Object { $_ -like '*REBOOT*' }).Count) -Expected 1 -Message 'the operator reboot decision is recorded'
+
+        # A credential offered as a detail is not serialised: the parameter is typed [string], so
+        # what lands in the file is the object's type name, never its password.
+        Write-RunEvent -State $eventState -Event 'VMApplied' -Phase 'Apply' -Round 1 -VMName 'VM04' -Detail $canaryCredential
+        Write-RunEvent -State $eventState -Event 'VMApplied' -Phase 'Apply' -Round 1 -VMName 'VM05' -Detail ([string]$canaryCredential.Password)
+        $fileText = Get-Content -LiteralPath $eventPath -Raw
+        Assert-NotContains -Text $fileText -Needle $canary -Message 'a marked secret never reaches the event log'
+        Assert-NotContains -Text $fileText -Needle 'guestFile?id=' -Message 'no GuestOps transfer ticket reaches the event log'
+
+        # A field nobody allowed is refused outright rather than written.
+        $rejected = $false
+        try { Write-RunEvent -State $eventState -Event 'Bogus' -Phase 'Apply' -Detail 'ok' -Round 1 -VMName 'VM06' -ErrorKind 'x' -OperatorDecision 'y' -Outcome 'z' -RunId 'r' } catch { $rejected = $true }
+        Assert-Equal -Actual $rejected -Expected $false -Message 'the allowed field set is accepted as it stands'
+    }
+    finally {
+        Remove-Item -LiteralPath $eventDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # A log that cannot be created, and one that breaks mid-run. Neither may stop the phase; both
+    # have to be remembered so the run can end 1 after the results are safely collected.
+    $unwritableState = New-RunEventLogState -Path (Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-missing-' + [guid]::NewGuid().ToString('N')))
+    $unwritableState.Enabled = $true
+    $unwritableState.Path = [System.IO.Path]::GetTempPath()
+    $brokeMidRun = $false
+    try { Write-RunEvent -State $unwritableState -Event 'VMApplied' -Phase 'Apply' -VMName 'VM07' 3>$null } catch { $brokeMidRun = $true }
+    Assert-Equal -Actual $brokeMidRun -Expected $false -Message 'a write failure mid-run does not throw and does not stop the phase'
+    Assert-Equal -Actual ($null -ne $unwritableState.AuditError) -Expected $true -Message 'a write failure is remembered so the run can end 1'
+    Assert-Equal -Actual $unwritableState.Enabled -Expected $false -Message 'a broken log stops being written to rather than failing on every event'
+}
+
+# The "To verify" section is its own section: an operator reading exit 1 with no failing install
+# would otherwise go looking for a fault that is not there.
+& {
+    $summaryDir = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-verifysummary-' + [guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Path $summaryDir)
+    try {
+        $verifyMap = @{ 'VM-drift' = @{ 'aaaa-1111|1' = $true; 'bbbb-2222|3' = $true } }
+        Write-PatchRunSummary -RunOutputDirectory $summaryDir -RoundSummaries @() -FinalStateMap @{ 'VM-drift' = [pscustomobject]@{ vmName = 'VM-drift'; state = 'Green'; reason = 'No selectable updates remain.' } } -OutstandingVerificationByVm $verifyMap -AuditError 'synthetic audit failure'
+        $summaryText = Get-Content -LiteralPath (Join-Path $summaryDir 'summary.md') -Raw
+        Assert-Contains -Text $summaryText -Needle '## To verify' -Message 'the summary has its own To verify section'
+        Assert-Contains -Text $summaryText -Needle 'aaaa-1111|1' -Message 'the section names the keys that were not installed'
+        Assert-Contains -Text $summaryText -Needle 'Nothing failed to install' -Message 'the section says this is not an install failure'
+        Assert-Contains -Text $summaryText -Needle 'synthetic audit failure' -Message 'an audit failure is reported in the summary'
+        Assert-Contains -Text $summaryText -Needle 'not because a VM failed' -Message 'the audit failure says why the run is reported as failed'
+
+        Write-PatchRunSummary -RunOutputDirectory $summaryDir -RoundSummaries @() -FinalStateMap @{}
+        $cleanSummary = Get-Content -LiteralPath (Join-Path $summaryDir 'summary.md') -Raw
+        Assert-Contains -Text $cleanSummary -Needle 'nothing outstanding' -Message 'a run with nothing to verify says so'
+        Assert-NotContains -Text $cleanSummary -Needle '## Audit log' -Message 'a run with a working audit log has no audit section'
+    }
+    finally {
+        Remove-Item -LiteralPath $summaryDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $baseTime = [datetime]::Parse('2026-01-01T00:00:00Z').ToUniversalTime()
 $newTime = [datetime]::Parse('2026-01-02T00:00:00Z').ToUniversalTime()
 

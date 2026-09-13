@@ -395,6 +395,27 @@ try {
     Assert-Equal -Actual ($okState.UploadedPaths.Count -gt 0) -Expected $true -Message 'harness: a secured workspace still uploads the agent'
     Assert-Equal -Actual ($okHandle.GuestCycleDirectory -like ($guestWorkingDirectory + '*')) -Expected $true -Message 'harness: the secured path is the cycle directory'
 
+    # The seal only works if the token the bootstrap wrote is the token the agent is asked to
+    # verify. Nothing else couples the two calls, and if they diverge the agent refuses every
+    # apply in the field while every offline test still passes.
+    $bootstrapArguments = [string]@($okState.WorkspaceSpecs)[0].Arguments
+    $encodedIndex = $bootstrapArguments.IndexOf('-EncodedCommand')
+    $encodedBootstrap = ($bootstrapArguments.Substring($encodedIndex + '-EncodedCommand'.Length)).Trim().Trim('"')
+    $decodedBootstrap = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String($encodedBootstrap))
+    $sealBase64Match = [regex]::Match($decodedBootstrap, "SealTokenBase64 = '([^']*)'")
+    Assert-Equal -Actual $sealBase64Match.Success -Expected $true -Message 'harness: the bootstrap carries a seal token'
+    $bootstrapSealToken = ''
+    if ($sealBase64Match.Success -and -not [string]::IsNullOrWhiteSpace($sealBase64Match.Groups[1].Value)) {
+        $bootstrapSealToken = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($sealBase64Match.Groups[1].Value))
+    }
+    Assert-Equal -Actual ($bootstrapSealToken.Length -gt 0) -Expected $true -Message 'harness: the bootstrap seals the directory with a non-empty token'
+
+    $agentSealMatch = [regex]::Match([string]$okState.AgentSpec.Arguments, '-WorkspaceSealToken "([^"]+)"')
+    Assert-Equal -Actual $agentSealMatch.Success -Expected $true -Message 'harness: the agent is asked to verify the seal'
+    if ($agentSealMatch.Success) {
+        Assert-Equal -Actual $agentSealMatch.Groups[1].Value -Expected $bootstrapSealToken -Message 'harness: the agent verifies the same seal the bootstrap wrote'
+    }
+
     # The guest reports "an untrusted account may modify this directory" (exit code 12).
     $script:guestState = @{}
     New-FakeGuest -VMName 'VM-workspace-refused'

@@ -464,6 +464,14 @@ $script:GuestWorkspaceExitCodeReasons = @{
     15 = 'its security descriptor could not be read'
     16 = 'it could not be created'
     17 = 'the guest reported an unexpected error'
+    18 = 'the workspace seal is missing or does not match this run, so the directory is not the one that was secured'
+}
+
+function New-GuestWorkspaceSealToken {
+    # Identity, not a secret: it says "this is the directory the bootstrap created". Forging it in
+    # a directory that also passes the owner and access-rule checks needs administrator rights,
+    # which is the authority half of the same question.
+    return [guid]::NewGuid().ToString('N')
 }
 
 function Get-GuestWorkspaceFailureReason {
@@ -494,7 +502,9 @@ function New-GuestWorkspaceBootstrapCommand {
         [ValidateSet('Initialize', 'Assert')][string]$Mode = 'Initialize',
         # Optional: one file inside that directory whose owner and rules must also hold. A safe
         # root does not vouch for a file that was already sitting in it.
-        [string]$FilePath
+        [string]$FilePath,
+        # Seals the directory on Initialize, and requires that exact seal on Assert.
+        [string]$SealToken
     )
 
     if ([string]::IsNullOrWhiteSpace($WorkspaceScriptText)) {
@@ -509,8 +519,12 @@ function New-GuestWorkspaceBootstrapCommand {
     if (-not [string]::IsNullOrWhiteSpace($FilePath)) {
         $fileBase64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$FilePath))
     }
+    $sealBase64 = ''
+    if (-not [string]::IsNullOrWhiteSpace($SealToken)) {
+        $sealBase64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$SealToken))
+    }
     $preamble = @(
-        "`$GuestWorkspaceRequest = [pscustomobject]@{ Mode = '$Mode'; PathBase64 = '$pathBase64'; FileBase64 = '$fileBase64' }"
+        "`$GuestWorkspaceRequest = [pscustomobject]@{ Mode = '$Mode'; PathBase64 = '$pathBase64'; FileBase64 = '$fileBase64'; SealTokenBase64 = '$sealBase64' }"
     ) -join [Environment]::NewLine
 
     $commandText = $preamble + [Environment]::NewLine + $WorkspaceScriptText
@@ -553,6 +567,7 @@ function Assert-GuestWorkspaceReady {
         [string]$WorkspaceScriptPath,
         [ValidateSet('Initialize', 'Assert')][string]$Mode = 'Initialize',
         [string]$FilePath,
+        [string]$SealToken,
         [int]$TimeoutSeconds = 120,
         [int]$PollSeconds = 5
     )
@@ -560,7 +575,7 @@ function Assert-GuestWorkspaceReady {
     # Executed straight from the trusted local copy through -EncodedCommand. Uploading the
     # guard into the directory it is supposed to be guarding would mean writing a file into an
     # unverified location and then trusting what came back from it.
-    $encodedCommand = New-GuestWorkspaceBootstrapCommand -WorkspaceScriptText (Get-GuestWorkspaceScriptText -WorkspaceScriptPath $WorkspaceScriptPath) -Path $Path -Mode $Mode -FilePath $FilePath
+    $encodedCommand = New-GuestWorkspaceBootstrapCommand -WorkspaceScriptText (Get-GuestWorkspaceScriptText -WorkspaceScriptPath $WorkspaceScriptPath) -Path $Path -Mode $Mode -FilePath $FilePath -SealToken $SealToken
     $processId = Start-GuestWorkspaceBootstrap -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -EncodedCommand $encodedCommand
     $result = Wait-GuestProcess -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -ProcessId $processId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
 
@@ -717,6 +732,7 @@ function New-GuestAgentArguments {
         [string[]]$SelectedUpdateKeys = @(),
         [string]$SelectionPath,
         [string]$RunId,
+        [string]$WorkspaceSealToken,
         [switch]$SearchOnly
     )
 
@@ -744,6 +760,11 @@ function New-GuestAgentArguments {
     if (-not [string]::IsNullOrWhiteSpace($SelectionPath)) {
         $arguments += '-SelectionPath'
         $arguments += ('"{0}"' -f $SelectionPath)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($WorkspaceSealToken)) {
+        $arguments += '-WorkspaceSealToken'
+        $arguments += ('"{0}"' -f $WorkspaceSealToken)
     }
 
     if (@($SelectedUpdateKeys).Count -gt 0) {
@@ -852,12 +873,13 @@ function Start-GuestAgent {
         [string[]]$SelectedUpdateKeys = @(),
         [string]$SelectionPath,
         [string]$RunId,
+        [string]$WorkspaceSealToken,
         [switch]$SearchOnly
     )
 
     $programSpec = New-Object VMware.Vim.GuestProgramSpec
     $programSpec.ProgramPath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
-    $programSpec.Arguments = New-GuestAgentArguments -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -RunId $RunId -SearchOnly:$SearchOnly
+    $programSpec.Arguments = New-GuestAgentArguments -GuestAgentPath $GuestAgentPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -RunId $RunId -WorkspaceSealToken $WorkspaceSealToken -SearchOnly:$SearchOnly
     $programSpec.WorkingDirectory = $GuestWorkingDirectory
 
     return $ProcessManager.StartProgramInGuest($VMView.MoRef, $GuestAuth, $programSpec)
@@ -1131,7 +1153,11 @@ function Start-VMAgentCycle {
     # including a directory that was already there. This replaces the plain mkdir: an ordinary
     # user who can write here could swap Run-LocalPatch.ps1 between the upload and the start and
     # have it run under the patching account. A failure throws before the first transfer.
-    Assert-GuestWorkspaceReady -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -VMName $VMName -Path $guestCycleDirectory -WorkspaceScriptPath $WorkspaceScriptPath -Mode 'Initialize' -TimeoutSeconds 120 -PollSeconds 5
+    # Sealed with a token this cycle generated. Everything that runs in the guest afterwards
+    # re-checks the seal, so a directory swapped or re-permissioned between this check and the
+    # agent start is caught instead of being trusted on the strength of one check.
+    $workspaceSealToken = New-GuestWorkspaceSealToken
+    Assert-GuestWorkspaceReady -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -VMName $VMName -Path $guestCycleDirectory -WorkspaceScriptPath $WorkspaceScriptPath -Mode 'Initialize' -SealToken $workspaceSealToken -TimeoutSeconds 120 -PollSeconds 5
 
     # Every transfer carries a budget. The fleet puts no job wrapper around these calls, so
     # nothing else bounds a curl hanging against an unresponsive ESXi data plane.
@@ -1149,7 +1175,11 @@ function Start-VMAgentCycle {
         Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $LocalSelectionPath -GuestPath $SelectionPath -TimeoutSeconds $TransferTimeoutSeconds
     }
 
-    $agentProcessId = Start-GuestAgent -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -GuestAgentPath $guestAgentPath -GuestWorkingDirectory $guestCycleDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -RunId $runId -SearchOnly:$SearchOnly
+    # The agent re-checks the seal before it creates the WUA session. The uploads above are the
+    # gap this closes: three GuestOps calls stand between the bootstrap's check and the first
+    # line the agent runs, and the agent refuses to read selection.json or touch WUA in a
+    # directory that is no longer the one this cycle secured.
+    $agentProcessId = Start-GuestAgent -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -GuestAgentPath $guestAgentPath -GuestWorkingDirectory $guestCycleDirectory -MaxUpdates $MaxUpdates -SelectedUpdateKeys $SelectedUpdateKeys -SelectionPath $SelectionPath -RunId $runId -WorkspaceSealToken $workspaceSealToken -SearchOnly:$SearchOnly
 
     $mode = if ($SearchOnly) { 'SearchOnly' } else { 'Apply' }
     return New-VMAgentCycleHandle -VMName $VMName -RunId $runId -Mode $mode -Managers $Managers -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -ProcessId $agentProcessId -GuestStatusPath $guestStatusPath -GuestLogPath $guestLogPath -LocalStatusPath $localStatusPath -LocalLogPath $localLogPath -GuestWorkingDirectory $GuestWorkingDirectory -GuestCycleDirectory $guestCycleDirectory -TransferTimeoutSeconds $TransferTimeoutSeconds
@@ -1636,12 +1666,23 @@ function Invoke-VMGuestReboot {
 function New-GuestBootTimeQueryArguments {
     param(
         [string]$BootTimeHelperPath,
-        [string]$OutputPath
+        [string]$OutputPath,
+        [string]$WorkspacePath = '',
+        [string]$WorkspaceSealToken = ''
     )
 
     $safeHelperPath = ([string]$BootTimeHelperPath) -replace '"', '`"'
     $safeOutputPath = ([string]$OutputPath) -replace '"', '`"'
-    return ('-NoProfile -ExecutionPolicy Bypass -File "{0}" -OutputPath "{1}"' -f $safeHelperPath, $safeOutputPath)
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -OutputPath "{1}"' -f $safeHelperPath, $safeOutputPath
+    if (-not [string]::IsNullOrWhiteSpace($WorkspaceSealToken)) {
+        # The helper re-checks the seal before writing anything, so this read cannot come from a
+        # directory that was swapped between the bootstrap and the query.
+        $safeWorkspacePath = ([string]$WorkspacePath) -replace '"', '`"'
+        $safeSealToken = ([string]$WorkspaceSealToken) -replace '"', '`"'
+        $arguments = '{0} -WorkspacePath "{1}" -WorkspaceSealToken "{2}"' -f $arguments, $safeWorkspacePath, $safeSealToken
+    }
+
+    return $arguments
 }
 
 function Start-GuestBootTimeQuery {
@@ -1650,12 +1691,14 @@ function Start-GuestBootTimeQuery {
         $VMView,
         $GuestAuth,
         [string]$BootTimeHelperPath,
-        [string]$OutputPath
+        [string]$OutputPath,
+        [string]$WorkspacePath = '',
+        [string]$WorkspaceSealToken = ''
     )
 
     $programSpec = New-Object VMware.Vim.GuestProgramSpec
     $programSpec.ProgramPath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
-    $programSpec.Arguments = New-GuestBootTimeQueryArguments -BootTimeHelperPath $BootTimeHelperPath -OutputPath $OutputPath
+    $programSpec.Arguments = New-GuestBootTimeQueryArguments -BootTimeHelperPath $BootTimeHelperPath -OutputPath $OutputPath -WorkspacePath $WorkspacePath -WorkspaceSealToken $WorkspaceSealToken
     $programSpec.WorkingDirectory = Split-Path -Parent $OutputPath
 
     return $ProcessManager.StartProgramInGuest($VMView.MoRef, $GuestAuth, $programSpec)
@@ -1723,13 +1766,17 @@ function Invoke-VMGuestBootTimeRead {
         # When the upload is skipped the helper already in the guest is the one about to run,
         # so it is checked too. A fresh upload replaces whatever is there, so it is not.
         $workspaceFilePath = if ($SkipHelperUpload) { $guestHelperPath } else { '' }
-        Assert-GuestWorkspaceReady -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -VMName $VMName -Path $GuestWorkingDirectory -WorkspaceScriptPath $WorkspaceScriptPath -Mode 'Initialize' -FilePath $workspaceFilePath -TimeoutSeconds $workspaceTimeoutSeconds -PollSeconds $shortOperationPollSeconds
+        $bootTimeSealToken = New-GuestWorkspaceSealToken
+        Assert-GuestWorkspaceReady -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -VMName $VMName -Path $GuestWorkingDirectory -WorkspaceScriptPath $WorkspaceScriptPath -Mode 'Initialize' -FilePath $workspaceFilePath -SealToken $bootTimeSealToken -TimeoutSeconds $workspaceTimeoutSeconds -PollSeconds $shortOperationPollSeconds
 
         if (-not $SkipHelperUpload) {
             Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $BootTimeHelperPath -GuestPath $guestHelperPath -TimeoutSeconds (& $getRemainingSeconds)
+            # The helper dot-sources this to check the seal, so it has to sit beside it. The
+            # directory was verified above, so writing into it is safe.
+            Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $WorkspaceScriptPath -GuestPath (Join-Path $GuestWorkingDirectory 'GuestWorkspace.ps1') -TimeoutSeconds (& $getRemainingSeconds)
         }
 
-        $queryProcessId = Start-GuestBootTimeQuery -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -BootTimeHelperPath $guestHelperPath -OutputPath $guestOutputPath
+        $queryProcessId = Start-GuestBootTimeQuery -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -BootTimeHelperPath $guestHelperPath -OutputPath $guestOutputPath -WorkspacePath $GuestWorkingDirectory -WorkspaceSealToken $bootTimeSealToken
         $queryTimeoutSeconds = & $getRemainingSeconds
         $queryResult = Wait-GuestProcess -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -ProcessId $queryProcessId -TimeoutSeconds $queryTimeoutSeconds -PollSeconds $shortOperationPollSeconds
         if (-not $queryResult.Completed) {

@@ -198,6 +198,10 @@ function Invoke-AgentFixture {
         $SearchUpdateIdentities = $null,
         $SelectedKeys = $null,
         [string]$EulaFailureKey = '',
+        # The workspace seal, as the agent sees it: no token supplied at all (a legacy or manual
+        # invocation), the directory still carrying this cycle's seal, or a seal the guest
+        # refused because the directory is no longer the one that was secured.
+        [ValidateSet('None', 'Ok', 'Refused')][string]$WorkspaceSeal = 'Ok',
         [bool]$ClusterMembershipUnknown = $false)
     # Only external effects are mocked: local probes, artifact I/O, and WUA COM.
     function Write-AgentLog { param($Message) }
@@ -218,6 +222,16 @@ function Invoke-AgentFixture {
         return $true
     }
     function Exit-GuestRunGuard { param($Guard) $script:guardReleases++ }
+    # Stands in for the real check, which needs a Windows security descriptor. What is under test
+    # here is what the agent does with each verdict, not how the verdict is reached -
+    # tests/Invoke-GuestWorkspaceChecks.ps1 exercises the seal itself.
+    function Assert-GuestWorkspaceSeal {
+        param([string]$Path, [string]$Token)
+        if ($WorkspaceSeal -eq 'Refused') {
+            return [pscustomobject]@{ Status = 'SealRefused'; Reason = 'synthetic: the directory was resealed'; Path = $Path }
+        }
+        return [pscustomobject]@{ Status = 'Ok'; Reason = $null; Path = $Path }
+    }
     function Test-IsElevated { $true }
     function Get-ServiceSnapshot { @() }
     function Get-SystemDriveFreeGB { 100 }
@@ -290,6 +304,7 @@ function Invoke-AgentFixture {
         }
     }
     $RunId = 'fixture'; $WorkingDirectory = 'unused'; $SearchCriteria = 'IsInstalled=0'; $MaxUpdates = 1
+    $WorkspaceSealToken = if ($WorkspaceSeal -eq 'None') { '' } else { 'fixture-seal-token' }
     $SelectedUpdateKeys = @(); $SelectionPath = 'mock-selection.json'; $scriptExitCode = 1
     $guestRunGuard = $null
     . ([scriptblock]::Create($statusInit.Extent.Text))
@@ -448,6 +463,38 @@ $eulaFailure = Invoke-AgentFixture -SearchUpdateIdentities @($identityA1, $ident
 Assert-Equal (@($eulaFailure.InstallerKeys) -join ',') $keyA1 'a refused EULA drops only its own update'
 Assert-Equal (@($eulaFailure.Status.errors).Count -gt 0) $true 'a refused EULA is a real error, not drift'
 Assert-Equal ([bool]$eulaFailure.Status.selectionDrift) $false 'a refused EULA is not selection drift'
+
+# --- the workspace seal, as the agent enforces it ------------------------------------------------
+# The bootstrap verifies the directory and seals it; three GuestOps calls later this agent starts
+# in it. Re-reading the seal is what turns "it was safe when we checked" into "this is the same
+# directory we secured", so a refused seal must stop the run before any WUA work - and before the
+# run guard, so a directory this tool does not recognise leaves nothing on the guest to reconcile.
+
+$sealRefused = Invoke-AgentFixture -WorkspaceSeal 'Refused'
+Assert-Equal $sealRefused.DownloadCalled $false 'a refused workspace seal downloads nothing'
+Assert-Equal $sealRefused.InstallCalled $false 'a refused workspace seal installs nothing'
+Assert-Equal $sealRefused.ExitCode 1 'a refused workspace seal is an error'
+Assert-Equal $sealRefused.Status.outcome 'Failed' 'a refused workspace seal reports Failed'
+Assert-Equal ([bool]$sealRefused.Status.workspaceSealVerified) $false 'the guest records that the seal did not verify'
+Assert-Equal ([bool]$sealRefused.ApplyResult.workspaceSealVerified) $false 'the apply result carries the refused seal as a field'
+Assert-Equal (@($sealRefused.ApplyResult.errors) -join "`n" -like '*workspace seal*') $true 'the refused seal is named in the apply errors'
+Assert-Equal @($sealRefused.GuardCompletions).Count 0 'a refused seal never takes or completes the run guard'
+Assert-Equal $sealRefused.GuardReleases 0 'a refused seal never releases a guard it never took'
+Assert-Equal $sealRefused.State 'Failed' 'a VM whose seal was refused is never green'
+Assert-Equal (Test-IsApplyResultError -ApplyResult $sealRefused.ApplyResult) $true 'a refused seal keeps the run from succeeding'
+
+$sealOk = Invoke-AgentFixture -WorkspaceSeal 'Ok'
+Assert-Equal ([bool]$sealOk.Status.workspaceSealVerified) $true 'a matching seal is recorded as verified'
+Assert-Equal ([bool]$sealOk.ApplyResult.workspaceSealVerified) $true 'a matching seal reaches the apply result'
+Assert-Equal $sealOk.InstallCalled $true 'a matching seal does not block the run'
+
+# No token at all stays distinguishable from a refusal, so an older agent or a manual invocation
+# is not reported as tampering.
+$sealAbsent = Invoke-AgentFixture -WorkspaceSeal 'None'
+Assert-Equal ($null -eq $sealAbsent.Status.workspaceSealVerified) $true 'an unchecked seal is null, not false'
+Assert-Equal ($null -eq $sealAbsent.ApplyResult.workspaceSealVerified) $true 'an unchecked seal stays null in the apply result'
+Assert-Equal $sealAbsent.InstallCalled $true 'no seal token means no seal check, not a blocked run'
+Assert-Equal (Test-IsApplyResultError -ApplyResult $sealAbsent.ApplyResult) $false 'an unchecked seal is not an error'
 
 # --- one run per guest, as the orchestrator sees it (task 4) ---------------------------------
 # The agent reports guestRunConflict when the guest was already busy with another run of this
@@ -850,6 +897,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $deselectedUpdateKeys = @()
         $stoppedByRoundCap = $false
         $outstandingVerificationByVm = @{}
+        $runEventLog = New-RunEventLogState -Path (Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-events-' + [guid]::NewGuid().ToString('N') + '.jsonl'))
         $sawApplyFailure = $false
         $scriptExitCode = 0
         $runOutputDirectory = $roundRunDirectory
@@ -1066,6 +1114,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $deselectedUpdateKeys = @()
         $stoppedByRoundCap = $false
         $outstandingVerificationByVm = @{}
+        $runEventLog = New-RunEventLogState -Path (Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-events-' + [guid]::NewGuid().ToString('N') + '.jsonl'))
         $sawApplyFailure = $false
         $scriptExitCode = 0
         $runOutputDirectory = $cycleDirectory
@@ -1909,6 +1958,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         $deselectedUpdateKeys = @()
         $stoppedByRoundCap = $false
         $outstandingVerificationByVm = @{}
+        $runEventLog = New-RunEventLogState -Path (Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-events-' + [guid]::NewGuid().ToString('N') + '.jsonl'))
         $sawApplyFailure = $false
         $scriptExitCode = 0
         $runOutputDirectory = $f6Directory
@@ -2082,6 +2132,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         $deselectedUpdateKeys = @()
         $stoppedByRoundCap = $false
         $outstandingVerificationByVm = @{}
+        $runEventLog = New-RunEventLogState -Path (Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-events-' + [guid]::NewGuid().ToString('N') + '.jsonl'))
         $sawApplyFailure = $false
         $scriptExitCode = 0
         $runOutputDirectory = $f7Directory

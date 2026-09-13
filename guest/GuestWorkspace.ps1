@@ -34,6 +34,7 @@ $script:GuestWorkspaceExitCodes = [ordered]@{
     SecurityUnreadable = 15
     CreateFailed       = 16
     Unexpected         = 17
+    SealRefused        = 18
 }
 
 # SYSTEM and the local Administrators group. Everything else that can modify the directory or
@@ -320,6 +321,74 @@ function Assert-GuestWorkspacePath {
     return New-GuestWorkspaceVerdict -Status 'Ok' -Path $canonical
 }
 
+function Get-GuestWorkspaceSealPath {
+    param([string]$Path)
+
+    return (Join-Path $Path '.workspace-seal')
+}
+
+function Write-GuestWorkspaceSeal {
+    param(
+        [string]$Path,
+        [string]$Token
+    )
+
+    # Written by the bootstrap, inside the directory it has just created and verified. It turns
+    # "this directory was safe a moment ago" into "this is the same directory we secured": every
+    # later step re-reads it, so a directory replaced or re-permissioned mid-phase is caught
+    # instead of being trusted on the strength of one check at the start.
+    Set-Content -LiteralPath (Get-GuestWorkspaceSealPath -Path $Path) -Value ([string]$Token) -Encoding UTF8 -NoNewline
+}
+
+function Assert-GuestWorkspaceSeal {
+    param(
+        [string]$Path,
+        [string]$Token
+    )
+
+    # The full directory check runs again first. The token establishes IDENTITY - this is the
+    # directory the bootstrap made - and the access-control check establishes AUTHORITY. Neither
+    # is sufficient alone: a token nobody can forge in a directory anyone can write to proves
+    # nothing, and a correctly permissioned directory that is not the one we sealed is a
+    # different directory. The token is not a secret; it does not need to be, because forging the
+    # seal in a directory that also passes the owner and ACL checks needs administrator rights.
+    $directoryVerdict = Assert-GuestWorkspacePath -Path $Path
+    if ($directoryVerdict.Status -ne 'Ok') {
+        return $directoryVerdict
+    }
+    $canonical = [string]$directoryVerdict.Path
+
+    if ([string]::IsNullOrWhiteSpace($Token)) {
+        return New-GuestWorkspaceVerdict -Status 'SealRefused' -Reason 'No workspace seal token was supplied.' -Path $canonical
+    }
+
+    $sealPath = Get-GuestWorkspaceSealPath -Path $canonical
+    $sealFileVerdict = Assert-GuestWorkspaceFilePath -Path $sealPath
+    if ($sealFileVerdict.Status -ne 'Ok') {
+        return $sealFileVerdict
+    }
+
+    if (-not (Test-Path -LiteralPath $sealPath -PathType Leaf)) {
+        return New-GuestWorkspaceVerdict -Status 'SealRefused' -Reason ('The workspace seal is missing from {0}.' -f $canonical) -Path $canonical
+    }
+
+    $sealValue = $null
+    try {
+        $sealValue = ([string](Get-Content -LiteralPath $sealPath -Raw)).Trim()
+    }
+    catch {
+        return New-GuestWorkspaceVerdict -Status 'SealRefused' -Reason ('The workspace seal could not be read: {0}' -f $_.Exception.Message) -Path $canonical
+    }
+
+    # Ordinal, case-sensitive: the token is a generated GUID in N form, and a value that differs
+    # in any way is a different seal.
+    if (-not [string]::Equals($sealValue, ([string]$Token).Trim(), [System.StringComparison]::Ordinal)) {
+        return New-GuestWorkspaceVerdict -Status 'SealRefused' -Reason ('The workspace seal in {0} does not match this run; the directory was replaced or resealed since it was secured.' -f $canonical) -Path $canonical
+    }
+
+    return New-GuestWorkspaceVerdict -Status 'Ok' -Path $canonical
+}
+
 function Assert-GuestWorkspaceFilePath {
     param([string]$Path)
 
@@ -375,7 +444,12 @@ function Assert-GuestWorkspaceFilePath {
 }
 
 function Initialize-GuestWorkspace {
-    param([string]$Path)
+    param(
+        [string]$Path,
+        # When given, the directory is sealed with this token once it has been proven safe, and
+        # the seal is verified before this call returns.
+        [string]$SealToken
+    )
 
     $shape = Test-GuestWorkspacePathShape -Path $Path
     if ($shape.Status -ne 'Ok') {
@@ -412,7 +486,25 @@ function Initialize-GuestWorkspace {
 
     # Always verify, including what this call just created: a descriptor can be refused,
     # downgraded by policy, or replaced between the create and now.
-    return Assert-GuestWorkspacePath -Path $canonical
+    $verdict = Assert-GuestWorkspacePath -Path $canonical
+    if ($verdict.Status -ne 'Ok') {
+        return $verdict
+    }
+
+    # Sealed only after the directory has been proven safe, so the seal never vouches for a
+    # directory this code would have refused.
+    if (-not [string]::IsNullOrWhiteSpace($SealToken)) {
+        try {
+            Write-GuestWorkspaceSeal -Path $canonical -Token $SealToken
+        }
+        catch {
+            return New-GuestWorkspaceVerdict -Status 'SealRefused' -Reason ('The workspace seal could not be written: {0}' -f $_.Exception.Message) -Path $canonical
+        }
+
+        return Assert-GuestWorkspaceSeal -Path $canonical -Token $SealToken
+    }
+
+    return $verdict
 }
 
 # --- bootstrap dispatch ----------------------------------------------------------------------
@@ -424,11 +516,22 @@ if (Test-Path -LiteralPath 'Variable:GuestWorkspaceRequest') {
     try {
         $request = Get-Variable -Name 'GuestWorkspaceRequest' -ValueOnly
         $requestedPath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String([string]$request.PathBase64))
+        $requestedSealBase64 = [string](& { try { [string]$request.SealTokenBase64 } catch { '' } })
+        $requestedSealToken = ''
+        if (-not [string]::IsNullOrWhiteSpace($requestedSealBase64)) {
+            $requestedSealToken = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($requestedSealBase64))
+        }
+
         $verdict = if ([string]$request.Mode -eq 'Assert') {
-            Assert-GuestWorkspacePath -Path $requestedPath
+            if ([string]::IsNullOrWhiteSpace($requestedSealToken)) {
+                Assert-GuestWorkspacePath -Path $requestedPath
+            }
+            else {
+                Assert-GuestWorkspaceSeal -Path $requestedPath -Token $requestedSealToken
+            }
         }
         else {
-            Initialize-GuestWorkspace -Path $requestedPath
+            Initialize-GuestWorkspace -Path $requestedPath -SealToken $requestedSealToken
         }
 
         # An optional second question, asked only once the directory itself is acceptable: is

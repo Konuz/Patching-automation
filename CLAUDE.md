@@ -83,7 +83,7 @@ Execution flows through layered runtime scripts plus the offline planning model 
 4. **`scripts/PatchPlanModel.ps1`** (offline model) — pure planning/reporting logic for update identity validation, default group selection, Failover Cluster skips, per-VM patch plans, summaries, and PlanOnly exit semantics. Keep it free of PowerCLI, GuestOps calls, `Read-Host`, and top-level runtime flow.
 5. **`scripts/GuestOpsLib.ps1`** (GuestOps helpers) — shared PowerCLI/GuestOps file transfer and process-run helpers. The guest agent cycle is split into `Start-VMAgentCycle` (upload + `StartProgramInGuest`), `Test-VMAgentCycleComplete` (one `ListProcessesInGuest`) and `Complete-VMAgentCycle` (download + parse). Those three are the whole cycle; the single-shot `Invoke-VMAgentCycle`/`Invoke-GuestAgentRun` that preceded them are gone, along with the needles that were keeping them alive after their last caller disappeared.
 6. **`guest/Run-LocalPatch.ps1`** (agent, runs *inside* the guest) — WUA COM only: `Microsoft.Update.Session` → searcher → downloader → installer. Writes `status.json` + `agent.log` to a unique cycle directory (`C:\ProgramData\PatchingGuestOps\<runId>`). **Never reboots** — it only reports `pendingReboot`.
-7. **`guest/GuestWorkspace.ps1`** (guard, runs *inside* the guest, **never uploaded**) — creates the tool directory with a protected DACL and verifies owner, access rules, reparse points and the parent before anything is written to it. Executed through `powershell.exe -EncodedCommand`; see "Securing the guest directory before the first upload".
+7. **`guest/GuestWorkspace.ps1`** (guard, runs *inside* the guest, **never uploaded** by the bootstrap) — creates the tool directory with a protected DACL and verifies owner, access rules, reparse points and the parent before anything is written to it, then seals it with a one-time token every later guest-side step re-verifies. Executed through `powershell.exe -EncodedCommand`; uploaded beside the agent and the boot-time helper only so *they* can re-check the seal. See "Securing the guest directory before the first upload".
 8. **`guest/GuestRunGuard.ps1`** (guard, runs *inside* the guest) — the one-run-per-guest lock and its coordination record; see "One run per guest".
 9. **`guest/Request-GuestReboot.ps1`** (runs *inside* the guest, **never uploaded**) — takes the run guard and invokes `shutdown.exe` while holding it.
 10. **`guest/Read-BootTime.ps1`** (helper, runs *inside* the guest) — reads `Win32_OperatingSystem.LastBootUpTime` and writes a UTC/ISO 8601 result for the reboot validation gate.
@@ -248,9 +248,44 @@ that was already sitting in it, and that file is a script this tool is about to 
 
 The channel back is a process exit code and nothing else, so the guest's status table and the
 orchestrator's reason table must agree: 10 path, 11 owner, 12 access rule, 13 reparse point,
-14 parent, 15 unreadable descriptor, 16 create failed, 17 unexpected. An **unrecognised code, and
-a lost exit code, both fail the VM** — vSphere forgets exit codes shortly after a process ends,
-and "no answer" is the one thing that must never read as success.
+14 parent, 15 unreadable descriptor, 16 create failed, 17 unexpected, 18 seal refused. An
+**unrecognised code, and a lost exit code, both fail the VM** — vSphere forgets exit codes shortly
+after a process ends, and "no answer" is the one thing that must never read as success.
+
+#### The seal: one token for the whole cycle
+
+The checks above answer *who may write here*. They cannot answer *is this still the directory we
+secured*, because a directory someone else created and permissioned identically passes every one of
+them. And the bootstrap is not the last word: between it and the first line the agent runs there
+are three more GuestOps calls — the uploads, and the start — each with a gap an administrator on
+that guest could act in.
+
+So `Initialize-GuestWorkspace -SealToken` writes the token into `.workspace-seal` inside the
+directory **after** it has passed, and every guest-side step afterwards re-reads it through
+`Assert-GuestWorkspaceSeal`: the agent before it creates the WUA session (`-WorkspaceSealToken`,
+recorded as `workspaceSealVerified` in `status.json` and in the apply result), and the boot-time
+helper before it reports a boot time (`exit 3` on a refusal, so a stale `boot-time-<vm>.json`
+cannot read as a fresh answer). `Start-VMAgentCycle` and `Invoke-VMGuestBootTimeRead` each mint
+their own token with `New-GuestWorkspaceSealToken`; one token spans the bootstrap and the program
+started after it, pinned by `Test-GuestWorkspaceSealsSpanTheCycle` in the static gate, because the
+harness that exercises the coupling end to end needs PowerCLI types and skips on most machines.
+
+Three properties are load-bearing:
+
+- **The token is identity, the ACL is authority.** Neither is sufficient: a token nobody can forge
+  in a directory anyone can write to proves nothing, and a correctly permissioned directory that is
+  not the one we sealed is a different directory. So `Assert-GuestWorkspaceSeal` runs the whole
+  directory check first and returns *its* verdict when it fails — the operator is told which of the
+  two broke, not "seal mismatch" for an ACL problem.
+- **The token need not be secret**, which is why it can sit in the directory it seals: forging it
+  in a directory that also passes the owner and ACL checks already needs administrator rights.
+- **Nothing about a refusal is lenient.** No token supplied to the check, no seal file, an empty
+  seal, a seal that differs in case — all `SealRefused`. The one thing that is *not* a refusal is
+  an agent invoked without `-WorkspaceSealToken` at all: `workspaceSealVerified` stays `$null`, so
+  "not checked" (an older agent, a manual run) never reads as "checked and refused".
+
+In the agent the seal is verified **before the run guard is taken**, so a directory this tool does
+not recognise leaves nothing on the guest to reconcile.
 
 ### One run per guest: the guest run guard
 

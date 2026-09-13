@@ -370,7 +370,12 @@ function New-ApplyResultRecord {
         [bool]$GuestRunConflict = $false,
         [string[]]$MissingUpdateKeys = @(),
         [bool]$SelectionDrift = $false,
-        [bool]$RequiresVerification = $false
+        [bool]$RequiresVerification = $false,
+        # Null when the guest was not asked to check a seal, otherwise the guest's own answer to
+        # "is this still the directory the bootstrap secured". Not merged into the error list
+        # alone: a refused seal is a tampering signal, and it must be visible as a field rather
+        # than as one string among several.
+        $WorkspaceSealVerified = $null
     )
 
     return [pscustomobject]@{
@@ -386,6 +391,7 @@ function New-ApplyResultRecord {
         cleanupStatus = $CleanupStatus
         cleanupReason = $CleanupReason
         guestRunConflict = $GuestRunConflict
+        workspaceSealVerified = $WorkspaceSealVerified
         missingUpdateKeys = @($MissingUpdateKeys)
         selectionDrift = $SelectionDrift
         requiresVerification = $RequiresVerification
@@ -418,6 +424,12 @@ function New-ApplyResultFromCycle {
     # carried an unreconciled trace of one. It has to survive every branch below, including the
     # failure branches, because it is what blocks the reboot and the next round for this VM.
     $guestRunConflict = [bool](Get-ObjectPropertyValue -InputObject $status -Path @('guestRunConflict') -DefaultValue $false)
+    # Left null when the agent did not report it - an older agent, or a cycle that supplied no
+    # token - so "not checked" stays distinguishable from "checked and refused".
+    $workspaceSealVerified = Get-ObjectPropertyValue -InputObject $status -Path @('workspaceSealVerified')
+    if ($null -ne $workspaceSealVerified) {
+        $workspaceSealVerified = [bool]$workspaceSealVerified
+    }
     # Drift is an explicitly incomplete execution, not a failure: the approved updates that were
     # still on offer went in, the ones that had moved did not, and somebody has to look at the
     # difference. It must survive every branch below, including the failure branches.
@@ -432,6 +444,10 @@ function New-ApplyResultFromCycle {
         $errors += ('Guest run conflict: {0}' -f $conflictReason)
     }
 
+    if ($false -eq $workspaceSealVerified) {
+        $errors += 'The guest refused the workspace seal: the tool directory is no longer the one this cycle secured.'
+    }
+
     if (-not $agentCompletionConfirmed) {
         $reason = 'Agent completion was not confirmed; apply guest process did not complete.'
         if (-not [string]::IsNullOrWhiteSpace($agentCompletionReason)) {
@@ -442,7 +458,7 @@ function New-ApplyResultFromCycle {
             -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
             -AgentCompletionConfirmed $false -AgentCompletionReason $agentCompletionReason `
             -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
-            -Errors $errors -GuestRunConflict $guestRunConflict -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
+            -Errors $errors -GuestRunConflict $guestRunConflict -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
     }
 
     if ($null -eq $agentResult -or -not $agentResult.Completed) {
@@ -462,7 +478,7 @@ function New-ApplyResultFromCycle {
                 -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
                 -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
                 -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
-                -Errors $errors -GuestRunConflict $guestRunConflict -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
+                -Errors $errors -GuestRunConflict $guestRunConflict -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
         }
     }
     # A partial install (WUA ResultCode 3) exits non-zero but is authoritative in
@@ -475,14 +491,14 @@ function New-ApplyResultFromCycle {
             -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
             -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
             -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
-            -Errors $errors -GuestRunConflict $guestRunConflict -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
+            -Errors $errors -GuestRunConflict $guestRunConflict -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
     }
 
     return New-ApplyResultRecord -VMName $VMName -Outcome $outcome -InstallResult $installResult `
         -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
         -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
         -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
-        -Errors $errors -GuestRunConflict $guestRunConflict -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
+        -Errors $errors -GuestRunConflict $guestRunConflict -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
 }
 
 function Add-OutstandingVerificationKeys {
@@ -1284,11 +1300,116 @@ function Write-RebootActionArtifacts {
     Add-Content -LiteralPath $summaryPath -Value $lines -Encoding UTF8
 }
 
+# --- operational event log ---------------------------------------------------------------------
+# One line of JSON per event, in the run root. Deliberately NOT a transcript: a transcript is how
+# credentials, GuestOps transfer tickets and raw exception objects end up in a file somebody later
+# emails around. This writes an allow-list of fields and nothing else, and it never captures
+# Write-Host output wholesale.
+$script:RunEventAllowedFields = @('timestampUtc', 'event', 'phase', 'round', 'vmName', 'runId', 'outcome', 'errorKind', 'operatorDecision', 'detail')
+
+function New-RunEventLogState {
+    param([string]$Path)
+
+    return [pscustomobject]@{
+        Path = $Path
+        Enabled = $false
+        # The first write failure is remembered so the run can end 1 without interrupting the
+        # patching that is already in flight: losing the audit trail is not a reason to abandon
+        # guests mid-install, and it is not a reason to report success either.
+        AuditError = $null
+    }
+}
+
+function Initialize-RunEventLog {
+    param($State)
+
+    # Proven writable BEFORE any agent starts, so a run that cannot be audited says so up front
+    # rather than after the first install.
+    if ($null -eq $State) {
+        return $false
+    }
+
+    try {
+        $directory = Split-Path -Parent ([string]$State.Path)
+        if (-not [string]::IsNullOrWhiteSpace($directory) -and -not (Test-Path -LiteralPath $directory -PathType Container)) {
+            [void](New-Item -ItemType Directory -Path $directory -Force)
+        }
+        Set-Content -LiteralPath ([string]$State.Path) -Value '' -Encoding UTF8
+        $State.Enabled = $true
+        return $true
+    }
+    catch {
+        $State.Enabled = $false
+        $State.AuditError = ('The run event log could not be created at {0}: {1}' -f [string]$State.Path, $_.Exception.Message)
+        return $false
+    }
+}
+
+function Write-RunEvent {
+    param(
+        $State,
+        [string]$Event,
+        [string]$Phase = '',
+        $Round = $null,
+        [string]$VMName = '',
+        [string]$RunId = '',
+        [string]$Outcome = '',
+        [string]$ErrorKind = '',
+        [string]$OperatorDecision = '',
+        [string]$Detail = ''
+    )
+
+    if ($null -eq $State -or -not [bool]$State.Enabled) {
+        return
+    }
+
+    # Built field by field from typed strings. Nothing is ever handed an object to serialise, so a
+    # PSCredential, a SecureString, an authentication object, a GuestOps transfer URL or a raw
+    # exception cannot reach the file by being attached to something that looked harmless.
+    $record = [ordered]@{
+        timestampUtc = ([datetime]::UtcNow).ToString('o')
+        event = $Event
+        phase = $Phase
+        round = $(if ($null -eq $Round) { $null } else { [int]$Round })
+        vmName = $VMName
+        runId = $RunId
+        outcome = $Outcome
+        errorKind = $ErrorKind
+        operatorDecision = $OperatorDecision
+        detail = $Detail
+    }
+
+    foreach ($fieldName in @($record.Keys)) {
+        if ($fieldName -notin $script:RunEventAllowedFields) {
+            throw ('The run event log does not accept the field {0}.' -f $fieldName)
+        }
+    }
+
+    try {
+        Add-Content -LiteralPath ([string]$State.Path) -Value ($record | ConvertTo-Json -Depth 3 -Compress) -Encoding UTF8
+    }
+    catch {
+        # A disk that filled up mid-run must not end the phase: the guests are already installing,
+        # and abandoning them is worse than losing the log. The failure is remembered instead, and
+        # the run ends 1 once the results have been collected safely.
+        if ($null -eq $State.AuditError) {
+            $State.AuditError = ('The run event log could not be written at {0}: {1}' -f [string]$State.Path, $_.Exception.Message)
+            $State.Enabled = $false
+            Write-Warning $State.AuditError
+        }
+    }
+}
+
 function Write-PatchRunSummary {
     param(
         [string]$RunOutputDirectory,
         $RoundSummaries,
-        [hashtable]$FinalStateMap
+        [hashtable]$FinalStateMap,
+        # vmName -> the approved update keys this run could not install and has not shown to be
+        # inapplicable. Its own section, because an operator reading "exit 1" with no failing
+        # install will otherwise go looking for a fault that is not there.
+        [hashtable]$OutstandingVerificationByVm = @{},
+        [string]$AuditError = ''
     )
 
     $rounds = @($RoundSummaries)
@@ -1325,6 +1446,30 @@ function Write-PatchRunSummary {
         $lines += ('- VMs in an unrecognised state: {0}' -f $otherStates.Count)
     }
     $lines += ''
+
+    # Not an error section: these installs may all have worked. What is outstanding is that this
+    # run installed less than was approved, and nobody has established that it was harmless.
+    $lines += '## To verify'
+    if ($null -eq $OutstandingVerificationByVm -or $OutstandingVerificationByVm.Count -eq 0) {
+        $lines += '- nothing outstanding'
+    }
+    else {
+        $lines += 'Approved updates WUA no longer offered, which no later discovery has shown to be'
+        $lines += 'inapplicable. Nothing failed to install; these were never offered. Check each key on'
+        $lines += 'the VM (Windows Update history, or the update catalogue) and re-run discovery.'
+        $lines += ''
+        foreach ($verifyVmName in @($OutstandingVerificationByVm.Keys | Sort-Object)) {
+            $lines += ('- {0}: {1}' -f $verifyVmName, ((@($OutstandingVerificationByVm[$verifyVmName].Keys) | Sort-Object) -join ', '))
+        }
+    }
+    $lines += ''
+
+    if (-not [string]::IsNullOrWhiteSpace($AuditError)) {
+        $lines += '## Audit log'
+        $lines += ('- {0}' -f $AuditError)
+        $lines += '- The run is reported as failed because it could not be audited, not because a VM failed.'
+        $lines += ''
+    }
 
     $lines += '## Rounds'
     if ($rounds.Count -eq 0) {

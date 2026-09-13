@@ -27,6 +27,7 @@ jednoelementowa.
 - [Jak to działa pod spodem](#jak-to-działa-pod-spodem)
 - [Struktura repozytorium](#struktura-repozytorium)
 - [Testy](#testy)
+- [Co zrobić, gdy…](#co-zrobić-gdy)
 - [Ograniczenia i bezpieczeństwo](#ograniczenia-i-bezpieczeństwo)
 
 ---
@@ -527,6 +528,20 @@ zero transferów i zero uruchomień agenta na tej maszynie. Brak odpowiedzi od g
 wyjścia, przekroczony czas) też jest błędem, nie sukcesem. `-SkipHelperUpload` oszczędza transfer,
 nie kontrolę: przy ponownym użyciu helpera czasu rozruchu sprawdzany jest także sam plik.
 
+**Katalog jest pieczętowany jednorazowym tokenem.** Kontrola uprawnień odpowiada na pytanie „kto
+może tu pisać”, ale nie na pytanie „czy to nadal ten katalog, który zabezpieczyliśmy” — katalog
+utworzony przez kogoś innego z identycznymi uprawnieniami przejdzie każdą z tych kontroli. Między
+kontrolą a pierwszą linią agenta są jeszcze trzy wywołania GuestOps (uploady i start), a więc
+i trzy przerwy. Dlatego po udanej kontroli do katalogu zapisywany jest plik `.workspace-seal`
+z tokenem wygenerowanym dla tego cyklu, a **każdy kolejny krok w gościu sprawdza, czy token się nie
+zmienił**: agent — przed utworzeniem sesji WUA (pole `workspaceSealVerified` w `status.json`
+i w `apply-results.json`), helper czasu rozruchu — przed zapisaniem wyniku. Token nie jest
+tajemnicą i nie musi nią być: podrobienie go w katalogu, który przechodzi także kontrolę
+właściciela i ACL, wymaga już uprawnień administratora. Jeśli zawiedzie kontrola uprawnień,
+zgłaszana jest **ona**, a nie niezgodność pieczęci — operator ma wiedzieć, która z dwóch rzeczy
+się nie zgadza. Odrzucona pieczęć zatrzymuje maszynę **przed** zajęciem blokady przebiegu, więc
+katalog, którego narzędzie nie rozpoznaje, nie zostawia niczego do ręcznego uzgodnienia.
+
 **Jeden przebieg na gościa.** Wewnątrz maszyny działa blokada w stałym katalogu
 `C:\ProgramData\PatchingGuestOps\.coordination` — jedna na gościa, wspólna dla wszystkich
 procesów narzędzia, niezależna od `runId`, katalogu cyklu, konta wykonawczego i
@@ -697,6 +712,100 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-GuestOpsH
 
 Launcher odpala te bramki automatycznie przed każdym przebiegiem (chyba że dodasz
 `-SkipStaticChecks`).
+
+---
+
+## Co zrobić, gdy…
+
+Skrót dla operatora. Każdy z tych stanów jest **zamierzony** — narzędzie zatrzymuje się, bo nie ma
+dowodu, że może iść dalej, a nie dlatego, że coś się zepsuło. Żadnego z nich nie da się obejść
+przełącznikiem i nie należy tego robić ręcznie „na skróty”.
+
+### Gość odmawia przebiegu (`guestRunConflict=true`, wynik `Failed`)
+
+Na tej maszynie działa inny przebieg tego narzędzia albo został po nim niepotwierdzony ślad.
+Maszyna nie jest łatana, nie jest restartowana i nie wchodzi do kolejnej rundy; przebieg kończy się
+kodem 1.
+
+Pole `guestRunConflictReason` w `apply-results.json` rozróżnia cztery różne sytuacje — i tylko
+jedna z nich wymaga interwencji.
+
+1. **„Another PatchingGuestOps run holds the guest run guard”** — na maszynie *w tej chwili* pracuje
+   inny proces narzędzia (uchwyt pliku jest zajęty). Poczekaj na jego koniec i uruchom narzędzie
+   ponownie. Nic więcej nie trzeba robić.
+2. **„a reboot requested by a previous run … has not been confirmed by a newer boot time”** —
+   poprzedni przebieg zlecił restart, który się jeszcze nie potwierdził. Zrestartuj maszynę lub
+   poczekaj na okno restartu: blokada zwalnia się **sama**, gdy czas rozruchu będzie nowszy od
+   zapisanego. Nie usuwaj tu niczego ręcznie — skasowanie znacznika pozwoliłoby wysłać drugi
+   `shutdown.exe`.
+3. **„a previous run … never reported completion”** — porzucony przebieg: agent został przerwany albo
+   maszyna została wyłączona w trakcie. System zwolnił uchwyt pliku, ale to **nie** znaczy, że praca
+   WUA się zakończyła. Dopiero tu potrzebne jest ręczne uzgodnienie — patrz niżej.
+4. **„a coordination record this tool cannot interpret”** lub nierozpoznany status — plik blokady
+   został uszkodzony albo zapisany przez inną wersję. Też ręczne uzgodnienie.
+
+Ręczne uzgodnienie (przypadki 3 i 4), w tej kolejności: na gościu sprawdź historię Windows Update
+i to, czy nie działa proces `Run-LocalPatch.ps1`. Dopiero gdy masz pewność, że nic nie pracuje, usuń
+`C:\ProgramData\PatchingGuestOps\.coordination\guest-run.lock`. Następny przebieg wystartuje
+normalnie. Nie ma przełącznika, który pomija blokadę, i nie będzie — szczegóły w sekcji
+„Jeden przebieg na gościa”.
+
+### Pieczęć katalogu została odrzucona (`workspaceSealVerified=false`)
+
+Katalog narzędzia w gościu nie jest już tym, który ten cykl zabezpieczył: został podmieniony,
+odtworzony albo przepieczętowany między kontrolą a startem programu. Maszyna zatrzymuje się przed
+sesją WUA i **przed** zajęciem blokady przebiegu, więc nie ma nic do uzgadniania.
+
+1. Traktuj to jako zdarzenie bezpieczeństwa, nie jako usterkę narzędzia. Sprawdź, kto ma prawo pisać
+   do `C:\ProgramData\PatchingGuestOps` na tej maszynie i czy katalog nie jest punktem ponownej
+   analizy (junction/symlink).
+2. Jeśli ACL katalogu jest nieprawidłowy, narzędzie zgłosi **właśnie to** (`AccessRuleRefused`,
+   `OwnerRefused`, `ParentRefused`), a nie niezgodność pieczęci — komunikat wskazuje, którą z dwóch
+   rzeczy poprawić.
+3. Narzędzie niczego nie naprawia samo: usuń przyczynę, a następnie uruchom przebieg ponownie —
+   nowy cykl utworzy i zapieczętuje własny katalog.
+
+### Maszyna kończy w stanie `PendingReboot`
+
+Instalacja mogła się udać; zaległy jest restart i jego potwierdzenie (odmowa operatora, timeout,
+brak nowszego czasu rozruchu, błąd zlecenia). Dlatego to **nie** `Failed`.
+
+1. Sprawdź `reboot-actions.json`: `validationStatus`, `operatorDecision` oraz parę
+   `uptimeBaselineSeconds` / `uptimeObservedSeconds` (diagnostycznie — pokazuje cofnięty zegar gościa).
+2. Uruchom narzędzie ponownie. Zaległy restart jest widziany przez wykrywanie
+   (`pendingRebootBefore`), więc maszyna trafi do kolejnej rundy nawet wtedy, gdy nie ma nic do
+   instalacji — i wtedy trzeba potwierdzić restart wpisując `REBOOT`.
+3. Jeśli restart został wymuszony przez `CONTINUE`, wynik jest świadomie niepotwierdzony i kod
+   wyjścia pozostaje 1 — potwierdź stan maszyny samodzielnie.
+
+### Maszyna kończy w stanie `NeedsReview`
+
+Polityka trafiła na pakiet, którego nie potrafi bezpiecznie zakwalifikować, i **nie zgaduje**.
+Decyzja należy do operatora.
+
+1. Uruchom przebieg **interaktywnie** — bez `-SelectedUpdateKeys` i bez `-SkipConfirmation`. Bez
+   otwartej listy odznaczone pole nie jest decyzją, a przebieg kończy się kodem 1.
+2. Na liście grup szukaj znacznika `[NEEDS REVIEW]` i podanego powodu.
+3. Zaznaczenie instaluje pakiet. Świadome pozostawienie pola odznaczonego **po wyświetleniu listy**
+   daje `GreenByOperatorChoice`; decyzja jest pamiętana po tożsamości, więc kolejne rundy nie pytają
+   ponownie.
+
+### W `summary.md` jest sekcja „To verify” z listą kluczy
+
+To **nie** jest awaria instalacji. Zatwierdzone aktualizacje przestały być oferowane przez WUA
+między planem a instalacją (dryf), a żadne późniejsze wykrywanie nie wykazało, że nie mają już
+zastosowania. Zainstalowano mniej, niż zatwierdzono, i nikt tego jeszcze nie wyjaśnił — dlatego kod
+wyjścia 1 przy braku innych błędów.
+
+1. Weź listę `VM: klucz, klucz` z sekcji „To verify” (te same klucze są w `missingUpdateKeys`
+   w `apply-results.json`).
+2. Na maszynie sprawdź historię Windows Update dla danego KB oraz to, czy pakiet nie został
+   zastąpiony nowszą wersją (`RevisionNumber` w kluczu to część tożsamości — zmiana wersji tworzy
+   nową grupę).
+3. Uruchom wykrywanie ponownie. Jeśli aktualizacja faktycznie nie ma już zastosowania, kolejna runda
+   to rozstrzygnie i przebieg może zakończyć się sukcesem z zachowanym ostrzeżeniem.
+4. Tryb `-PatchPlanPath` nie ma świeżego wykrywania i nie może tego rozstrzygnąć — raportuje braki
+   i kończy kodem 1. Pełny przebieg (z wykrywaniem) jest właściwą odpowiedzią.
 
 ---
 

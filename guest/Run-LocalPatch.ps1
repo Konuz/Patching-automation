@@ -5,6 +5,11 @@ param(
     [string[]]$SelectedUpdateKeys = @(),
     [string]$SelectionPath,
     [string]$RunId,
+    # The seal the workspace bootstrap wrote into $WorkingDirectory. Verified before the WUA
+    # session is created: the upload and the start are two separate GuestOps calls, and the
+    # directory passing its checks when the bootstrap ran is not the same fact as this being
+    # still the directory that was secured.
+    [string]$WorkspaceSealToken = '',
     [switch]$SearchOnly,
     [string]$SearchCriteria = "IsInstalled=0 and IsHidden=0 and Type='Software'"
 )
@@ -537,6 +542,11 @@ $status = [ordered]@{
     pendingRebootBefore = $null
     pendingRebootAfter = $null
     roleFlags = $null
+    # Null when no seal token was supplied (a legacy or manual invocation), true when the working
+    # directory still carries the seal this run's bootstrap wrote, false when it does not. False
+    # stops the run before any WUA work: the directory holds selection.json and status.json, and
+    # a directory that is no longer the one that was secured cannot be read from or reported into.
+    workspaceSealVerified = $null
     # False unless this guest was already busy with another run of this tool, or carried an
     # unreconciled trace of one. True is absolute: no WUA work here, no reboot, no next cycle
     # for this VM in this run - even after the other process has ended.
@@ -560,6 +570,21 @@ try {
 
     if ($MaxUpdates -lt 1) {
         throw 'MaxUpdates must be greater than or equal to 1.'
+    }
+
+    # Before the run guard, so a refused seal leaves no trace to reconcile, and long before the
+    # WUA session. The bootstrap verified and sealed this directory, then the orchestrator
+    # uploaded into it and started this process - three separate GuestOps calls with gaps between
+    # them. Re-reading the seal here is what turns "the directory was safe when we checked it"
+    # into "this is the same directory we secured".
+    if (-not [string]::IsNullOrWhiteSpace($WorkspaceSealToken)) {
+        $sealVerdict = Assert-GuestWorkspaceSeal -Path $WorkingDirectory -Token $WorkspaceSealToken
+        $status.workspaceSealVerified = ($sealVerdict.Status -eq 'Ok')
+        Save-Status -Status $status
+        if (-not $status.workspaceSealVerified) {
+            throw ('The workspace seal was refused, so this directory is not the one that was secured for this run: {0}' -f [string]$sealVerdict.Reason)
+        }
+        Write-AgentLog -Message 'Workspace seal verified.'
     }
 
     # Taken before the WUA session is created, and held until the terminal status below has been

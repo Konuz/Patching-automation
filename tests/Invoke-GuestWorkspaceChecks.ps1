@@ -94,6 +94,91 @@ Assert-Equal (Get-GuestWorkspaceExitCode -Status 'SomethingElse') (Get-GuestWork
 Assert-Contains (Get-GuestWorkspaceFailureReason -ExitCode 99) 'unrecognised' 'an unrecognised exit code is a failure'
 Assert-Contains (Get-GuestWorkspaceFailureReason -ExitCode $null) 'never reported an exit code' 'a lost exit code is a failure, not a pass'
 
+# --- the seal: identity on top of authority -------------------------------------------------------
+# The owner and access-rule checks answer "who may write here". They cannot answer "is this the
+# same directory we secured", because a directory created and permissioned identically by someone
+# else passes them all. The seal answers that, and it is re-read by every guest-side step after the
+# bootstrap - the agent before it creates the WUA session, the boot-time helper before it reports.
+#
+# The access-control part of the verdict needs real Windows security descriptors, so this section
+# stubs it out and exercises the token comparison alone; the Windows-only section below runs the
+# whole thing against a real directory.
+
+& {
+    function Assert-GuestWorkspacePath { param([string]$Path) return (New-GuestWorkspaceVerdict -Status 'Ok' -Path $Path) }
+    function Assert-GuestWorkspaceFilePath { param([string]$Path) return (New-GuestWorkspaceVerdict -Status 'Ok' -Path $Path) }
+
+    $sealRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-seal-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Force -Path $sealRoot
+    try {
+        $token = New-GuestWorkspaceSealToken
+        Assert-Equal ($token -match '^[0-9a-f]{32}$') $true 'the seal token is a generated GUID in N form'
+        Assert-Equal ((New-GuestWorkspaceSealToken) -ne $token) $true 'every cycle gets its own token'
+
+        # Nothing written yet: an unsealed directory is refused, so a directory that merely looks
+        # right cannot be mistaken for the one this run secured.
+        Assert-Equal (Assert-GuestWorkspaceSeal -Path $sealRoot -Token $token).Status 'SealRefused' 'a directory with no seal is refused'
+
+        Write-GuestWorkspaceSeal -Path $sealRoot -Token $token
+        Assert-Equal (Test-Path -LiteralPath (Get-GuestWorkspaceSealPath -Path $sealRoot) -PathType Leaf) $true 'the seal is written inside the directory it seals'
+        Assert-Equal (Assert-GuestWorkspaceSeal -Path $sealRoot -Token $token).Status 'Ok' 'the token written by the bootstrap verifies'
+
+        # A different token is the case this whole mechanism exists for: the directory was
+        # replaced or resealed between the bootstrap and this step.
+        $otherVerdict = Assert-GuestWorkspaceSeal -Path $sealRoot -Token (New-GuestWorkspaceSealToken)
+        Assert-Equal $otherVerdict.Status 'SealRefused' 'a token that does not match the seal is refused'
+        Assert-Contains $otherVerdict.Reason 'replaced or resealed' 'the refusal says what it means'
+
+        # Resealing by someone else does not make the earlier run pass: the token on disk is
+        # theirs now, and this run has to stop rather than work in a directory it no longer owns.
+        $intruderToken = New-GuestWorkspaceSealToken
+        Write-GuestWorkspaceSeal -Path $sealRoot -Token $intruderToken
+        Assert-Equal (Assert-GuestWorkspaceSeal -Path $sealRoot -Token $token).Status 'SealRefused' 'a resealed directory refuses the original token'
+        Assert-Equal (Assert-GuestWorkspaceSeal -Path $sealRoot -Token $intruderToken).Status 'Ok' 'the seal verifies against whatever token is actually on disk'
+
+        # Ordinal, so a token differing only in case is a different token.
+        Write-GuestWorkspaceSeal -Path $sealRoot -Token 'abcdef0123456789abcdef0123456789'
+        Assert-Equal (Assert-GuestWorkspaceSeal -Path $sealRoot -Token 'ABCDEF0123456789ABCDEF0123456789').Status 'SealRefused' 'the comparison is case-sensitive'
+
+        # An empty or missing token is refused rather than treated as "no seal required": the
+        # caller asking for a seal check with nothing to check is a programming error, and
+        # answering Ok would turn it into a silent bypass.
+        foreach ($emptyToken in @('', '   ', $null)) {
+            Assert-Equal (Assert-GuestWorkspaceSeal -Path $sealRoot -Token $emptyToken).Status 'SealRefused' 'a seal check with no token is refused, never accepted'
+        }
+
+        # Deleting the seal is not a way past it either.
+        Remove-Item -LiteralPath (Get-GuestWorkspaceSealPath -Path $sealRoot) -Force
+        Assert-Equal (Assert-GuestWorkspaceSeal -Path $sealRoot -Token $intruderToken).Status 'SealRefused' 'removing the seal refuses the run rather than skipping the check'
+    }
+    finally {
+        if ($sealRoot -like '*guestops-seal-*') {
+            Remove-Item -LiteralPath $sealRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# The access-control verdict outranks the token: a directory whose permissions no longer hold is
+# reported as such, not as a seal mismatch, so the operator is told which of the two failed.
+& {
+    function Assert-GuestWorkspacePath { param([string]$Path) return (New-GuestWorkspaceVerdict -Status 'AccessRuleRefused' -Reason 'synthetic' -Path $Path) }
+    Assert-Equal (Assert-GuestWorkspaceSeal -Path 'C:\ProgramData\PatchingGuestOps' -Token 'anything').Status 'AccessRuleRefused' 'a directory that fails its access-control check is not reported as a seal mismatch'
+}
+
+# A refused seal has its own exit code, and the orchestrator recognises it.
+Assert-Equal (Get-GuestWorkspaceExitCode -Status 'SealRefused') 18 'a refused seal has its own exit code'
+Assert-Contains (Get-GuestWorkspaceFailureReason -ExitCode 18) 'seal' 'the orchestrator explains a refused seal'
+
+# The token travels as data, like the path: it is written into the directory the bootstrap secures,
+# and interpolating it into the command text would make it another place syntax can be written.
+& {
+    $sealInjection = "abc'; Stop-Computer -Force; '"
+    $encodedSeal = New-GuestWorkspaceBootstrapCommand -WorkspaceScriptText 'function Initialize-GuestWorkspace { }' -Path 'C:\ProgramData\PatchingGuestOps' -Mode 'Initialize' -SealToken $sealInjection
+    $decodedSeal = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String($encodedSeal))
+    Assert-Equal ($decodedSeal.Contains('Stop-Computer')) $false 'the seal token never appears as code in the bootstrap'
+    Assert-Contains $decodedSeal ([System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($sealInjection))) 'the seal token travels base64-encoded as data'
+}
+
 # --- the bootstrap command ------------------------------------------------------------------------
 # Built from the trusted local copy and run through -EncodedCommand, so the guard is never
 # uploaded into the directory it is meant to be guarding.
@@ -619,6 +704,33 @@ else {
         $helperSecurity.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($usersSid, 'Modify', 'None', 'None', 'Allow')))
         Set-Acl -LiteralPath $untrustedHelper -AclObject $helperSecurity
         Assert-Equal (Assert-GuestWorkspaceFilePath -Path $untrustedHelper).Status 'AccessRuleRefused' 'a helper an ordinary user may rewrite is refused even inside a safe directory'
+
+        # 9. The seal, end to end against real security descriptors: the bootstrap writes it, the
+        #    directory still verifies with the token it was sealed with, and the seal file itself
+        #    is subject to the same file rules as the helper above.
+        $sealedHome = Join-Path $aclRoot 'sealed'
+        $sealedToken = New-GuestWorkspaceSealToken
+        Assert-Equal (Initialize-GuestWorkspace -Path $sealedHome -SealToken $sealedToken).Status 'Ok' 'a directory is created, verified and then sealed'
+        Assert-Equal (Assert-GuestWorkspaceSeal -Path $sealedHome -Token $sealedToken).Status 'Ok' 'the sealed directory verifies against its own token'
+        Assert-Equal (Assert-GuestWorkspaceSeal -Path $sealedHome -Token (New-GuestWorkspaceSealToken)).Status 'SealRefused' 'the sealed directory refuses a token it was not sealed with'
+
+        # Initialize without a token leaves no seal, so nothing later can pretend to have checked
+        # one: Assert-GuestWorkspaceSeal refuses instead of finding a stale file to match.
+        $unsealedHome = Join-Path $aclRoot 'unsealed'
+        Assert-Equal (Initialize-GuestWorkspace -Path $unsealedHome).Status 'Ok' 'a directory can still be created without a seal'
+        Assert-Equal (Test-Path -LiteralPath (Get-GuestWorkspaceSealPath -Path $unsealedHome) -PathType Leaf) $false 'no token means no seal file is written'
+        Assert-Equal (Assert-GuestWorkspaceSeal -Path $unsealedHome -Token $sealedToken).Status 'SealRefused' 'an unsealed directory cannot satisfy a seal check'
+
+        # A seal an ordinary user could rewrite is worth nothing, so it goes through the same file
+        # check as the boot-time helper.
+        $sealFilePath = Get-GuestWorkspaceSealPath -Path $sealedHome
+        $sealFileSecurity = Get-Acl -LiteralPath $sealFilePath
+        $sealFileSecurity.SetAccessRuleProtection($true, $false)
+        $sealFileSecurity.SetOwner($administratorsSid)
+        $sealFileSecurity.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($administratorsSid, 'FullControl', 'None', 'None', 'Allow')))
+        $sealFileSecurity.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($usersSid, 'Modify', 'None', 'None', 'Allow')))
+        Set-Acl -LiteralPath $sealFilePath -AclObject $sealFileSecurity
+        Assert-Equal (Assert-GuestWorkspaceSeal -Path $sealedHome -Token $sealedToken).Status 'AccessRuleRefused' 'a seal an ordinary user may rewrite is refused'
     }
     finally {
         # Only ever the private test directory, and only when it is still the one this run made.
