@@ -422,9 +422,124 @@ $fleetResults = @(Invoke-InProcessAgentFleet -Items $fleetItems -MaxInFlight 3 -
 
 Assert-Equal -Actual $fleetResults.Count -Expected 3 -Message 'fleet returns one result per item'
 Assert-Equal -Actual (@($fleetResults | Where-Object { $_.Error }).Count) -Expected 0 -Message 'healthy fleet items report no error'
-# Every VM must be started before the first poll: that is the whole point of the model.
+# Starts and polls interleave: exactly one start happens before the first poll, and every VM is
+# still started exactly once. Draining the whole queue first would leave the first guest running
+# unwatched for as long as the remaining starts take - minutes at fleet scale, by which time it
+# can have finished and dropped out of vSphere's process list.
 $firstPollIndex = $fleetEvents.IndexOf(($fleetEvents | Where-Object { $_ -like 'poll:*' } | Select-Object -First 1))
-Assert-Equal -Actual (@($fleetEvents[0..($firstPollIndex - 1)] | Where-Object { $_ -like 'start:*' }).Count) -Expected 3 -Message 'all items start before the first poll when MaxInFlight covers them'
+Assert-Equal -Actual (@($fleetEvents[0..($firstPollIndex - 1)] | Where-Object { $_ -like 'start:*' }).Count) -Expected 1 -Message 'the first poll follows the first start, not the last'
+Assert-Equal -Actual (@($fleetEvents | Where-Object { $_ -like 'start:*' }).Count) -Expected 3 -Message 'every item is still started exactly once'
+Assert-Equal -Actual ((@($fleetEvents | Where-Object { $_ -like 'start:*' }) | Sort-Object -Unique).Count) -Expected 3 -Message 'no item is started twice'
+
+# --- fleet scale: 100 VMs with an injected clock ------------------------------------------------
+# Each start costs several SOAP round trips plus three file transfers. Draining the queue first
+# meant the first guest ran unwatched for the length of every remaining start - with 100 VMs at
+# six seconds each, ten minutes - by which time it could have finished and dropped out of
+# vSphere's short-lived process list. The clock is injected so this measures the ORDER of
+# operations, not how fast the test host happens to be.
+& {
+    $scaleItems = @(1..100 | ForEach-Object { [pscustomobject]@{ Sequence = $_; VMName = ('VM{0:D3}' -f $_); PollsNeeded = 2 } })
+    $scaleEvents = New-Object System.Collections.Generic.List[string]
+    $script:scaleClock = [datetime]::Parse('2026-09-13T00:00:00Z').ToUniversalTime()
+    $script:scaleStartSeconds = 6
+    $script:scaleStarted = @{}
+
+    $scaleResults = @(Invoke-InProcessAgentFleet -Items $scaleItems -MaxInFlight 100 -PollSeconds 15 -ItemTimeoutSeconds 1800 `
+        -StartScript {
+            param($Item)
+            # A start takes real time on the wire, and it finishes before the next thing happens.
+            $script:scaleClock = $script:scaleClock.AddSeconds($script:scaleStartSeconds)
+            $vmName = [string]$Item.VMName
+            if ($script:scaleStarted.ContainsKey($vmName)) { throw ('VM {0} was started twice' -f $vmName) }
+            $script:scaleStarted[$vmName] = $true
+            $scaleEvents.Add('start:' + $vmName)
+            return [pscustomobject]@{ VMName = $vmName; Remaining = [int]$Item.PollsNeeded }
+        } `
+        -PollScript {
+            param($Handle)
+            $script:scaleClock = $script:scaleClock.AddSeconds(1)
+            $scaleEvents.Add('poll:' + $Handle.VMName)
+            $Handle.Remaining--
+            return ($Handle.Remaining -le 0)
+        } `
+        -CompleteScript { param($Handle) return [pscustomobject]@{ Completed = $true; VMName = $Handle.VMName } } `
+        -SleepScript { param([int]$Seconds) $script:scaleClock = $script:scaleClock.AddSeconds($Seconds) } `
+        -NowScript { return $script:scaleClock })
+
+    Assert-Equal -Actual $scaleResults.Count -Expected 100 -Message 'every VM in a 100-VM fleet produces a result'
+    Assert-Equal -Actual (@($scaleResults | Where-Object { $_.Error }).Count) -Expected 0 -Message 'a 100-VM fleet with healthy guests reports no error'
+    Assert-Equal -Actual (@($scaleEvents | Where-Object { $_ -like 'start:*' }).Count) -Expected 100 -Message 'each of the 100 VMs is started exactly once'
+
+    $scaleStarts = @($scaleEvents | Where-Object { $_ -like 'start:*' })
+    $lastStartIndex = $scaleEvents.LastIndexOf($scaleStarts[$scaleStarts.Count - 1])
+    $firstPollIndex = $scaleEvents.IndexOf(($scaleEvents | Where-Object { $_ -like 'poll:*' } | Select-Object -First 1))
+    Assert-Equal -Actual ($firstPollIndex -lt $lastStartIndex) -Expected $true -Message 'polling begins before the last VM is started'
+    # And not merely "before the last": immediately after the first start completes.
+    Assert-Equal -Actual $firstPollIndex -Expected 1 -Message 'the first poll happens as soon as the first start has finished'
+
+    # No free slot is ever spent asleep while targets are still waiting: the queue is what decides
+    # how long the whole phase takes.
+    $scaleSleeps = 0
+    $scaleSleepEvents = New-Object System.Collections.Generic.List[string]
+    $script:scaleClock = [datetime]::Parse('2026-09-13T00:00:00Z').ToUniversalTime()
+    $script:scaleStarted = @{}
+    $null = @(Invoke-InProcessAgentFleet -Items $scaleItems -MaxInFlight 100 -PollSeconds 15 -ItemTimeoutSeconds 1800 `
+        -StartScript {
+            param($Item)
+            $script:scaleClock = $script:scaleClock.AddSeconds(6)
+            $scaleSleepEvents.Add('start')
+            return [pscustomobject]@{ VMName = [string]$Item.VMName; Remaining = 1 }
+        } `
+        -PollScript { param($Handle) $script:scaleClock = $script:scaleClock.AddSeconds(1); $Handle.Remaining--; return ($Handle.Remaining -le 0) } `
+        -CompleteScript { param($Handle) return [pscustomobject]@{ Completed = $true } } `
+        -SleepScript { param([int]$Seconds) $script:scaleSleeps++; $scaleSleepEvents.Add('sleep'); $script:scaleClock = $script:scaleClock.AddSeconds($Seconds) } `
+        -NowScript { return $script:scaleClock })
+    $firstSleepIndex = $scaleSleepEvents.IndexOf('sleep')
+    if ($firstSleepIndex -ge 0) {
+        Assert-Equal -Actual (@($scaleSleepEvents[0..$firstSleepIndex] | Where-Object { $_ -eq 'start' }).Count) -Expected 100 -Message 'no poll interval is spent idle while targets are still waiting to start'
+    }
+
+    # The clock is read per item, not once per wave. With several guests in flight and a poll that
+    # costs real time, a single reading taken at the top of the wave is already minutes old by the
+    # time the last entry is examined - so a VM whose budget the earlier polls consumed is judged
+    # as if no time had passed, and its timeout is deferred by a whole wave.
+    $freshEvents = New-Object System.Collections.Generic.List[string]
+    $script:freshClock = [datetime]::Parse('2026-09-13T00:00:00Z').ToUniversalTime()
+    $script:freshPollSeconds = 0
+    $freshItems = @(1..3 | ForEach-Object { [pscustomobject]@{ Sequence = $_; VMName = ('FRESH{0}' -f $_) } })
+    $null = @(Invoke-InProcessAgentFleet -Items $freshItems -MaxInFlight 3 -PollSeconds 5 -ItemTimeoutSeconds 90 `
+        -StartScript {
+            param($Item)
+            $freshEvents.Add('start:' + $Item.VMName)
+            # Once every guest is running, each poll starts costing 60 seconds on the wire.
+            if (@($freshEvents | Where-Object { $_ -like 'start:*' }).Count -ge 3) { $script:freshPollSeconds = 60 }
+            return [pscustomobject]@{ VMName = [string]$Item.VMName; Polls = 0 }
+        } `
+        -PollScript {
+            param($Handle)
+            $script:freshClock = $script:freshClock.AddSeconds($script:freshPollSeconds)
+            $freshEvents.Add('poll:' + $Handle.VMName)
+            $Handle.Polls++
+            # Never finishes on its own: the deadline is the only thing that ends this fleet.
+            return $false
+        } `
+        -CompleteScript { param($Handle) $freshEvents.Add('collect:' + $Handle.VMName); return [pscustomobject]@{ Completed = $false; VMName = $Handle.VMName } } `
+        -SleepScript { param([int]$Seconds) $freshEvents.Add('sleep'); $script:freshClock = $script:freshClock.AddSeconds($Seconds) } `
+        -NowScript { return $script:freshClock })
+
+    # The first wave where polls cost 60s begins right after the third start. Two polls into it,
+    # 120 seconds have gone by and the third guest is past its 90-second budget - so that wave has
+    # to end it. A stale clock reading would have let all three poll again and deferred every
+    # timeout to the following wave.
+    $thirdStartIndex = $freshEvents.IndexOf('start:FRESH3')
+    $firstSleepAfterStarts = $freshEvents.IndexOf('sleep')
+    Assert-Equal -Actual ($thirdStartIndex -ge 0 -and $firstSleepAfterStarts -gt $thirdStartIndex) -Expected $true -Message 'the slow wave is identifiable in the event trace'
+    if ($thirdStartIndex -ge 0 -and $firstSleepAfterStarts -gt $thirdStartIndex) {
+        $firstSlowWave = @($freshEvents[($thirdStartIndex + 1)..($firstSleepAfterStarts - 1)])
+        Assert-Equal -Actual (@($firstSlowWave | Where-Object { $_ -like 'poll:*' }).Count) -Expected 2 -Message 'a per-item clock stops polling the wave once a budget has been consumed by the earlier polls'
+        Assert-Equal -Actual (@($firstSlowWave | Where-Object { $_ -eq 'collect:FRESH3' }).Count) -Expected 1 -Message 'the VM whose budget the earlier polls consumed is timed out in that same wave'
+    }
+}
 
 # One guest throwing must become that VM's error, not the end of the phase.
 $throwingResults = @(Invoke-InProcessAgentFleet -Items $fleetItems -MaxInFlight 3 -PollSeconds 1 -ItemTimeoutSeconds 60 `

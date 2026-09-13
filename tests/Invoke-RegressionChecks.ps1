@@ -126,7 +126,7 @@ $roundLoop = $ast.Find({ param($n) $n -is [System.Management.Automation.Language
     $hasExplicitSelectedUpdateKeys = $false; $SkipConfirmation = $false; $PromptProvider = $null
     $managers = $null; $guestCredentialMap = @{}; $resolvedVIServers = @('vc.regression.invalid'); $viServerScope = @('vc.regression.invalid'); $viserverCredentialMap = @{}
     $IgnoreVCenterCertificate = $false; $guestOpsLibPath = ''; $curlPath = ''; $AgentPath = ''; $identityHelperPath = ''; $workspaceScriptPath = ''; $runGuardScriptPath = ''; $rebootRequestScriptPath = ''
-    $GuestWorkingDirectory = ''; $TimeoutMinutes = 1; $RebootTimeoutMinutes = 1; $PollSeconds = 1; $ThrottleLimit = 1
+    $GuestWorkingDirectory = ''; $TimeoutMinutes = 1; $DiscoveryTimeoutMinutes = 1; $RebootTimeoutMinutes = 1; $PollSeconds = 1; $ThrottleLimit = 1
     $resolvedRebootBatchSize = 1; $MaxUpdates = 1
     . ([scriptblock]::Create($roundLoop.Extent.Text))
     Assert-Equal $finalStateMap['vm01'].state 'GreenByOperatorChoice' 'deselecting all updates refreshes the final state without another discovery'
@@ -165,7 +165,7 @@ foreach ($planOnlyCase in @($false, $true)) {
         $hasExplicitSelectedUpdateKeys = $false; $SkipConfirmation = $true; $PromptProvider = $null
         $managers = $null; $guestCredentialMap = @{}; $resolvedVIServers = @('vc.regression.invalid'); $viServerScope = @('vc.regression.invalid'); $viserverCredentialMap = @{}
         $IgnoreVCenterCertificate = $false; $guestOpsLibPath = ''; $curlPath = ''; $AgentPath = ''; $identityHelperPath = ''; $workspaceScriptPath = ''; $runGuardScriptPath = ''; $rebootRequestScriptPath = ''
-        $GuestWorkingDirectory = ''; $TimeoutMinutes = 1; $RebootTimeoutMinutes = 1; $PollSeconds = 1; $ThrottleLimit = 1
+        $GuestWorkingDirectory = ''; $TimeoutMinutes = 1; $DiscoveryTimeoutMinutes = 1; $RebootTimeoutMinutes = 1; $PollSeconds = 1; $ThrottleLimit = 1
         $resolvedRebootBatchSize = 1; $MaxUpdates = 1
         . ([scriptblock]::Create($roundLoop.Extent.Text))
 

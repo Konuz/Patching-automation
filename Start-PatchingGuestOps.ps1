@@ -19,8 +19,11 @@ param(
     [int]$RebootBatchSize,
     [ValidateRange(1, 2147483647)]
     [int]$MaxPatchRounds,
+    [ValidateRange(1, 35791394)]
     [int]$TimeoutMinutes = 180,
-    [ValidateRange(1, 2147483647)]
+    [ValidateRange(1, 35791394)]
+    [int]$DiscoveryTimeoutMinutes = 30,
+    [ValidateRange(1, 35791394)]
     [int]$RebootTimeoutMinutes = 30,
     [ValidateRange(1, 2147483647)]
     [int]$PollSeconds = 15,
@@ -157,6 +160,7 @@ $orchestratorParams = @{
     LocalOutputDirectory = $LocalOutputDirectory
     MaxUpdates = $MaxUpdates
     TimeoutMinutes = $TimeoutMinutes
+    DiscoveryTimeoutMinutes = $DiscoveryTimeoutMinutes
     RebootTimeoutMinutes = $RebootTimeoutMinutes
     PollSeconds = $PollSeconds
 }

@@ -238,6 +238,8 @@ Krok po kroku:
 | `-ThrottleLimit <n>` | Ile VM przechodzi jednocześnie przez discovery i apply (domyślnie: wszystkie z listy celów). |
 | `-RebootBatchSize <n>` | Ile VM restartuje się w jednej paczce (gdy pominiesz — skrypt zapyta, Enter = 1). |
 | `-MaxPatchRounds <n>` | Limit rund instalacji (domyślnie 3). |
+| `-TimeoutMinutes <n>` | Budżet agenta w fazie **instalacji** (domyślnie 180 minut). |
+| `-DiscoveryTimeoutMinutes <n>` | Budżet agenta w fazie **wykrywania** (domyślnie 30 minut). |
 | `-RebootTimeoutMinutes <n>` | Maksymalny czas potwierdzania każdej paczki rebootu (domyślnie 30 minut). |
 | `-PollSeconds <n>` | Odstęp odpytywania procesów gościa w fazach discovery i apply oraz odczytów boot time podczas oczekiwania na reboot (domyślnie 15). |
 | `-SkipConfirmation` | Pomiń pytanie o plan i zakończ po rundzie 1 zamiast pytać `CONTINUE`/`FINISH` (**nie** pomija promptu o restart ani o rozmiar paczki). |
@@ -252,6 +254,25 @@ Pełna lista parametrów znajduje się w nagłówku `Start-PatchingGuestOps.ps1`
 ---
 
 ## Jak wybierane są aktualizacje
+
+**Limity czasu: discovery i instalacja są osobne.** `-TimeoutMinutes` (domyślnie 180) dotyczy
+**wyłącznie instalacji** — instalacja WUA rzeczywiście może zająć godziny. Wykrywanie ma własny
+`-DiscoveryTimeoutMinutes` (domyślnie 30), bo wyszukiwanie WUA trwa minuty; wcześniej ten sam limit
+180 minut oznaczał, że jeden gość, który przestał odpowiadać w trakcie wyszukiwania, blokował całą
+fazę na trzy godziny. Oba parametry przyjmują `1..35791394` minut (największa wartość, która po
+przeliczeniu na sekundy nadal mieści się w Int32). GUI korzysta z domyślnych wartości.
+
+**To nie jest twarda gwarancja czasu ściennego.** Pojedyncze wywołanie SOAP nie da się przerwać w
+trakcie, a budżet jest sprawdzany między krokami GuestOps. Faktyczna granica to „budżet agenta plus
+jedno trwające wywołanie plus jedno ograniczone zebranie artefaktów". Zebranie artefaktów po
+przekroczeniu limitu ma własny, osobny budżet transferu — wcześniej limit agenta był po cichu
+wydłużany o 300 sekund.
+
+**Starty i odpytywanie przeplatają się.** W jednej iteracji pętli startuje jedna maszyna, po czym
+narzędzie odpytuje wszystkie już uruchomione. Wcześniej najpierw startowała cała kolejka, więc przy
+100 maszynach pierwszy gość mógł pracować bez nadzoru kilkanaście minut — a nawet zakończyć pracę i
+zniknąć z krótkotrwałej listy procesów vSphere. Wolne miejsce w limicie `-ThrottleLimit` nie jest
+marnowane na oczekiwanie, dopóki są maszyny czekające na start.
 
 **Dryf zatwierdzonego wyboru.** WUA zmienia rewizje pakietów między planem a instalacją, więc
 zatwierdzony klucz `UpdateID|RevisionNumber` może już nie występować w wyniku wyszukiwania.

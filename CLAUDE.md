@@ -130,6 +130,30 @@ flight and **defaults to the whole target list**; it costs GuestOps calls rather
 PowerShell host plus a PowerCLI import per VM, which is what capped the old `Start-Job` model at a
 handful of machines. `Start-Job` now survives only in reboot initiation.
 
+**Starts and polls interleave: one start per loop iteration, then every guest already running.**
+Draining the queue first looks cheaper — `StartProgramInGuest` returns without waiting — but a
+start is still several SOAP round trips plus three file transfers, so at fleet scale the first
+guest could be minutes into its work, or finished and gone from vSphere's short-lived process
+list, before anything looked at it. The loop also does not sleep while a slot is free and targets
+are still waiting: a poll interval spent idle is one the next guest was not started in.
+
+**The clock is read per item, not once per wave.** A single reading taken at the top is already
+minutes old by the time a long wave of polls reaches the last entry, so a guest whose budget the
+earlier polls consumed would be judged as if no time had passed and its timeout deferred by a
+whole wave.
+
+**Discovery and apply have separate budgets.** `-TimeoutMinutes` (180) is the *apply* agent budget:
+a WUA install can genuinely take hours. `-DiscoveryTimeoutMinutes` (30) bounds a WUA search, which
+takes minutes — the same 180 held a whole discovery phase for three hours when one guest stopped
+answering. Both are validated `1..35791394`, the largest value that still fits Int32 once converted
+to seconds. The GUI passes neither and uses the defaults.
+
+The item timeout is now exactly the agent budget: the old `+300` silently extended it. The
+collection that follows a timeout is bounded separately, by the transfer deadline already on the
+cycle handle. **Neither is a hard wall-clock guarantee** — a single SOAP call cannot be cancelled
+mid-flight, and the budget is only checked between GuestOps steps — so the real bound is "agent
+budget, plus one in-progress call, plus one bounded collection".
+
 `Invoke-InProcessAgentFleet` (`OrchestratorRuntime.ps1`) is the coordinator and takes injected
 start/poll/complete scriptblocks, so it is tested offline. Three consequences are load-bearing:
 

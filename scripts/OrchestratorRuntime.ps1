@@ -225,10 +225,13 @@ function Invoke-InProcessAgentFleet {
     }
 
     while ($pending.Count -gt 0 -or $inFlight.Count -gt 0) {
-        # Starts are sequential but return immediately: StartProgramInGuest hands back a
-        # process id without waiting, so with MaxInFlight at the target count every guest
-        # is working before the first poll round begins.
-        while ($pending.Count -gt 0 -and $inFlight.Count -lt $MaxInFlight) {
+        # ONE start per iteration, then straight on to the guests that are already running.
+        # Draining the whole queue first looks cheaper - StartProgramInGuest returns a process id
+        # without waiting - but each start is still several SOAP round trips plus three file
+        # transfers, so at fleet scale the first guest can be minutes into its work, or finished
+        # and gone from vSphere's process list, before anything looks at it. Interleaving keeps
+        # the first poll close behind the first start whatever MaxInFlight is.
+        if ($pending.Count -gt 0 -and $inFlight.Count -lt $MaxInFlight) {
             $item = $pending.Dequeue()
             try {
                 $handle = & $StartScript $item
@@ -248,9 +251,12 @@ function Invoke-InProcessAgentFleet {
             }
         }
 
-        $now = & $NowScript
         $kept = @()
         foreach ($entry in @($inFlight)) {
+            # The clock is read per item, not once for the whole wave. A single reading taken at
+            # the top would be minutes old by the time a long wave of polls reaches the last
+            # entry, so a VM would be judged against a deadline that had already passed.
+            $now = & $NowScript
             if (($now - $entry.StartedAt).TotalSeconds -ge $ItemTimeoutSeconds) {
                 # Harvest anyway. status.json is the primary result (see CLAUDE.md), and the
                 # job-based path this replaces always downloaded the artifacts even when the
@@ -320,7 +326,11 @@ function Invoke-InProcessAgentFleet {
         }
 
         $inFlight = @($kept)
-        if ($inFlight.Count -gt 0) {
+        # Sleep only when there is nothing else to do. With free slots and targets still waiting,
+        # a poll interval spent idle is a poll interval the next guest was not started in - and
+        # the queue is what decides how long the whole phase takes.
+        $hasStartableWork = ($pending.Count -gt 0 -and $inFlight.Count -lt $MaxInFlight)
+        if ($inFlight.Count -gt 0 -and -not $hasStartableWork) {
             & $SleepScript $PollSeconds
         }
     }

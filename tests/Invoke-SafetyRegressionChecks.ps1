@@ -814,6 +814,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $rebootRequestScriptPath = 'unused'
         $GuestWorkingDirectory = 'C:\unused'
         $TimeoutMinutes = 1
+        $DiscoveryTimeoutMinutes = 1
         $RebootTimeoutMinutes = 1
         $PollSeconds = 1
         $ThrottleLimit = 1
@@ -1024,6 +1025,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $rebootRequestScriptPath = 'unused'
         $GuestWorkingDirectory = 'C:\unused'
         $TimeoutMinutes = 1
+        $DiscoveryTimeoutMinutes = 1
         $RebootTimeoutMinutes = 1
         $PollSeconds = 1
         $ThrottleLimit = 2
@@ -1872,6 +1874,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         $rebootRequestScriptPath = 'unused'
         $GuestWorkingDirectory = 'C:\unused'
         $TimeoutMinutes = 1
+        $DiscoveryTimeoutMinutes = 1
         $RebootTimeoutMinutes = 1
         $PollSeconds = 1
         $ThrottleLimit = 1
@@ -2044,6 +2047,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         $rebootRequestScriptPath = 'unused'
         $GuestWorkingDirectory = 'C:\unused'
         $TimeoutMinutes = 1
+        $DiscoveryTimeoutMinutes = 1
         $RebootTimeoutMinutes = 1
         $PollSeconds = 1
         $ThrottleLimit = 1

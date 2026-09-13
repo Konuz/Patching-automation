@@ -42,9 +42,18 @@ param(
 
     [switch]$SkipConfirmation,
 
+    # Apply only. A WUA install can genuinely take hours, which is why this is 180 - but the same
+    # budget applied to discovery meant a guest that stopped answering during a search held the
+    # whole phase for three hours before anyone was told.
+    [ValidateRange(1, 35791394)]
     [int]$TimeoutMinutes = 180,
 
-    [ValidateRange(1, 2147483647)]
+    # Discovery is a WUA search: minutes, not hours. Upper bound, like the others, is the largest
+    # value that still fits Int32 once converted to seconds.
+    [ValidateRange(1, 35791394)]
+    [int]$DiscoveryTimeoutMinutes = 30,
+
+    [ValidateRange(1, 35791394)]
     [int]$RebootTimeoutMinutes = 30,
 
     [ValidateRange(1, 2147483647)]
@@ -320,7 +329,7 @@ function Invoke-GuestAgentFleet {
         $readyItems += $item
     }
 
-    $fleetResults = @(Invoke-InProcessAgentFleet -Items $readyItems -MaxInFlight $MaxInFlight -PollSeconds $PollSeconds -ItemTimeoutSeconds ($TimeoutSeconds + 300) `
+    $fleetResults = @(Invoke-InProcessAgentFleet -Items $readyItems -MaxInFlight $MaxInFlight -PollSeconds $PollSeconds -ItemTimeoutSeconds $TimeoutSeconds `
         -StartScript {
             param($Item)
             if (-not $credentialRecoveryEnabled) {
@@ -1892,7 +1901,7 @@ try {
         New-Item -ItemType Directory -Force -Path $roundOutputDirectory | Out-Null
 
         Write-Step -Message ('Patch round {0} over {1} VM(s).' -f $roundNumber, @($roundTargetVMNames).Count)
-        $discoveryRecords = Invoke-DiscoveryPhase -TargetVMNames $roundTargetVMNames -VIServerScope $viServerScope -Managers $managers -GuestCredentialMap $guestCredentialMap -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -WorkspaceScriptPath $workspaceScriptPath -RunGuardScriptPath $runGuardScriptPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -TimeoutSeconds ($TimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -MaxInFlight $ThrottleLimit -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive
+        $discoveryRecords = Invoke-DiscoveryPhase -TargetVMNames $roundTargetVMNames -VIServerScope $viServerScope -Managers $managers -GuestCredentialMap $guestCredentialMap -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -WorkspaceScriptPath $workspaceScriptPath -RunGuardScriptPath $runGuardScriptPath -GuestWorkingDirectory $GuestWorkingDirectory -MaxUpdates $MaxUpdates -TimeoutSeconds ($DiscoveryTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -MaxInFlight $ThrottleLimit -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive
         $failedDiscoveryRecords = @($discoveryRecords | Where-Object { @($_.errors).Count -gt 0 })
 
         # A fresh discovery is the only thing that can settle an approved update WUA stopped
