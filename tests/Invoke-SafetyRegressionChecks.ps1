@@ -1828,6 +1828,183 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
     }
 }
 
+# F7: a VM with no applicable updates but a pending reboot. This is the case the audit found
+# reporting a green fleet without ever looking again: the VM restarts, the round loop never picks
+# it up because its apply action was NoSelectedUpdates, and the verdict from the discovery taken
+# BEFORE the restart stands. Everything except the guest work runs through production code -
+# the round loop, the reboot-target selection, the state map and the final exit code.
+& {
+    $f7Directory = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-f7-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $f7Directory | Out-Null
+
+    $f7RoundLoop = $orchestratorAst.Find({ param($node)
+        $node -is [System.Management.Automation.Language.WhileStatementAst] -and $node.Extent.Text.Contains('$roundNumber++')
+    }, $true)
+    $f7RoundFinalization = $orchestratorAst.Find({ param($node)
+        $node -is [System.Management.Automation.Language.IfStatementAst] -and $node.Extent.Text.Contains('Write-PatchRunSummary -RunOutputDirectory')
+    }, $true)
+
+    $f7Role = [pscustomobject]@{ failoverCluster = $false }
+    $f7SecurityId = '0fa1201d-4330-4fa8-8ae9-b877473b6441'
+    $f7Update = [pscustomobject]@{
+        updateId = '77777777-7777-7777-7777-777777777777'; revisionNumber = 1; title = 'Security Update'
+        kbArticleIds = @('5031250'); categories = @('Security Updates'); categoryIds = @($f7SecurityId)
+        browseOnly = $false; msrcSeverity = 'Critical'; updateType = 'Software'
+    }
+
+    $script:f7DiscoveryCalls = 0
+    $script:f7DiscoveryTargets = @()
+    $script:f7RebootApproved = $true
+    $script:f7RebootConfirmed = $true
+    $script:f7RoundTwoUpdates = @()
+
+    function Invoke-DiscoveryPhase {
+        param($TargetVMNames, $VIServerScope, $Managers, $GuestCredentialMap, $CurlPath, $AgentPath, $IdentityHelperPath, $WorkspaceScriptPath, $RunGuardScriptPath, $GuestWorkingDirectory, $MaxUpdates, $TimeoutSeconds, $PollSeconds, $CycleOutputDirectory, $MaxInFlight, $CredentialContext, $CredentialDecisionScript, $CredentialValidatedScript, $CredentialInteractive)
+        $script:f7DiscoveryCalls++
+        $script:f7DiscoveryTargets += ,@($TargetVMNames)
+        if ($script:f7DiscoveryCalls -eq 1) {
+            # Nothing to install, but the guest already carries a pending reboot.
+            return @([pscustomobject]@{ vmName = 'VM-reboot'; computerName = 'VM-reboot'; outcome = 'SearchOnly'; errors = @(); roleFlags = $f7Role; pendingRebootBefore = [pscustomobject]@{ isPending = $true }; updates = @() })
+        }
+        return @([pscustomobject]@{ vmName = 'VM-reboot'; computerName = 'VM-reboot'; outcome = 'SearchOnly'; errors = @(); roleFlags = $f7Role; pendingRebootBefore = [pscustomobject]@{ isPending = $false }; updates = @($script:f7RoundTwoUpdates) })
+    }
+    function Read-UpdateGroupSelection { param($UpdateGroups, $PromptProvider) return [pscustomobject]@{ Aborted = $false; Keys = @(@($UpdateGroups) | ForEach-Object { [string]$_.identityKey }) } }
+    function Confirm-PatchPlan { param([switch]$SkipConfirmation) $true }
+    function Read-ContinuePatchingDecision { param($CompletionStates, $Round) return 'CONTINUE' }
+    function Write-PatchRoundVerification { param($CompletionStates, $Round) }
+    function Write-PatchRunSummary { param($RunOutputDirectory, $RoundSummaries, $FinalStateMap) }
+    function Show-UpdateGroups { param($UpdateGroups) }
+    function Show-PatchPlan { param($PatchPlanRecords) }
+    function Write-PatchingSummary { param($ApplyResults) }
+    function Write-FinalReport { param($PatchPlanRecords, $ApplyResults, $CycleOutputDirectory, $RebootTargets) }
+    function Write-RebootActionArtifacts { param($CycleOutputDirectory, $RebootActions) }
+    function Confirm-GuestReboot { param($RebootTargets) return $script:f7RebootApproved }
+    function Read-RebootBatchSize { param($TargetCount) return 1 }
+
+    # The apply phase is the only stubbed production function here; its result shape is the real
+    # one, built by the production constructor.
+    function Invoke-ApplyPhase {
+        param($PatchPlanRecords, $VIServerScope, $Managers, $GuestCredentialMap, $CurlPath, $AgentPath, $IdentityHelperPath, $WorkspaceScriptPath, $RunGuardScriptPath, $GuestWorkingDirectory, $TimeoutSeconds, $PollSeconds, $CycleOutputDirectory, $MaxInFlight, $CredentialContext, $CredentialDecisionScript, $CredentialValidatedScript, $CredentialInteractive)
+        $results = @()
+        foreach ($record in @($PatchPlanRecords)) {
+            $selectedCount = @(Get-RuntimePropertyValue -InputObject $record -Name 'selectedUpdates' -DefaultValue @()).Count
+            if ($selectedCount -eq 0) {
+                $results += New-ApplyResultRecord -VMName ([string]$record.vmName) -Action 'NoSelectedUpdates' -Outcome 'NoSelectedUpdates' -Reason 'No selected updates apply to this VM.' -AgentCompletionConfirmed $true -RebootRequired $false
+            }
+            else {
+                $results += New-ApplyResultRecord -VMName ([string]$record.vmName) -Outcome 'InstallSucceeded' -AgentCompletionConfirmed $true -RebootRequired $false
+            }
+        }
+        return @($results)
+    }
+    function Invoke-GuestRebootPhase {
+        param($RebootTargets, $GuestCredentialMap, $VIServers, $VIServerScope, $VIServerCredentialMap, [switch]$IgnoreVCenterCertificate, $GuestOpsLibPath, $CurlPath, $WorkspaceScriptPath, $RunGuardScriptPath, $RebootRequestScriptPath, $GuestWorkingDirectory, $RebootTimeoutSeconds, $PollSeconds, $RebootBatchSize, $BootTimeHelperPath, $CredentialContext, $CredentialDecisionScript, $CredentialValidatedScript, $CredentialInteractive)
+        $records = @()
+        foreach ($target in @($RebootTargets)) {
+            $records += New-RebootActionRecord -VMName ([string]$target.vmName) -Action 'Initiated' -ValidationStatus $(if ($script:f7RebootConfirmed) { 'Confirmed' } else { 'Timeout' }) -RebootReason ([string]$target.rebootReason)
+        }
+        return @($records)
+    }
+
+    $f7Invoke = {
+        param([bool]$RebootApproved, [bool]$RebootConfirmed, $RoundTwoUpdates)
+        $script:f7DiscoveryCalls = 0
+        $script:f7DiscoveryTargets = @()
+        $script:f7RebootApproved = $RebootApproved
+        $script:f7RebootConfirmed = $RebootConfirmed
+        $script:f7RoundTwoUpdates = @($RoundTwoUpdates)
+
+        $roundNumber = 0
+        $targetVMNames = @('VM-reboot')
+        $roundTargetVMNames = @($targetVMNames)
+        $roundSummaries = @()
+        $finalStateMap = @{}
+        $deselectedUpdateKeys = @()
+        $stoppedByRoundCap = $false
+        $sawApplyFailure = $false
+        $scriptExitCode = 0
+        $runOutputDirectory = $f7Directory
+        $MaxPatchRounds = 2
+        $SearchOnly = $false
+        $PlanOnly = $false
+        $hasExplicitSelectedUpdateKeys = $false
+        $SelectedUpdateKeys = @()
+        $SkipConfirmation = $false
+        $PromptProvider = $null
+        $managers = $null
+        $guestCredentialMap = @{}
+        $guestCredentialContext = $null
+        $guestCredentialDecisionScript = $null
+        $guestCredentialValidatedScript = $null
+        $guestCredentialInteractive = $false
+        $resolvedVIServers = @('vc.synthetic.invalid')
+        $viServerScope = @('vc.synthetic.invalid')
+        $viserverCredentialMap = @{}
+        $IgnoreVCenterCertificate = $false
+        $guestOpsLibPath = 'unused'
+        $curlPath = 'unused'
+        $AgentPath = 'unused'
+        $identityHelperPath = 'unused'
+        $workspaceScriptPath = 'unused'
+        $runGuardScriptPath = 'unused'
+        $rebootRequestScriptPath = 'unused'
+        $GuestWorkingDirectory = 'C:\unused'
+        $TimeoutMinutes = 1
+        $RebootTimeoutMinutes = 1
+        $PollSeconds = 1
+        $ThrottleLimit = 1
+        $resolvedRebootBatchSize = 1
+        $MaxUpdates = 1
+
+        . ([scriptblock]::Create(($f7RoundLoop.Extent.Text + "`n" + $f7RoundFinalization.Extent.Text)))
+
+        return [pscustomobject]@{
+            ExitCode = $scriptExitCode
+            State = [string]$finalStateMap['VM-reboot'].state
+            DiscoveryCalls = $script:f7DiscoveryCalls
+            DiscoveryTargets = @($script:f7DiscoveryTargets)
+        }
+    }
+
+    try {
+        # 1. Reboot only, confirmed, nothing left afterwards: a second discovery has to run before
+        #    the VM may be called green.
+        $confirmed = & $f7Invoke $true $true @()
+        Assert-Equal $confirmed.DiscoveryCalls 2 'F7: a confirmed restart is verified by a fresh discovery, not by the boot time alone'
+        Assert-Equal (@($confirmed.DiscoveryTargets[1]) -join ',') 'VM-reboot' 'F7: the rebooted VM is the target of that discovery even though it installed nothing'
+        Assert-Equal $confirmed.State 'Green' 'F7: only the post-reboot discovery may call the VM green'
+        Assert-Equal $confirmed.ExitCode 0 'F7: a verified reboot-only round can finish successfully'
+
+        # 2. The post-reboot discovery finds new patches: the VM is pending again and gets another
+        #    round rather than being reported as finished.
+        $stillPending = & $f7Invoke $true $true @($f7Update)
+        Assert-Equal $stillPending.State 'Pending' 'F7: updates found after the restart keep the VM pending'
+        Assert-Equal $stillPending.ExitCode 1 'F7: a VM still pending at the end is not a success'
+
+        # 3. The operator refuses the restart the VM needs.
+        $refused = & $f7Invoke $false $true @()
+        Assert-Equal $refused.State 'PendingReboot' 'F7: a refused required restart is PendingReboot, not Failed'
+        Assert-Equal $refused.ExitCode 1 'F7: a refused required restart cannot exit 0'
+        Assert-Equal $refused.DiscoveryCalls 1 'F7: a VM that was never restarted is not re-discovered'
+
+        # 4. The restart was sent but never confirmed: no reliable boot time, so no next discovery
+        #    and no verdict claiming the machine is finished.
+        $unconfirmed = & $f7Invoke $true $false @()
+        Assert-Equal $unconfirmed.State 'PendingReboot' 'F7: an unconfirmed restart leaves the VM pending a reboot'
+        Assert-Equal $unconfirmed.ExitCode 1 'F7: an unconfirmed restart cannot exit 0'
+        Assert-Equal $unconfirmed.DiscoveryCalls 1 'F7: a guest with no reliable boot time is not re-discovered'
+    }
+    finally {
+        foreach ($stubbed in @('Invoke-DiscoveryPhase', 'Read-UpdateGroupSelection', 'Confirm-PatchPlan', 'Read-ContinuePatchingDecision',
+                'Write-PatchRoundVerification', 'Write-PatchRunSummary', 'Show-UpdateGroups', 'Show-PatchPlan', 'Write-PatchingSummary',
+                'Write-FinalReport', 'Write-RebootActionArtifacts', 'Confirm-GuestReboot', 'Read-RebootBatchSize', 'Invoke-ApplyPhase',
+                'Invoke-GuestRebootPhase')) {
+            Remove-Item ('Function:\' + $stubbed) -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $f7Directory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 if ($failures.Count -gt 0) {
     foreach ($failure in $failures) { Write-Host ('FAIL: ' + $failure) }
     exit 1

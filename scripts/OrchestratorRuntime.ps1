@@ -758,9 +758,10 @@ function Test-RebootActionsSuccessful {
     foreach ($record in $records) {
         $action = [string]$record.action
         $validation = [string]$record.validationStatus
-        if ($action -eq 'SkippedByOperator') {
-            continue
-        }
+        # An operator skip used to count as success here. It cannot: every record in this list is
+        # a restart the VM was found to REQUIRE, so refusing it leaves updates half-applied and
+        # the run has to say so. The state map calls that VM PendingReboot rather than Failed -
+        # the install may well have worked - but either way the run does not exit 0.
         if ($action -eq 'Initiated' -and $validation -eq 'Confirmed') {
             continue
         }
@@ -931,6 +932,137 @@ function Test-PatchRunAllGreen {
     return $true
 }
 
+function Get-ConfirmedRebootVMNames {
+    param($RebootActions)
+
+    # Only a restart this tool watched come back counts. An unverified or forced CONTINUE, a
+    # skipped reboot and a failed initiation all leave the guest in a state nobody measured.
+    $names = @()
+    foreach ($record in @($RebootActions)) {
+        if ([string](Get-RuntimePropertyValue -InputObject $record -Name 'action') -ne 'Initiated') {
+            continue
+        }
+        if ([string](Get-RuntimePropertyValue -InputObject $record -Name 'validationStatus') -ne 'Confirmed') {
+            continue
+        }
+        $vmName = [string](Get-RuntimePropertyValue -InputObject $record -Name 'vmName')
+        if (-not [string]::IsNullOrWhiteSpace($vmName)) {
+            $names += $vmName
+        }
+    }
+
+    return @($names)
+}
+
+function Get-NextRoundTargetVMNames {
+    param(
+        $ApplyResults,
+        $RebootActions = @()
+    )
+
+    # A deduplicated union of two different reasons to look again, because either alone loses a
+    # VM. Apply alone misses the machine that had nothing to install but a pending reboot
+    # (action = NoSelectedUpdates): it restarts and then never gets re-discovered, so its state
+    # stays whatever the PRE-reboot discovery said. Reboot alone misses the machine that
+    # installed updates and needed no restart.
+    $names = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+    $conflicted = @{}
+
+    foreach ($result in @($ApplyResults)) {
+        $vmName = [string](Get-RuntimePropertyValue -InputObject $result -Name 'vmName')
+        if ([string]::IsNullOrWhiteSpace($vmName)) {
+            continue
+        }
+
+        # A guest this run was refused on stays refused, whatever else happened to it.
+        if ([bool](Get-RuntimePropertyValue -InputObject $result -Name 'guestRunConflict' -DefaultValue $false)) {
+            $conflicted[$vmName] = $true
+            continue
+        }
+
+        if ((Get-RuntimePropertyValue -InputObject $result -Name 'action') -ne 'Install') {
+            continue
+        }
+
+        if (-not [bool](Get-RuntimePropertyValue -InputObject $result -Name 'agentCompletionConfirmed' -DefaultValue $false)) {
+            continue
+        }
+
+        if (-not $seen.ContainsKey($vmName)) {
+            $seen[$vmName] = $true
+            $names.Add($vmName)
+        }
+    }
+
+    foreach ($vmName in @(Get-ConfirmedRebootVMNames -RebootActions $RebootActions)) {
+        if ($conflicted.ContainsKey($vmName) -or $seen.ContainsKey($vmName)) {
+            continue
+        }
+        $seen[$vmName] = $true
+        $names.Add($vmName)
+    }
+
+    return @($names.ToArray())
+}
+
+function Set-PatchRunPendingRebootStates {
+    param(
+        [hashtable]$StateMap,
+        $RebootTargets,
+        $RebootActions = @()
+    )
+
+    # A VM that needs a restart is not finished, whatever the pre-apply discovery said about its
+    # update list. That discovery was taken BEFORE the reboot, so a Green read off it would be a
+    # verdict about a machine in a different state - and a newer boot time on its own says
+    # nothing about whether updates remain. PendingReboot holds until a fresh discovery decides.
+    #
+    # A confirmed restart is the one case that does not stay here: that VM becomes a target of
+    # the next round, and its real verdict comes from the discovery that round runs.
+    $confirmed = @{}
+    foreach ($vmName in @(Get-ConfirmedRebootVMNames -RebootActions $RebootActions)) {
+        $confirmed[$vmName] = $true
+    }
+
+    $reasonByVm = @{}
+    foreach ($record in @($RebootActions)) {
+        $recordVmName = [string](Get-RuntimePropertyValue -InputObject $record -Name 'vmName')
+        if ([string]::IsNullOrWhiteSpace($recordVmName)) {
+            continue
+        }
+        $action = [string](Get-RuntimePropertyValue -InputObject $record -Name 'action')
+        $validation = [string](Get-RuntimePropertyValue -InputObject $record -Name 'validationStatus')
+        $reasonByVm[$recordVmName] = ('Reboot action {0}, validation {1}.' -f $action, $validation)
+    }
+
+    foreach ($target in @($RebootTargets)) {
+        $vmName = [string](Get-RuntimePropertyValue -InputObject $target -Name 'vmName')
+        if ([string]::IsNullOrWhiteSpace($vmName) -or $confirmed.ContainsKey($vmName)) {
+            continue
+        }
+
+        $reason = 'A restart this VM requires has not been completed and confirmed.'
+        if ($reasonByVm.ContainsKey($vmName)) {
+            $reason = '{0} {1}' -f $reason, $reasonByVm[$vmName]
+        }
+
+        # Deliberately not 'Failed': the installation itself may well have succeeded, and saying
+        # otherwise sends whoever reads the summary looking for an install problem that is not
+        # there. What is outstanding is the restart.
+        $StateMap[$vmName] = [pscustomobject]@{
+            vmName = $vmName
+            state = 'PendingReboot'
+            reason = $reason
+            outcome = if ($null -ne $StateMap -and $StateMap.ContainsKey($vmName)) { Get-RuntimePropertyValue -InputObject $StateMap[$vmName] -Name 'outcome' } else { $null }
+            pendingSelectableCount = 0
+            deselectedSelectableCount = 0
+            needsReviewSelectableCount = 0
+            errors = @()
+        }
+    }
+}
+
 function Test-RebootActionsAllConfirmed {
     param($RebootActions)
 
@@ -1020,8 +1152,14 @@ function Write-PatchRunSummary {
     $green = @($finalStates | Where-Object { [string]$_.state -eq 'Green' })
     $greenByChoice = @($finalStates | Where-Object { [string]$_.state -eq 'GreenByOperatorChoice' })
     $pending = @($finalStates | Where-Object { [string]$_.state -eq 'Pending' })
+    $pendingReboot = @($finalStates | Where-Object { [string]$_.state -eq 'PendingReboot' })
+    $needsReview = @($finalStates | Where-Object { [string]$_.state -eq 'NeedsReview' })
     $failed = @($finalStates | Where-Object { [string]$_.state -eq 'Failed' })
     $excluded = @($finalStates | Where-Object { [string]$_.state -eq 'Excluded' })
+    # A state nobody has taught this summary about would otherwise vanish from it entirely while
+    # still making the run exit 1, leaving the operator with no line to read.
+    $knownSummaryStates = @('Green', 'GreenByOperatorChoice', 'Pending', 'PendingReboot', 'NeedsReview', 'Failed', 'Excluded')
+    $otherStates = @($finalStates | Where-Object { [string]$_.state -notin $knownSummaryStates })
 
     $lines = @()
     $lines += '# Patch run summary'
@@ -1032,8 +1170,13 @@ function Write-PatchRunSummary {
     $lines += ('- VMs up to date: {0}' -f $green.Count)
     $lines += ('- VMs up to date except operator-deselected updates: {0}' -f $greenByChoice.Count)
     $lines += ('- VMs still having selectable updates: {0}' -f $pending.Count)
+    $lines += ('- VMs waiting for a restart they require: {0}' -f $pendingReboot.Count)
+    $lines += ('- VMs with updates that need an operator decision: {0}' -f $needsReview.Count)
     $lines += ('- VMs with failed or unconfirmed patching: {0}' -f $failed.Count)
-    $lines += ('- VMs excluded from patching: {0}' -f $excluded.Count)
+    $lines += ('- VMs excluded from patching (outside the scope of patching, not patched): {0}' -f $excluded.Count)
+    if ($otherStates.Count -gt 0) {
+        $lines += ('- VMs in an unrecognised state: {0}' -f $otherStates.Count)
+    }
     $lines += ''
 
     $lines += '## Rounds'
@@ -1049,8 +1192,11 @@ function Write-PatchRunSummary {
 
     foreach ($section in @(
         [pscustomobject]@{ Title = 'VMs still having selectable updates'; Rows = $pending },
+        [pscustomobject]@{ Title = 'VMs waiting for a restart they require'; Rows = $pendingReboot },
+        [pscustomobject]@{ Title = 'VMs with updates that need an operator decision'; Rows = $needsReview },
         [pscustomobject]@{ Title = 'VMs with failed or unconfirmed patching'; Rows = $failed },
-        [pscustomobject]@{ Title = 'VMs excluded from patching'; Rows = $excluded },
+        [pscustomobject]@{ Title = 'VMs excluded from patching (outside the scope of patching, not patched)'; Rows = $excluded },
+        [pscustomobject]@{ Title = 'VMs in an unrecognised state'; Rows = $otherStates },
         [pscustomobject]@{ Title = 'VMs up to date except operator-deselected updates'; Rows = $greenByChoice },
         [pscustomobject]@{ Title = 'VMs up to date'; Rows = $green }
     )) {

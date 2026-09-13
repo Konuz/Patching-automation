@@ -1512,6 +1512,7 @@ function Invoke-ApplyAndOptionalReboot {
     return [pscustomobject]@{
         ExitCode = $exitCode
         ApplyResults = @($applyResults)
+        RebootTargets = @($rebootTargets)
         RebootActions = @($rebootActions)
         RebootRan = ($rebootTargets.Count -gt 0)
     }
@@ -2054,6 +2055,12 @@ try {
             }
         }
 
+        # A VM that needs a restart is not finished, whatever this round's pre-apply discovery
+        # said about its update list: that discovery describes the machine BEFORE the reboot.
+        # PendingReboot holds until a fresh discovery decides, and a refused or unverified
+        # restart leaves it there - which is exit 1 without claiming the install failed.
+        Set-PatchRunPendingRebootStates -StateMap $finalStateMap -RebootTargets @(Get-RuntimePropertyValue -InputObject $applyOutcome -Name 'RebootTargets' -DefaultValue @()) -RebootActions $applyOutcome.RebootActions
+
         # A machine that was told to restart and has not provably come back must not be
         # re-discovered: the read would either fail or describe a half-booted guest.
         if ($applyOutcome.RebootRan -and -not (Test-RebootActionsAllConfirmed -RebootActions $applyOutcome.RebootActions)) {
@@ -2061,14 +2068,10 @@ try {
             break
         }
 
-        $nextTargets = @($applyResults | Where-Object {
-                (Get-RuntimePropertyValue -InputObject $_ -Name 'action') -eq 'Install' -and
-                [bool](Get-RuntimePropertyValue -InputObject $_ -Name 'agentCompletionConfirmed' -DefaultValue $false) -and
-                # A guest this run was refused on stays refused for the rest of the run. Trying
-                # again in the next round would start a second WUA session on a machine another
-                # run may still be installing on.
-                -not [bool](Get-RuntimePropertyValue -InputObject $_ -Name 'guestRunConflict' -DefaultValue $false)
-            } | ForEach-Object { [string](Get-RuntimePropertyValue -InputObject $_ -Name 'vmName') })
+        # Both reasons to look again, deduplicated. Apply alone would lose the machine that had
+        # nothing to install but a pending reboot: it restarts and is never re-discovered, so the
+        # verdict from before the restart would stand.
+        $nextTargets = @(Get-NextRoundTargetVMNames -ApplyResults $applyResults -RebootActions $applyOutcome.RebootActions)
         if ($nextTargets.Count -eq 0) {
             Write-Step -Message 'No VM was patched in this round; nothing left to verify.'
             break

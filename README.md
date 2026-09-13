@@ -253,6 +253,26 @@ Pełna lista parametrów znajduje się w nagłówku `Start-PatchingGuestOps.ps1`
 
 ## Jak wybierane są aktualizacje
 
+**Stany maszyn na koniec przebiegu.** Kod wyjścia 0 wymaga, aby **każda** maszyna skończyła w
+jednym ze stanów `Green`, `GreenByOperatorChoice` lub `Excluded` (ten ostatni oznacza „poza
+zakresem łatania", nie „załatana"). Sprawdzenie jest listą dozwolonych stanów, nie listą zakazanych
+— każdy nowy stan domyślnie **blokuje** kod 0. Maszyna, której w ogóle nie ma w podsumowaniu, też
+nie jest sukcesem. Stany blokujące:
+
+- `Pending` — zostały aktualizacje, które polityka by zainstalowała,
+- `PendingReboot` — maszyna wymaga restartu, który nie został wykonany i potwierdzony (odmowa
+  operatora, brak potwierdzenia, timeout, błąd zlecenia). Celowo **nie** `Failed`: sama instalacja
+  mogła się udać, a zaległy jest restart,
+- `NeedsReview` — jest pakiet, którego polityka nie potrafi zakwalifikować i nikt nie podjął decyzji,
+- `Failed` — instalacja lub wykrywanie zawiodło, albo gość odmówił przebiegu.
+
+**Potwierdzony restart nie jest dowodem, że maszyna jest załatana.** Nowszy czas rozruchu mówi
+tylko, że system wstał. Dlatego po potwierdzonym restarcie maszyna zawsze trafia do **następnej
+rundy** i wynik nadaje jej świeże wykrywanie — także wtedy, gdy w tej rundzie nie było nic do
+instalacji (`action = NoSelectedUpdates`) i maszyna była restartowana wyłącznie z powodu zaległego
+restartu. Stan z wykrywania wykonanego **przed** restartem nigdy nie jest używany jako wynik po
+restarcie.
+
 Polityka domyślna opiera się **wyłącznie na strukturalnych danych WUA** — identyfikatorach
 klasyfikacji (GUID), `MsrcSeverity`, typie aktualizacji, fladze `BrowseOnly` i numerze KB. Nie
 czyta tytułu ani **nazw** kategorii, bo jedno i drugie jest tłumaczone: dotychczasowa reguła

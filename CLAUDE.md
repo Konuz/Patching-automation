@@ -436,9 +436,27 @@ the verification of round N.
   otherwise resurrect a group that was already refused. A Failover Cluster VM is `Excluded`: never
   green, never a target.
 - **Another round only starts when every rebooted VM confirmed a newer boot time**
-  (`Test-RebootActionsAllConfirmed`, stricter than `Test-RebootActionsSuccessful`, which tolerates
-  an operator skip). Re-discovering a half-booted guest would either fail or describe a state
-  nobody should act on.
+  (`Test-RebootActionsAllConfirmed`). Re-discovering a half-booted guest would either fail or
+  describe a state nobody should act on.
+- **A restart the VM requires and did not get is `PendingReboot`, and the run does not exit 0.**
+  `Set-PatchRunPendingRebootStates` marks every reboot target whose restart was not confirmed —
+  refused by the operator, unverified, forced, timed out or a failed initiation. Deliberately not
+  `Failed`: the installation itself may well have succeeded, and saying otherwise sends whoever
+  reads the summary looking for an install problem that is not there. `Test-RebootActionsSuccessful`
+  no longer tolerates an operator skip either, which is what makes the `-PatchPlanPath` resume path
+  agree with the round loop.
+- **A confirmed restart is verified by a fresh discovery, never by the boot time alone.** A newer
+  boot time says the guest came back; it says nothing about what updates remain. So a confirmed
+  reboot target becomes a target of the next round and that round's discovery assigns its verdict.
+  The pre-apply discovery must never supply it: that discovery describes the machine *before* the
+  restart, and `pendingRebootBefore` from it is not a statement about the state afterwards.
+- **The next round's targets are a deduplicated union**, `Get-NextRoundTargetVMNames`: VMs whose
+  apply completed safely, plus VMs whose restart was confirmed — including `NoSelectedUpdates`
+  ones. Either half alone loses a machine. Apply alone loses the VM that had nothing to install
+  but a pending reboot: it restarts and is never looked at again, so the pre-restart verdict
+  stands, which is exactly how a run could report a green fleet it had never re-checked. Reboot
+  alone loses the VM that installed updates and needed no restart. A `guestRunConflict` VM is in
+  neither half.
 - Round 1 always reaches group selection even when nothing is preselected, so the operator can
   still tick something the default policy skipped.
 - Round ≥ 2 always uses the interactive selection, so anything that cannot answer a prompt must

@@ -660,7 +660,50 @@ $skippedRebootActions = @(New-SkippedRebootActionRecords -RebootTargets $rebootT
 Assert-Equal -Actual $skippedRebootActions.Count -Expected 1 -Message 'skipped reboot action is created for every reboot target'
 Assert-Equal -Actual $skippedRebootActions[0].action -Expected 'SkippedByOperator' -Message 'operator skip action is explicit'
 Assert-Equal -Actual $skippedRebootActions[0].rebootReason -Expected 'Reported after apply' -Message 'skipped reboot action preserves reboot reason'
-Assert-Equal -Actual (Test-RebootActionsSuccessful -RebootActions $skippedRebootActions) -Expected $true -Message 'operator skip is not a reboot failure'
+# Every record in this list is a restart the VM was found to REQUIRE, so refusing it leaves
+# updates half-applied and the run must not exit 0. The state map records that VM as
+# PendingReboot rather than Failed - see the Set-PatchRunPendingRebootStates section below.
+Assert-Equal -Actual (Test-RebootActionsSuccessful -RebootActions $skippedRebootActions) -Expected $false -Message 'a refused required reboot is not a successful run'
+
+# --- what the next round looks at, and what PendingReboot means (task 6) ----------------------
+# Two different reasons to look again, and either alone loses a VM: apply results alone miss the
+# machine that had nothing to install but a pending reboot (action = NoSelectedUpdates), which
+# restarts and would then keep the verdict from the discovery taken BEFORE the restart.
+
+$installedResult = New-ApplyResultRecord -VMName 'VM-installed' -Outcome 'InstallSucceeded' -AgentCompletionConfirmed $true
+$rebootOnlyResult = New-ApplyResultRecord -VMName 'VM-reboot-only' -Action 'NoSelectedUpdates' -Outcome 'NoSelectedUpdates' -AgentCompletionConfirmed $true
+$unconfirmedResult = New-ApplyResultRecord -VMName 'VM-unconfirmed' -Outcome 'Failed' -AgentCompletionConfirmed $false
+$conflictResult = New-ApplyResultRecord -VMName 'VM-conflict' -Outcome 'Failed' -AgentCompletionConfirmed $true -GuestRunConflict $true
+
+$confirmedRebootAction = New-RebootActionRecord -VMName 'VM-reboot-only' -Action 'Initiated' -ValidationStatus 'Confirmed'
+$unverifiedRebootAction = New-RebootActionRecord -VMName 'VM-unverified' -Action 'Initiated' -ValidationStatus 'UnverifiedForced'
+$skippedRebootAction = New-RebootActionRecord -VMName 'VM-skipped' -Action 'SkippedByOperator'
+$conflictRebootAction = New-RebootActionRecord -VMName 'VM-conflict' -Action 'Initiated' -ValidationStatus 'Confirmed'
+
+$nextTargets = @(Get-NextRoundTargetVMNames -ApplyResults @($installedResult, $rebootOnlyResult, $unconfirmedResult) -RebootActions @($confirmedRebootAction, $unverifiedRebootAction, $skippedRebootAction))
+Assert-Equal -Actual ($nextTargets -join ',') -Expected 'VM-installed,VM-reboot-only' -Message 'the next round looks at safely applied VMs and confirmed reboots, once each'
+Assert-Equal -Actual (@(Get-NextRoundTargetVMNames -ApplyResults @($rebootOnlyResult) -RebootActions @($confirmedRebootAction)).Count) -Expected 1 -Message 'a VM that only rebooted is still re-discovered'
+Assert-Equal -Actual (@(Get-NextRoundTargetVMNames -ApplyResults @($rebootOnlyResult) -RebootActions @($unverifiedRebootAction)).Count) -Expected 0 -Message 'a VM with no reliable boot time is not re-discovered'
+Assert-Equal -Actual (@(Get-NextRoundTargetVMNames -ApplyResults @($unconfirmedResult) -RebootActions @()).Count) -Expected 0 -Message 'an unconfirmed agent is not carried into the next round'
+Assert-Equal -Actual (@(Get-NextRoundTargetVMNames -ApplyResults @($conflictResult) -RebootActions @($conflictRebootAction)).Count) -Expected 0 -Message 'a guest run conflict is never re-entered, even with a confirmed reboot record'
+
+# PendingReboot, not Failed: the install may well have succeeded, and saying otherwise sends
+# whoever reads the summary looking for a problem that is not there.
+$rebootTargetsForState = @(
+    [pscustomobject]@{ vmName = 'VM-reboot-only'; rebootRequired = $true; rebootReason = 'Reported after apply' },
+    [pscustomobject]@{ vmName = 'VM-unverified'; rebootRequired = $true; rebootReason = 'Reported after apply' },
+    [pscustomobject]@{ vmName = 'VM-skipped'; rebootRequired = $true; rebootReason = 'Reported after apply' }
+)
+$rebootStateMap = @{
+    'VM-reboot-only' = [pscustomobject]@{ vmName = 'VM-reboot-only'; state = 'Green'; reason = 'No selectable updates remain.' }
+    'VM-unverified' = [pscustomobject]@{ vmName = 'VM-unverified'; state = 'Green'; reason = 'No selectable updates remain.' }
+    'VM-skipped' = [pscustomobject]@{ vmName = 'VM-skipped'; state = 'Green'; reason = 'No selectable updates remain.' }
+}
+Set-PatchRunPendingRebootStates -StateMap $rebootStateMap -RebootTargets $rebootTargetsForState -RebootActions @($confirmedRebootAction, $unverifiedRebootAction, $skippedRebootAction)
+Assert-Equal -Actual $rebootStateMap['VM-unverified'].state -Expected 'PendingReboot' -Message 'an unverified restart leaves the VM pending a reboot'
+Assert-Equal -Actual $rebootStateMap['VM-skipped'].state -Expected 'PendingReboot' -Message 'a refused required restart leaves the VM pending a reboot, not failed'
+Assert-Equal -Actual $rebootStateMap['VM-reboot-only'].state -Expected 'Green' -Message 'a confirmed restart is not marked pending; the next discovery decides'
+Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $rebootStateMap) -Expected $false -Message 'a VM pending a reboot cannot produce exit 0'
 
 $baseTime = [datetime]::Parse('2026-01-01T00:00:00Z').ToUniversalTime()
 $newTime = [datetime]::Parse('2026-01-02T00:00:00Z').ToUniversalTime()
