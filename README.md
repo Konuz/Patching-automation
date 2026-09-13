@@ -388,6 +388,15 @@ ponownie 30 sekund. Rozstrzygnięcie poświadczeń celu poprzedza tę próbę: p
 przerwana obsługa poświadczeń zachowują wynik dla danej VM i nie powodują sprawdzania jej hosta.
 Żądanie `HEAD` dotyczy głównego adresu HTTPS hosta, bez biletu transferowego i plików gościa;
 odpowiedzi HTTP takie jak 401, 403 lub 405 po poprawnym TLS nie oznaczają błędu certyfikatu.
+
+**Konfiguracja curl jest ignorowana.** Każde wywołanie `curl.exe` przechodzi przez jeden
+wrapper, który wymusza `--disable` jako **pierwszy** argument — dla próby HTTPS, wysyłki i
+pobrania. Bez tego curl czyta `%APPDATA%\_curlrc`, `CURL_HOME/.curlrc` lub `~/.curlrc`, więc
+osoba, która utworzyła taki plik na maszynie sterującej, mogłaby wyłączyć weryfikację
+certyfikatu, wstawić proxy albo podmienić magazyn CA dla transferu do ESXi. Kolejność ma
+znaczenie: curl stosuje plik konfiguracyjny przed dalszymi flagami, więc `--disable` podane
+później jest już za późno. Wrapper jest jedynym miejscem, które je dodaje — żadna lista
+argumentów go nie powtarza.
 To kontrola aktualnego punktu końcowego, a nie gwarancja późniejszego transferu: każdy transfer
 nadal niezależnie sprawdza certyfikat, również po zmianie hosta VM.
 

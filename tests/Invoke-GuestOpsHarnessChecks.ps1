@@ -223,6 +223,9 @@ function Get-VMHostNameForTransfer {
     return 'esxi-fake.invalid'
 }
 
+# Kept so one block below can put the real wrapper back and watch what reaches the program.
+$script:productionInvokeCurl = (Get-Item Function:\Invoke-Curl).ScriptBlock
+
 function Invoke-Curl {
     param(
         [string]$CurlPath,
@@ -368,6 +371,42 @@ finally {
     Set-Item Function:\Invoke-Curl -Value $originalInvokeCurl
     Set-Item Function:\Start-GuestAgent -Value $originalStartGuestAgent
     Remove-Item -LiteralPath $failureWorkspace -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# The PUT path, asserted at the program-execution boundary with the real Invoke-Curl. The
+# runtime gate covers the wrapper, the GET path and the endpoint probe the same way; only the
+# upload needs VMware.Vim.GuestFileAttributes, which is why it lives here. curl must ignore
+# %APPDATA%\_curlrc and CURL_HOME/.curlrc, or whoever wrote one could hand this tool
+# --insecure, a proxy or a different CA store for an ESXi transfer.
+$putProbeWorkspace = New-HarnessWorkspace
+$originalPutInvokeCurl = (Get-Item Function:\Invoke-Curl).ScriptBlock
+try {
+    Set-Item Function:\Invoke-Curl -Value $script:productionInvokeCurl
+    $putFakeCurlPath = Join-Path $putProbeWorkspace 'fake-curl.ps1'
+    $putFakeCurlLogPath = Join-Path $putProbeWorkspace 'arguments.txt'
+    $putFakeCurlBody = @'
+$args | Set-Content -LiteralPath '__LOG__' -Encoding UTF8
+exit 0
+'@
+    Set-Content -LiteralPath $putFakeCurlPath -Value ($putFakeCurlBody.Replace('__LOG__', $putFakeCurlLogPath)) -Encoding UTF8
+
+    $script:guestState = @{}
+    New-FakeGuest -VMName 'VM-put-probe'
+    $putSourcePath = Join-Path $putProbeWorkspace 'payload.txt'
+    Set-Content -LiteralPath $putSourcePath -Value 'payload' -Encoding UTF8
+    $putManagers = New-FakeManagers -VMName 'VM-put-probe'
+    Send-GuestFile -FileManager $putManagers.FileManager -VMView (New-FakeVMView -VMName 'VM-put-probe') -GuestAuth $null -HostName 'esxi-fake.invalid' -CurlPath $putFakeCurlPath -LocalPath $putSourcePath -GuestPath 'C:\guest\payload.txt'
+
+    $putArguments = @(Get-Content -LiteralPath $putFakeCurlLogPath)
+    Assert-Equal -Actual $putArguments[0] -Expected '--disable' -Message 'harness: an upload reaches curl with --disable first'
+    Assert-Equal -Actual @($putArguments | Where-Object { $_ -eq '--disable' }).Count -Expected 1 -Message 'harness: an upload passes --disable once'
+    Assert-Equal -Actual ($putArguments -contains '-k') -Expected $false -Message 'harness: an upload never disables TLS verification'
+    Assert-Equal -Actual ($putArguments -contains '--insecure') -Expected $false -Message 'harness: an upload has no alternate insecure flag'
+    Assert-Equal -Actual ($putArguments -contains '--max-time') -Expected $true -Message 'harness: an upload still carries its deadline'
+}
+finally {
+    Set-Item Function:\Invoke-Curl -Value $originalPutInvokeCurl
+    Remove-Item -LiteralPath $putProbeWorkspace -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # The fleet must not reuse a manager obtained from another vCenter client. Extract the

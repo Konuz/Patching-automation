@@ -60,6 +60,18 @@ There is no build step, no linter, and no Pester. `Invoke-StaticChecks.ps1` is a
 
 The hard-won insight (validated empirically, see `spec/spec-patching-guestops.md`) is that **control and data must be split** because .NET Framework on PS 5.1 cannot negotiate the ESXi host's modern TLS:
 
+- **`curl.exe` is always called through `Invoke-Curl`, which forces `--disable` as the first
+  argument.** curl otherwise reads `%APPDATA%\_curlrc`, `CURL_HOME/.curlrc` or `~/.curlrc`, and
+  whoever wrote one could switch off certificate verification, insert a proxy or swap the CA
+  store for an ESXi transfer. Position matters — curl applies the config before the flags that
+  follow — so the wrapper is the single place that adds it and no argument list repeats it.
+  This is asserted where the program is actually executed (a fake curl that records its
+  arguments), not on the argument lists in isolation: `tests/Invoke-RuntimeChecks.ps1` covers
+  the wrapper, the GET path and the endpoint probe, `tests/Invoke-GuestOpsHarnessChecks.ps1`
+  the PUT path (it needs `VMware.Vim.GuestFileAttributes`). The endpoint probe still omits
+  `--fail`, because an HTTP access or method error after a successful handshake is not a trust
+  failure.
+
 - **Control plane** — PS 5.1 → SOAP → vCenter:443 → ESXi → VMware Tools → guest. This works on .NET Framework. Carries `StartProgramInGuest`, `ListProcessesInGuest`, and `InitiateFileTransfer{To,From}Guest` (which only *returns* a transfer URL).
 - **Data plane** — the actual file bytes go to ESXi:443 over HTTPS. .NET Framework fails the TLS handshake here, so **`curl.exe` (Schannel)** does every byte transfer. curl is a Windows component, not a new binary.
 

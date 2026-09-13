@@ -56,6 +56,72 @@ function New-TestCredential {
     )
 }
 
+# --- curl ignores the machine's own configuration -------------------------------------------
+# Asserted at the program-execution boundary, not on the three argument lists separately: a
+# curl that reads %APPDATA%\_curlrc or CURL_HOME/.curlrc can be handed --insecure, a proxy or
+# a different CA store by whoever set that file up, and the transfer would then either fail
+# TLS verification silently or succeed without it. --disable has to be the FIRST argument -
+# curl applies the config before later flags, so a late --disable is too late.
+& {
+    $curlProbeDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-curl-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $curlProbeDirectory | Out-Null
+    try {
+        # A stand-in for curl.exe that records exactly what reached the program. Written as a
+        # .ps1 so the same fixture works wherever the gate runs; `exit 0` sets $LASTEXITCODE
+        # the way a native curl would.
+        $fakeCurlPath = Join-Path $curlProbeDirectory 'fake-curl.ps1'
+        $fakeCurlLogPath = Join-Path $curlProbeDirectory 'arguments.txt'
+        $fakeCurlBody = @'
+$args | Set-Content -LiteralPath '__LOG__' -Encoding UTF8
+exit 0
+'@
+        Set-Content -LiteralPath $fakeCurlPath -Value ($fakeCurlBody.Replace('__LOG__', $fakeCurlLogPath)) -Encoding UTF8
+
+        $readFakeCurlArguments = {
+            return @(Get-Content -LiteralPath $fakeCurlLogPath)
+        }
+
+        # 1. The wrapper itself, called with a bare argument list.
+        Remove-Item -LiteralPath $fakeCurlLogPath -Force -ErrorAction SilentlyContinue
+        Invoke-Curl -CurlPath $fakeCurlPath -Arguments @('--silent', 'https://esxi.invalid/') -Description 'curl configuration probe'
+        $wrapperArguments = @(& $readFakeCurlArguments)
+        Assert-Equal -Actual $wrapperArguments[0] -Expected '--disable' -Message 'Invoke-Curl forces --disable as the first argument'
+        Assert-Equal -Actual @($wrapperArguments | Where-Object { $_ -eq '--disable' }).Count -Expected 1 -Message 'Invoke-Curl does not duplicate --disable'
+        Assert-Equal -Actual ($wrapperArguments -contains '-k') -Expected $false -Message 'Invoke-Curl never adds -k'
+        Assert-Equal -Actual ($wrapperArguments -contains '--insecure') -Expected $false -Message 'Invoke-Curl never adds --insecure'
+
+        # The PUT path needs VMware.Vim.GuestFileAttributes, so it is asserted the same way in
+        # Invoke-GuestOpsHarnessChecks.ps1, where those types are available.
+        $fakeFileManager = [pscustomobject]@{}
+        $fakeFileManager | Add-Member ScriptMethod InitiateFileTransferFromGuest { param($MoRef, $GuestAuth, $GuestPath) return [pscustomobject]@{ Url = 'https://*/folder?token=fixture' } }
+        $fakeVMView = [pscustomobject]@{ MoRef = 'vm-fixture' }
+
+        # 2. The GET path.
+        Remove-Item -LiteralPath $fakeCurlLogPath -Force -ErrorAction SilentlyContinue
+        Receive-GuestFile -FileManager $fakeFileManager -VMView $fakeVMView -GuestAuth $null -HostName 'esxi.invalid' -CurlPath $fakeCurlPath -GuestPath 'C:\guest\status.json' -LocalPath (Join-Path $curlProbeDirectory 'downloaded.json')
+        $getArguments = @(& $readFakeCurlArguments)
+        Assert-Equal -Actual $getArguments[0] -Expected '--disable' -Message 'a download reaches curl with --disable first'
+        Assert-Equal -Actual @($getArguments | Where-Object { $_ -eq '--disable' }).Count -Expected 1 -Message 'a download passes --disable once'
+        Assert-Equal -Actual ($getArguments -contains '-k') -Expected $false -Message 'a download never disables TLS verification'
+        Assert-Equal -Actual ($getArguments -contains '--insecure') -Expected $false -Message 'a download has no alternate insecure flag'
+        Assert-Equal -Actual ($getArguments -contains '--max-time') -Expected $true -Message 'a download still carries its deadline'
+
+        # 3. The endpoint probe. It must keep NOT sending --fail: an HTTP 401/403/405 after a
+        # successful handshake proves TLS worked, and is not a trust failure.
+        Remove-Item -LiteralPath $fakeCurlLogPath -Force -ErrorAction SilentlyContinue
+        Assert-GuestTransferEndpoint -HostName 'esxi.invalid' -CurlPath $fakeCurlPath
+        $probeArguments = @(& $readFakeCurlArguments)
+        Assert-Equal -Actual $probeArguments[0] -Expected '--disable' -Message 'the endpoint probe reaches curl with --disable first'
+        Assert-Equal -Actual @($probeArguments | Where-Object { $_ -eq '--disable' }).Count -Expected 1 -Message 'the endpoint probe passes --disable once'
+        Assert-Equal -Actual ($probeArguments -contains '--fail') -Expected $false -Message 'the endpoint probe still omits --fail'
+        Assert-Equal -Actual ($probeArguments -contains '--max-time') -Expected $true -Message 'the endpoint probe still carries its deadline'
+        Assert-Equal -Actual ($probeArguments -contains '-k') -Expected $false -Message 'the endpoint probe never disables TLS verification'
+    }
+    finally {
+        Remove-Item -LiteralPath $curlProbeDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # Transfer timeout validation must happen during parameter binding, before any curl call.
 $script:invalidTransferCurlCalls = 0
 function Invoke-Curl {

@@ -404,6 +404,15 @@ function Invoke-Curl {
         [string]$Description
     )
 
+    # --disable first, for every call, so curl ignores %APPDATA%\_curlrc, CURL_HOME/.curlrc
+    # and ~/.curlrc. Whoever wrote one of those files could otherwise switch off certificate
+    # verification, point this tool at a proxy, or swap the CA store for an ESXi transfer, and
+    # the transfer would then either fail verification for no visible reason or succeed without
+    # it. Position matters: curl applies the config file before the flags that follow, so a
+    # late --disable is too late. This is the only place it is added - an argument list that
+    # also carried it would send it twice.
+    $effectiveArguments = @('--disable') + @($Arguments)
+
     # curl reports failures on stderr; under $ErrorActionPreference='Stop' a native
     # stderr write captured via 2>&1 is promoted to a terminating error before we can
     # inspect $LASTEXITCODE, which would bypass the descriptive throw below. Relax it
@@ -411,7 +420,7 @@ function Invoke-Curl {
     $previousErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $output = & $CurlPath @Arguments 2>&1
+        $output = & $CurlPath @effectiveArguments 2>&1
     }
     finally {
         $ErrorActionPreference = $previousErrorActionPreference
@@ -432,7 +441,8 @@ function Assert-GuestTransferEndpoint {
     # Probe the same ESXi name used in wildcard transfer URLs, without allocating a transfer
     # ticket or touching a guest. HTTP 401/403/405 still prove TLS worked, so omit --fail.
     $url = Resolve-GuestFileTransferUrl -Url 'https://*/' -HostName $HostName
-    $arguments = @('--disable', '--silent', '--show-error', '--head', '--output', 'NUL', '--max-time', '30', $url)
+    # --disable is added centrally by Invoke-Curl; repeating it here would send it twice.
+    $arguments = @('--silent', '--show-error', '--head', '--output', 'NUL', '--max-time', '30', $url)
     try {
         $null = Invoke-Curl -CurlPath $CurlPath -Arguments $arguments -Description ('Checking ESXi HTTPS endpoint {0}' -f $HostName)
     }

@@ -124,7 +124,7 @@ try {
         }
         function New-GuestAuthentication { param($Credential) return [pscustomobject]@{ UserName = 'synthetic' } }
         function Start-VMAgentCycle {
-            param($VMName, $Managers, $GuestAuth, $CurlPath, $AgentPath, $IdentityHelperPath, $GuestWorkingDirectory, $VMOutputDirectory, $MaxUpdates, $LocalSelectionPath, [switch]$SearchOnly)
+            param($VMName, $Servers, $Managers, $GuestAuth, $CurlPath, $AgentPath, $IdentityHelperPath, $GuestWorkingDirectory, $VMOutputDirectory, $MaxUpdates, $LocalSelectionPath, [switch]$SearchOnly)
             if ($VMName -eq 'missing-vm') { throw 'synthetic VM not found' }
             $fixture.Events += ('start:' + $VMName)
             return [pscustomobject]@{ VMName = $VMName; AgentResult = $null; GuestAuth = $GuestAuth }
@@ -158,7 +158,10 @@ try {
         Assert-Equal @($results | Where-Object { $_.VMName -eq 'missing-vm' -and $_.ResultKind -eq 'StartError' }).Count 1 'N3: an inventory failure remains isolated to its VM'
         Assert-Equal @($results | Where-Object { [string]::IsNullOrWhiteSpace([string]$_.Error) }).Count 4 'N3: valid peers still complete when one VM cannot be resolved'
         foreach ($arguments in $fixture.Calls) {
-            Assert-Equal $arguments[0] '--disable' 'N3: curl configuration cannot override the certificate probe'
+            # --disable is forced centrally by Invoke-Curl, which this fixture shadows, so the
+            # probe's own list must not carry it; that it reaches the program first is asserted
+            # at the execution boundary in Invoke-RuntimeChecks and Invoke-GuestOpsHarnessChecks.
+            Assert-Equal ($arguments -contains '--disable') $false 'N3: the certificate probe does not duplicate the forced --disable'
             Assert-Equal ($arguments -contains '--head') $true 'N3: certificate probe requests no file content'
             Assert-Equal ($arguments -contains '--fail') $false 'N3: HTTP access errors after successful TLS are not certificate failures'
             Assert-Equal ($arguments -contains '--insecure' -or $arguments -contains '-k') $false 'N3: certificate verification is never bypassed'
