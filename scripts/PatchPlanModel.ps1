@@ -309,7 +309,24 @@ function Test-IsFailoverClusterDiscoveryRecord {
         return $false
     }
 
+    # Only a CONFIRMED member. An unreadable membership is handled separately below, because
+    # "this is a cluster, update it by hand" and "we could not tell what this is" are different
+    # things to tell an operator - and only the first is a legitimate exclusion.
     return [bool](Get-ModelPropertyValue -InputObject $roleFlags -Name 'failoverCluster' -DefaultValue $false)
+}
+
+function Test-IsUnknownClusterMembershipRecord {
+    param($DiscoveryRecord)
+
+    $roleFlags = Get-ModelPropertyValue -InputObject $DiscoveryRecord -Name 'roleFlags'
+    if ($null -eq $roleFlags) {
+        return $false
+    }
+
+    # Absent entirely means the record predates this field; those VMs keep their old behaviour
+    # rather than all becoming failures on the first run after an upgrade.
+    $membership = [string](Get-ModelPropertyValue -InputObject $roleFlags -Name 'clusterMembership')
+    return ($membership -eq 'Unknown')
 }
 
 function New-UpdatePlanRecord {
@@ -764,6 +781,13 @@ function Get-VMPatchCompletionStates {
         if (Test-IsFailoverClusterDiscoveryRecord -DiscoveryRecord $discoveryRecord) {
             $state = 'Excluded'
             $reason = 'Skipped: Failover Cluster detected. Please update manually one by one.'
+        }
+        elseif (Test-IsUnknownClusterMembershipRecord -DiscoveryRecord $discoveryRecord) {
+            # Not Excluded: an exclusion is a decision about a machine somebody understood. This
+            # one is unresolved, and it must block apply and reboot rather than look settled.
+            $state = 'Failed'
+            $membershipReason = [string](Get-ModelPropertyValue -InputObject (Get-ModelPropertyValue -InputObject $discoveryRecord -Name 'roleFlags') -Name 'clusterMembershipReason')
+            $reason = ('Failover Cluster membership could not be determined, so this VM was not patched. {0}' -f $membershipReason).Trim()
         }
         elseif ($recordErrors.Count -gt 0 -or $outcome -notin @('SearchOnly', 'NoApplicableUpdates')) {
             $state = 'Failed'

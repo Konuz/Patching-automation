@@ -281,8 +281,80 @@ function Test-PendingReboot {
     }
 }
 
+function Get-LocalClusterMembership {
+    # "ClusSvc exists" is not "this node is in a cluster". The service is present on every server
+    # with the Failover Clustering feature installed, including one that was never joined to a
+    # cluster and one that was evicted - and treating that as membership excluded healthy servers
+    # from patching forever. GetNodeClusterState is the question that actually has an answer.
+    #
+    # Returns Member / NotMember / Unknown, and a reason. Unknown is never quietly read as
+    # NotMember: this decides whether a machine may be patched and restarted at all.
+    $service = $null
+    $serviceLookupFailed = $false
+    try {
+        $service = Get-Service -Name 'ClusSvc' -ErrorAction SilentlyContinue
+    }
+    catch {
+        $serviceLookupFailed = $true
+    }
+
+    if ($serviceLookupFailed) {
+        return [ordered]@{ membership = 'Unknown'; reason = 'The ClusSvc service could not be queried.'; clusterState = $null }
+    }
+
+    if ($null -eq $service) {
+        # No Failover Clustering feature at all. That is a fact, not a failure to read one.
+        return [ordered]@{ membership = 'NotMember'; reason = 'The ClusSvc service is not installed.'; clusterState = $null }
+    }
+
+    # A stopped service says nothing either: a node can be a cluster member with ClusSvc stopped
+    # for maintenance, which is exactly when someone might try to patch it.
+    $clusterState = $null
+    try {
+        if (-not ('PatchingGuestOps.ClusApi' -as [type])) {
+            Add-Type -Namespace 'PatchingGuestOps' -Name 'ClusApi' -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("clusapi.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+public static extern int GetNodeClusterState(string lpszNodeName, out uint pdwClusterState);
+'@
+        }
+
+        $state = [uint32]0
+        # The function's return code and the state value are separate pieces of information:
+        # a non-zero return means the state was never written, so it must not be read.
+        $returnCode = [PatchingGuestOps.ClusApi]::GetNodeClusterState($null, [ref]$state)
+        if ($returnCode -ne 0) {
+            return [ordered]@{ membership = 'Unknown'; reason = ('GetNodeClusterState failed with code {0}.' -f $returnCode); clusterState = $null }
+        }
+        $clusterState = [int]$state
+    }
+    catch {
+        # clusapi.dll missing while the service exists, a bitness mismatch, or a blocked P/Invoke.
+        return [ordered]@{ membership = 'Unknown'; reason = ('The cluster state could not be read: {0}' -f $_.Exception.Message); clusterState = $null }
+    }
+
+    $membership = switch ($clusterState) {
+        0 { 'NotMember' }
+        1 { 'NotMember' }
+        3 { 'Member' }
+        19 { 'Member' }
+        default { 'Unknown' }
+    }
+
+    $reason = switch ($membership) {
+        'NotMember' { 'The Failover Clustering feature is installed but this node is not in a cluster.' }
+        'Member' { 'This node is a Failover Cluster member.' }
+        default { ('GetNodeClusterState returned an unrecognised state {0}.' -f $clusterState) }
+    }
+
+    return [ordered]@{ membership = $membership; reason = $reason; clusterState = $clusterState }
+}
+
 function Get-RoleFlags {
-    $failoverCluster = ($null -ne (Get-Service -Name 'ClusSvc' -ErrorAction SilentlyContinue))
+    $clusterMembership = Get-LocalClusterMembership
+    # failoverCluster keeps its meaning for everything downstream: "this VM must not be patched
+    # automatically". Only a CONFIRMED member sets it; Unknown is refused separately, because
+    # "we could not tell" and "it is a cluster" call for different messages to the operator.
+    $failoverCluster = ([string]$clusterMembership.membership -eq 'Member')
     $domainController = ($null -ne (Get-Service -Name 'NTDS' -ErrorAction SilentlyContinue))
     $sql = (@(Get-Service -Name @('MSSQLSERVER', 'MSSQL$*', 'SQLSERVERAGENT', 'SQLAgent$*') -ErrorAction SilentlyContinue).Count -gt 0)
     $exchange = (@(Get-Service -Name 'MSExchange*' -ErrorAction SilentlyContinue).Count -gt 0)
@@ -291,6 +363,9 @@ function Get-RoleFlags {
     $detected = @()
     if ($failoverCluster) {
         $detected += 'Failover Cluster'
+    }
+    if ([string]$clusterMembership.membership -eq 'Unknown') {
+        $detected += 'Failover Cluster membership unknown'
     }
     if ($domainController) {
         $detected += 'Domain Controller'
@@ -307,6 +382,8 @@ function Get-RoleFlags {
 
     return [ordered]@{
         failoverCluster = $failoverCluster
+        clusterMembership = [string]$clusterMembership.membership
+        clusterMembershipReason = [string]$clusterMembership.reason
         domainController = $domainController
         sql = $sql
         exchange = $exchange
@@ -512,6 +589,12 @@ try {
 
     if (-not $SearchOnly -and $status.roleFlags.failoverCluster) {
         throw 'Failover Cluster detected. Automatic installation is blocked; update manually one by one.'
+    }
+
+    # Re-checked here on every apply, whatever a saved plan recorded, and refused rather than
+    # assumed either way: a node this tool cannot classify must not be patched or restarted.
+    if (-not $SearchOnly -and [string]$status.roleFlags.clusterMembership -eq 'Unknown') {
+        throw ('Failover Cluster membership could not be determined. Automatic installation is blocked. {0}' -f [string]$status.roleFlags.clusterMembershipReason)
     }
 
     Write-AgentLog -Message 'Creating Microsoft.Update.Session.'

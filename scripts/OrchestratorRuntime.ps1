@@ -731,6 +731,12 @@ function Select-RebootRequiredApplyResults {
             $excludedByVmName[$vmName] = $true
         }
 
+        # A node whose cluster membership could not be read must not be restarted either. A
+        # restart of an unrecognised cluster member is the expensive half of this mistake.
+        if ([string](Get-ObjectPropertyValue -InputObject $record -Path @('roleFlags', 'clusterMembership')) -eq 'Unknown') {
+            $excludedByVmName[$vmName] = $true
+        }
+
         $pendingRebootBefore = Get-RuntimePropertyValue -InputObject $record -Name 'pendingRebootBefore'
         $isPending = Get-RuntimePropertyValue -InputObject $pendingRebootBefore -Name 'isPending' -DefaultValue $false
         if ([bool]$isPending) {
@@ -757,8 +763,12 @@ function Select-RebootRequiredApplyResults {
             continue
         }
 
-        # Saved plans have no discovery records; skipped apply results retain roleFlags.
-        if ($excludedByVmName.ContainsKey($vmName) -or [bool](Get-ObjectPropertyValue -InputObject $result -Path @('roleFlags', 'failoverCluster') -DefaultValue $false)) {
+        # Saved plans have no discovery records; skipped apply results retain roleFlags. The
+        # agent re-checks membership on every apply, so a cluster the plan did not know about -
+        # or one whose membership has become unreadable - is caught here too.
+        if ($excludedByVmName.ContainsKey($vmName) -or
+            [bool](Get-ObjectPropertyValue -InputObject $result -Path @('roleFlags', 'failoverCluster') -DefaultValue $false) -or
+            [string](Get-ObjectPropertyValue -InputObject $result -Path @('roleFlags', 'clusterMembership')) -eq 'Unknown') {
             continue
         }
 

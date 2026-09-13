@@ -255,6 +255,26 @@ Pełna lista parametrów znajduje się w nagłówku `Start-PatchingGuestOps.ps1`
 
 ## Jak wybierane są aktualizacje
 
+**Obecność roli klastra to nie członkostwo.** Usługa `ClusSvc` istnieje na każdym serwerze z
+zainstalowaną funkcją Failover Clustering — także na takim, który nigdy nie został dołączony do
+klastra, i na takim, który z klastra usunięto. Traktowanie tego jako członkostwa **na zawsze**
+wykluczało zdrowe serwery z łatania, bo usługa nigdy nie znika.
+
+Narzędzie pyta teraz o rzeczywisty stan (`GetNodeClusterState` z `clusapi.dll`, wywoływane w
+gościu) i zapisuje `clusterMembership`:
+
+- `Member` (stan 3 lub 19) — maszyna jest **wykluczona**, aktualizuj ręcznie jedna po drugiej,
+- `NotMember` (stan 0 lub 1, albo potwierdzony brak usługi) — zwykły serwer, łatany normalnie,
+- `Unknown` (błąd odczytu, brak `clusapi.dll`, nierozpoznany stan) — maszyna jest `Failed`:
+  **nie jest łatana i nie jest restartowana**, a przebieg kończy się kodem 1.
+
+`Unknown` celowo **nie jest** `Excluded`: wykluczenie to decyzja o maszynie, którą ktoś zrozumiał, a
+tutaj sprawa jest nierozstrzygnięta. Zatrzymana usługa `ClusSvc` niczego nie rozstrzyga — węzeł może
+być członkiem klastra z usługą zatrzymaną na czas prac. Kod powrotu funkcji i sama wartość stanu to
+dwie różne informacje: nieudane wywołanie nie zapisuje stanu, więc jego odczyt byłby odczytem
+niezainicjowanej zmiennej. Agent sprawdza rolę ponownie przy każdej instalacji, niezależnie od tego,
+co zapisano w planie. Automatycznego łatania klastrów nadal nie ma.
+
 **Limity czasu: discovery i instalacja są osobne.** `-TimeoutMinutes` (domyślnie 180) dotyczy
 **wyłącznie instalacji** — instalacja WUA rzeczywiście może zająć godziny. Wykrywanie ma własny
 `-DiscoveryTimeoutMinutes` (domyślnie 30), bo wyszukiwanie WUA trwa minuty; wcześniej ten sam limit

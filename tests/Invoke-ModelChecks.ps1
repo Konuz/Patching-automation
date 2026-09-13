@@ -590,6 +590,24 @@ function Get-StateFor {
     return @($States | Where-Object { $_.vmName -eq $VMName })[0]
 }
 
+# --- cluster membership, in the completion model -------------------------------------------------
+& {
+    $memberRecord = [pscustomobject]@{ vmName = 'VM-member'; outcome = 'SearchOnly'; errors = @(); updates = @(); roleFlags = [pscustomobject]@{ failoverCluster = $true; clusterMembership = 'Member'; clusterMembershipReason = 'node is a member' } }
+    $unknownRecord = [pscustomobject]@{ vmName = 'VM-unknown'; outcome = 'SearchOnly'; errors = @(); updates = @(); roleFlags = [pscustomobject]@{ failoverCluster = $false; clusterMembership = 'Unknown'; clusterMembershipReason = 'clusapi.dll is missing' } }
+    $notMemberRecord = [pscustomobject]@{ vmName = 'VM-standalone'; outcome = 'SearchOnly'; errors = @(); updates = @(); roleFlags = [pscustomobject]@{ failoverCluster = $false; clusterMembership = 'NotMember'; clusterMembershipReason = 'feature installed, not joined' } }
+
+    $membershipStates = @(Get-VMPatchCompletionStates -DiscoveryRecords @($memberRecord, $unknownRecord, $notMemberRecord) -UpdateGroups @())
+    Assert-Equal -Actual (Get-StateFor -States $membershipStates -VMName 'VM-member').state -Expected 'Excluded' -Message 'a confirmed cluster member is excluded'
+    Assert-Equal -Actual (Get-StateFor -States $membershipStates -VMName 'VM-unknown').state -Expected 'Failed' -Message 'an unreadable cluster membership is a failure, never an exclusion'
+    Assert-True -Condition ((Get-StateFor -States $membershipStates -VMName 'VM-unknown').reason -like '*clusapi.dll is missing*') -Message 'the failure says why the membership could not be read'
+    Assert-Equal -Actual (Get-StateFor -States $membershipStates -VMName 'VM-standalone').state -Expected 'Green' -Message 'the clustering feature without membership does not exclude a server'
+
+    # An unreadable membership is surfaced in the role text, so the operator sees it in the
+    # discovery summary rather than only in the final state.
+    Assert-True -Condition ((Get-RoleFlagText -RoleFlags ([pscustomobject]@{ detected = @('Failover Cluster membership unknown') })) -like '*membership unknown*') -Message 'an unreadable membership is visible in the role summary'
+}
+
+
 Assert-Equal -Actual (Get-StateFor -States $greenStates -VMName 'VM01').state -Expected 'Green' -Message 'VM without applicable updates is green'
 Assert-Equal -Actual (Get-StateFor -States $greenStates -VMName 'VM02').state -Expected 'Pending' -Message 'VM with a default-selectable update is pending'
 Assert-Equal -Actual (Get-StateFor -States $greenStates -VMName 'VM02').pendingSelectableCount -Expected 1 -Message 'pending VM reports how many selectable groups remain'

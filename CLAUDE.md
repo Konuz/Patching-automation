@@ -659,7 +659,48 @@ Runtime and model scripts run under `Set-StrictMode -Version 2.0` + `$ErrorActio
 The single-VM index-selection mode is validation scaffolding, not the final product. The target tool separates stages: **discovery → group update selection → per-VM plan → final confirm → apply**. Notable decisions:
 
 - Update selection becomes a **checkbox group view** keyed technically on **`UpdateID` + `RevisionNumber`** (KB/title shown to humans but not authoritative).
-- **Failover Cluster detected → hard skip** the VM ("update manually one by one"). SQL/Exchange become high-risk role flags; Domain Controller and IIS are also detected as role flags. None of these auto-skip.
+- **Failover Cluster *membership* → hard skip** the VM ("update manually one by one") — not the
+  mere presence of the role. SQL/Exchange become high-risk role flags; Domain Controller and IIS
+  are also detected as role flags. None of these auto-skip. See "Cluster membership" below.
+
+### Cluster membership: presence of the role is not membership
+
+`ClusSvc` exists on every server with the Failover Clustering feature installed, including one
+that was never joined to a cluster and one that was evicted from it. Reading that as membership
+excluded healthy standalone servers from patching **forever**, since the service never goes away.
+
+`Get-LocalClusterMembership` asks the question that has an answer: `GetNodeClusterState` from
+`clusapi.dll`, P/Invoked in the guest. `roleFlags` gains `clusterMembership`
+(`Member`/`NotMember`/`Unknown`) and `clusterMembershipReason`, and `failoverCluster` keeps its
+meaning — "this VM must not be patched automatically" — but is now set **only** by a confirmed
+`Member`.
+
+The mapping, and why each half matters:
+
+| State | Membership |
+|---|---|
+| 0, 1 | `NotMember` — the feature may be installed, the node is not in a cluster |
+| 3, 19 | `Member` |
+| anything else, or a failed call | `Unknown` |
+
+- **The function's return code and the state value are separate facts.** A non-zero return means
+  the state was never written, so reading it would be reading an uninitialised variable. A read
+  error is `Unknown`, never `NotMember`.
+- **No service, queried successfully → `NotMember`.** That is a fact, not a failure to read one.
+- **Service present but `clusapi.dll` missing, a bitness mismatch or a blocked P/Invoke →
+  `Unknown`.**
+- **A stopped `ClusSvc` decides nothing.** A node can be a cluster member with the service stopped
+  for maintenance, which is exactly when someone might try to patch it.
+
+`Unknown` is `Failed`, deliberately **not** `Excluded`: an exclusion is a decision about a machine
+somebody understood, and this one is unresolved. It blocks apply (the agent throws, and re-checks
+on every apply whatever a saved plan recorded) and blocks reboot
+(`Select-RebootRequiredApplyResults` filters it out, from both the discovery record and the apply
+result). A confirmed `Excluded` still permits exit 0; the run summary calls that section "outside
+the scope of patching, not patched" rather than counting those VMs as done. A discovery record
+written before this field existed has no `clusterMembership` at all and keeps its old behaviour,
+so an upgrade does not turn every VM into a failure on its first run. Automatic cluster patching
+remains out of scope.
 - **The default policy is structural and language-independent.** It reads the WUA classification
   GUIDs, `MsrcSeverity`, `UpdateType`, `BrowseOnly` and the KB id — never the title and never the
   category *names*, both of which are localised. `Get-UpdatePolicyDecision` answers

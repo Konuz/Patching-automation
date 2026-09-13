@@ -197,7 +197,8 @@ function Invoke-AgentFixture {
         # in the collection handed to Install.
         $SearchUpdateIdentities = $null,
         $SelectedKeys = $null,
-        [string]$EulaFailureKey = '')
+        [string]$EulaFailureKey = '',
+        [bool]$ClusterMembershipUnknown = $false)
     # Only external effects are mocked: local probes, artifact I/O, and WUA COM.
     function Write-AgentLog { param($Message) }
     function Save-Status { param($Status) }
@@ -221,7 +222,16 @@ function Invoke-AgentFixture {
     function Get-ServiceSnapshot { @() }
     function Get-SystemDriveFreeGB { 100 }
     function Test-PendingReboot { [pscustomobject]@{ isPending = $PendingReboot } }
-    function Get-RoleFlags { [pscustomobject]@{ failoverCluster = $Cluster } }
+    # The fixture models the three membership answers the guest can give, because they are three
+    # different decisions: Member is Excluded, Unknown is refused, NotMember is patched normally.
+    function Get-RoleFlags {
+        $membership = if ($Cluster) { 'Member' } elseif ($ClusterMembershipUnknown) { 'Unknown' } else { 'NotMember' }
+        return [pscustomobject]@{
+            failoverCluster = ($membership -eq 'Member')
+            clusterMembership = $membership
+            clusterMembershipReason = ('synthetic membership {0}' -f $membership)
+        }
+    }
     $effectiveSelectedKeys = if ($null -eq $SelectedKeys) { @('11111111-1111-1111-1111-111111111111|1') } else { @($SelectedKeys) }
     function Read-SelectionDocumentKeys { param($Path) return @($effectiveSelectedKeys) }
 
@@ -328,6 +338,60 @@ $ordinaryApply = Invoke-AgentFixture -PendingReboot $true
 Assert-Equal $ordinaryApply.InstallCalled $true 'ordinary selected updates still reach WUA install'
 Assert-Equal $ordinaryApply.Status.outcome 'InstallSucceeded' 'ordinary successful installation stays successful'
 Assert-Equal $ordinaryApply.ExitCode 0 'ordinary successful installation exits zero'
+
+# --- role presence is not cluster membership (task 9) ------------------------------------------
+# ClusSvc exists on every server with the Failover Clustering feature installed, including one
+# that was never joined and one that was evicted. Treating that as membership excluded healthy
+# servers from patching forever; treating an unreadable state as "not a member" would patch and
+# restart a real cluster node.
+
+$clusterApplyCase = Invoke-AgentFixture -Cluster $true
+Assert-Equal $clusterApplyCase.InstallCalled $false 'a confirmed cluster member installs nothing'
+Assert-Equal $clusterApplyCase.State 'Excluded' 'a confirmed cluster member is Excluded'
+Assert-Equal ([string]$clusterApplyCase.Status.roleFlags.clusterMembership) 'Member' 'a confirmed member reports Member'
+
+$unknownMembership = Invoke-AgentFixture -ClusterMembershipUnknown $true
+Assert-Equal $unknownMembership.InstallCalled $false 'an unreadable cluster state installs nothing'
+Assert-Equal $unknownMembership.ExitCode 1 'an unreadable cluster state is an error'
+Assert-Equal $unknownMembership.State 'Failed' 'an unreadable cluster state is Failed, not Excluded'
+Assert-Equal ([bool]$unknownMembership.Status.roleFlags.failoverCluster) $false 'an unreadable state is not reported as a confirmed cluster'
+Assert-Equal (@(Select-RebootRequiredApplyResults -ApplyResults @(New-ApplyResultRecord -VMName 'VM-unknown-cluster' -Outcome 'InstallSucceeded' -AgentCompletionConfirmed $true -RebootRequired $true -RoleFlags ([pscustomobject]@{ failoverCluster = $false; clusterMembership = 'Unknown' })) -DiscoveryRecords @()).Count) 0 'an unreadable cluster state is never restarted'
+
+# ClusSvc present but the node is not in a cluster: an ordinary server, patched normally.
+$notMember = Invoke-AgentFixture
+Assert-Equal $notMember.InstallCalled $true 'a server with the clustering feature but no membership is patched normally'
+Assert-Equal ([string]$notMember.Status.roleFlags.clusterMembership) 'NotMember' 'a non-member reports NotMember'
+Assert-Equal ([bool]$notMember.Status.roleFlags.failoverCluster) $false 'a non-member does not set the cluster flag'
+
+# The state mapping itself, against the values GetNodeClusterState actually returns. The API's
+# return code and the state value are separate pieces of information: a failed call never wrote a
+# state, so reading one would be reading an uninitialised variable.
+& {
+    $membershipCases = @(
+        [pscustomobject]@{ State = 0; Expected = 'NotMember'; Name = 'ClusterStateNotInstalled' },
+        [pscustomobject]@{ State = 1; Expected = 'NotMember'; Name = 'ClusterStateNotConfigured' },
+        [pscustomobject]@{ State = 3; Expected = 'Member'; Name = 'ClusterStateRunning' },
+        [pscustomobject]@{ State = 19; Expected = 'Member'; Name = 'ClusterStateRunning (variant)' },
+        [pscustomobject]@{ State = 7; Expected = 'Unknown'; Name = 'an unrecognised state' }
+    )
+    foreach ($case in $membershipCases) {
+        $membership = switch ($case.State) {
+            0 { 'NotMember' }
+            1 { 'NotMember' }
+            3 { 'Member' }
+            19 { 'Member' }
+            default { 'Unknown' }
+        }
+        Assert-Equal $membership $case.Expected ('cluster state ' + $case.State + ' maps to ' + $case.Expected + ' (' + $case.Name + ')')
+    }
+}
+
+# A record written before this field existed keeps its old behaviour rather than turning every VM
+# into a failure on the first run after an upgrade.
+$legacyClusterRecord = [pscustomobject]@{ vmName = 'VM-legacy'; outcome = 'SearchOnly'; errors = @(); roleFlags = [pscustomobject]@{ failoverCluster = $false }; updates = @() }
+Assert-Equal (Test-IsUnknownClusterMembershipRecord -DiscoveryRecord $legacyClusterRecord) $false 'a discovery record without the membership field is not treated as unknown'
+$legacyClusterStates = @(Get-VMPatchCompletionStates -DiscoveryRecords @($legacyClusterRecord) -UpdateGroups @())
+Assert-Equal $legacyClusterStates[0].state 'Green' 'a record written before this change still reaches its old verdict'
 
 # --- selection drift: install the approved subset that is still on offer (task 7) ------------
 # Drift used to throw, which discarded every still-available approved update along with the one
