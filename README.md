@@ -562,6 +562,13 @@ trafia do kolejnej rundy i przebieg nie może zakończyć się kodem 0 — nawet
 odrzuconego agenta już się zakończył. Restart także przechodzi przez tę blokadę: `shutdown.exe`
 jest uruchamiany z wnętrza gościa przez proces, który trzyma uchwyt.
 
+**Odrzucona pieczęć katalogu działa dokładnie tak samo.** Jedno i drugie znaczy „gość odmówił
+temu narzędziu”, więc obie sytuacje wykluczają maszynę z restartu, z kolejnej rundy **i** z opisu
+„zostały aktualizacje”. Ta ostatnia część jest nieoczywista: mapa stanów powstaje z **wykrywania**,
+a wykrywanie to właśnie to, co się udało — odmowa pojawia się dopiero przy instalacji. Bez tego
+maszyna raportowałaby się jako `Pending` („są aktualizacje do zainstalowania”) zamiast jako
+odmowa wymagająca uzgodnienia. Kod wyjścia był poprawny już wcześniej; błędny był opis.
+
 **Cztery rodzaje odmowy — i tylko jeden z nich warto przeczekać.** Odmowa niesie też pole
 `guestRunConflictKind`, bo to nie jest jeden problem:
 

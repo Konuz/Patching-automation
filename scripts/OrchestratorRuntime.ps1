@@ -590,6 +590,23 @@ function Get-OutstandingVerificationText {
     return ($lines -join '; ')
 }
 
+function Test-IsApplyResultRefused {
+    param($ApplyResult)
+
+    # The two ways the GUEST refuses this tool outright, as opposed to the work failing: the run
+    # guard said no, or the workspace seal did not verify. Both mean nothing was installed and
+    # nothing this run does will change that, so a refused VM is never restarted, never carried
+    # into the next round, and never described as merely having updates outstanding.
+    #
+    # A seal that was never checked ($null - no token supplied, an older agent) is NOT a refusal.
+    if ([bool](Get-ObjectPropertyValue -InputObject $ApplyResult -Path @('guestRunConflict') -DefaultValue $false)) {
+        return $true
+    }
+
+    $sealVerified = Get-ObjectPropertyValue -InputObject $ApplyResult -Path @('workspaceSealVerified')
+    return ($null -ne $sealVerified -and -not [bool]$sealVerified)
+}
+
 function Test-IsApplyResultError {
     param($ApplyResult)
 
@@ -776,11 +793,12 @@ function Select-RebootRequiredApplyResults {
             continue
         }
 
-        # A guest that refused this run - because another one holds it, or because it carries an
-        # unreconciled trace of one - must not be restarted. The other run may be mid-install,
-        # and a restart across a half-written update is exactly what the guard exists to stop.
-        # This holds even though the refused agent's own process has already ended.
-        if ([bool](Get-ObjectPropertyValue -InputObject $result -Path @('guestRunConflict') -DefaultValue $false)) {
+        # A guest that refused this run - because another one holds it, because it carries an
+        # unreconciled trace of one, or because the tool directory is no longer the one this run
+        # sealed - must not be restarted. The other run may be mid-install, and a restart across a
+        # half-written update is exactly what the guard exists to stop. This holds even though the
+        # refused agent's own process has already ended.
+        if (Test-IsApplyResultRefused -ApplyResult $result) {
             continue
         }
 
@@ -1209,8 +1227,10 @@ function Get-NextRoundTargetVMNames {
             continue
         }
 
-        # A guest this run was refused on stays refused, whatever else happened to it.
-        if ([bool](Get-RuntimePropertyValue -InputObject $result -Name 'guestRunConflict' -DefaultValue $false)) {
+        # A guest this run was refused on stays refused, whatever else happened to it. Re-running
+        # the agent next round would upload into the same directory the guest just refused, and
+        # the round-2 verdict would overwrite the refusal recorded for round 1.
+        if (Test-IsApplyResultRefused -ApplyResult $result) {
             $conflicted[$vmName] = $true
             continue
         }
@@ -1293,6 +1313,66 @@ function Set-PatchRunPendingRebootStates {
             deselectedSelectableCount = 0
             needsReviewSelectableCount = 0
             errors = @()
+        }
+    }
+}
+
+function Set-PatchRunRefusedStates {
+    param(
+        [hashtable]$StateMap,
+        $ApplyResults
+    )
+
+    # A guest that refused this run - the run guard said no, or the workspace seal did not verify -
+    # is not a guest with work outstanding. But the state map is built from DISCOVERY, and
+    # discovery is what still succeeded in the window this happens in: another run took the guest,
+    # or a reboot was requested, or the directory was replaced, between discovery and apply. The
+    # VM therefore read as 'Pending' - "still has selectable updates" - which sends whoever reads
+    # summary.md looking for updates to install rather than at a guest that has to be reconciled.
+    #
+    # The exit code was already right (Pending is not in the all-green allow-list). What was wrong
+    # was the description, and a security refusal described as ordinary pending work is the one
+    # that will be skimmed past. Same argument as Set-PatchRunPendingRebootStates, opposite
+    # direction: there, calling a missing restart 'Failed' would have invented an install problem.
+    foreach ($result in @($ApplyResults)) {
+        $vmName = [string](Get-RuntimePropertyValue -InputObject $result -Name 'vmName')
+        if ([string]::IsNullOrWhiteSpace($vmName)) {
+            continue
+        }
+
+        if (-not (Test-IsApplyResultRefused -ApplyResult $result)) {
+            continue
+        }
+        $conflict = [bool](Get-RuntimePropertyValue -InputObject $result -Name 'guestRunConflict' -DefaultValue $false)
+
+        # Excluded is a decision about a machine somebody understood, and it already keeps the VM
+        # out of apply and reboot. Overwriting it would lose that.
+        if ($StateMap.ContainsKey($vmName) -and [string](Get-RuntimePropertyValue -InputObject $StateMap[$vmName] -Name 'state') -eq 'Excluded') {
+            continue
+        }
+
+        $reason = if ($conflict) {
+            $kind = [string](Get-RuntimePropertyValue -InputObject $result -Name 'guestRunConflictKind' -DefaultValue '')
+            if ([string]::IsNullOrWhiteSpace($kind)) {
+                'This guest refused the run; it was not patched.'
+            }
+            else {
+                'This guest refused the run ({0}); it was not patched.' -f $kind
+            }
+        }
+        else {
+            'This guest refused the workspace seal; the tool directory is no longer the one this run secured.'
+        }
+
+        $StateMap[$vmName] = [pscustomobject]@{
+            vmName = $vmName
+            state = 'Failed'
+            reason = $reason
+            outcome = Get-RuntimePropertyValue -InputObject $StateMap[$vmName] -Name 'outcome'
+            pendingSelectableCount = 0
+            deselectedSelectableCount = 0
+            needsReviewSelectableCount = 0
+            errors = @(Get-RuntimePropertyValue -InputObject $result -Name 'errors' -DefaultValue @())
         }
     }
 }

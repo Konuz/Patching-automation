@@ -820,6 +820,68 @@ Assert-Equal -Actual $rebootStateMap['VM-skipped'].state -Expected 'PendingReboo
 Assert-Equal -Actual $rebootStateMap['VM-reboot-only'].state -Expected 'Green' -Message 'a confirmed restart is not marked pending; the next discovery decides'
 Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $rebootStateMap) -Expected $false -Message 'a VM pending a reboot cannot produce exit 0'
 
+# --- a guest that refused the run is not a guest with work outstanding ---------------------------
+# The state map is built from DISCOVERY, and discovery is exactly what still succeeded in the
+# window a refusal happens in: another run took the guest, or a reboot was requested, or the
+# directory was replaced, between discovery and apply. So the VM read as "still has selectable
+# updates", which points whoever reads summary.md at updates to install rather than at a guest
+# that has to be reconciled. The exit code was already right; the description was not.
+
+& {
+    $refusedMap = @{
+        'VM-conflict'  = [pscustomobject]@{ vmName = 'VM-conflict';  state = 'Pending'; reason = 'Selectable updates remain.'; outcome = 'SearchOnly'; pendingSelectableCount = 2; deselectedSelectableCount = 0; needsReviewSelectableCount = 0; errors = @() }
+        'VM-seal'      = [pscustomobject]@{ vmName = 'VM-seal';      state = 'Pending'; reason = 'Selectable updates remain.'; outcome = 'SearchOnly'; pendingSelectableCount = 1; deselectedSelectableCount = 0; needsReviewSelectableCount = 0; errors = @() }
+        'VM-green'     = [pscustomobject]@{ vmName = 'VM-green';     state = 'Green'; reason = 'Nothing left.'; outcome = 'SearchOnly'; pendingSelectableCount = 0; deselectedSelectableCount = 0; needsReviewSelectableCount = 0; errors = @() }
+        'VM-excluded'  = [pscustomobject]@{ vmName = 'VM-excluded';  state = 'Excluded'; reason = 'Failover Cluster member.'; outcome = 'SearchOnly'; pendingSelectableCount = 0; deselectedSelectableCount = 0; needsReviewSelectableCount = 0; errors = @() }
+        'VM-unchecked' = [pscustomobject]@{ vmName = 'VM-unchecked'; state = 'Pending'; reason = 'Selectable updates remain.'; outcome = 'SearchOnly'; pendingSelectableCount = 1; deselectedSelectableCount = 0; needsReviewSelectableCount = 0; errors = @() }
+    }
+
+    Set-PatchRunRefusedStates -StateMap $refusedMap -ApplyResults @(
+        (New-ApplyResultRecord -VMName 'VM-conflict' -Outcome 'Failed' -GuestRunConflict $true -GuestRunConflictKind 'Unconfirmed' -Errors @('Guest run conflict: synthetic')),
+        (New-ApplyResultRecord -VMName 'VM-seal' -Outcome 'Failed' -WorkspaceSealVerified $false -Errors @('seal refused')),
+        (New-ApplyResultRecord -VMName 'VM-green' -Outcome 'InstallSucceeded' -WorkspaceSealVerified $true),
+        (New-ApplyResultRecord -VMName 'VM-excluded' -Action 'Skipped' -Outcome 'Skipped' -GuestRunConflict $true -GuestRunConflictKind 'Held'),
+        # No token was supplied, so the seal was never checked. Null must not read as refused.
+        (New-ApplyResultRecord -VMName 'VM-unchecked' -Outcome 'InstallSucceeded' -WorkspaceSealVerified $null)
+    )
+
+    Assert-Equal -Actual $refusedMap['VM-conflict'].state -Expected 'Failed' -Message 'a guest that refused the run is failed, not pending'
+    Assert-Equal -Actual ($refusedMap['VM-conflict'].reason -like '*Unconfirmed*') -Expected $true -Message 'the reason names which kind of refusal it was'
+    Assert-Equal -Actual $refusedMap['VM-conflict'].pendingSelectableCount -Expected 0 -Message 'a refused guest is not counted as having work outstanding'
+    Assert-Equal -Actual $refusedMap['VM-seal'].state -Expected 'Failed' -Message 'a refused workspace seal is failed, not pending'
+    Assert-Equal -Actual ($refusedMap['VM-seal'].reason -like '*seal*') -Expected $true -Message 'the reason says the seal was refused'
+    Assert-Equal -Actual $refusedMap['VM-green'].state -Expected 'Green' -Message 'a healthy VM keeps its state'
+    Assert-Equal -Actual $refusedMap['VM-unchecked'].state -Expected 'Pending' -Message 'a seal that was never checked is not a refusal'
+    # Excluded is a decision about a machine somebody understood, and it already keeps the VM out
+    # of apply and reboot; overwriting it would lose that.
+    Assert-Equal -Actual $refusedMap['VM-excluded'].state -Expected 'Excluded' -Message 'a refusal does not overwrite an exclusion'
+
+    Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $refusedMap -ExpectedVMNames @('VM-conflict', 'VM-seal', 'VM-green', 'VM-excluded', 'VM-unchecked')) -Expected $false -Message 'a refused guest keeps the run from exiting 0'
+}
+
+# The same predicate decides all three: no restart, no next round, no "has updates outstanding".
+# They have to agree, or a refusal recorded in one place is undone by another - which is exactly
+# what happened to a refused seal: it was not a next-round exclusion, so round two re-discovered
+# the VM and its Pending verdict overwrote the refusal from round one.
+& {
+    $refusedByConflict = New-ApplyResultRecord -VMName 'VM-conflict' -Outcome 'Failed' -RebootRequired $true -AgentCompletionConfirmed $true -GuestRunConflict $true -GuestRunConflictKind 'Unconfirmed'
+    $refusedBySeal = New-ApplyResultRecord -VMName 'VM-seal' -Outcome 'Failed' -RebootRequired $true -AgentCompletionConfirmed $true -WorkspaceSealVerified $false
+    $sealUnchecked = New-ApplyResultRecord -VMName 'VM-unchecked' -Outcome 'InstallSucceeded' -RebootRequired $true -AgentCompletionConfirmed $true -WorkspaceSealVerified $null
+    $healthy = New-ApplyResultRecord -VMName 'VM-healthy' -Outcome 'InstallSucceeded' -RebootRequired $true -AgentCompletionConfirmed $true -WorkspaceSealVerified $true
+
+    Assert-Equal -Actual (Test-IsApplyResultRefused -ApplyResult $refusedByConflict) -Expected $true -Message 'a run-guard conflict is a refusal'
+    Assert-Equal -Actual (Test-IsApplyResultRefused -ApplyResult $refusedBySeal) -Expected $true -Message 'a refused workspace seal is a refusal'
+    Assert-Equal -Actual (Test-IsApplyResultRefused -ApplyResult $sealUnchecked) -Expected $false -Message 'a seal that was never checked is not a refusal'
+    Assert-Equal -Actual (Test-IsApplyResultRefused -ApplyResult $healthy) -Expected $false -Message 'a healthy apply is not a refusal'
+
+    $allFour = @($refusedByConflict, $refusedBySeal, $sealUnchecked, $healthy)
+    $rebootable = @(@(Select-RebootRequiredApplyResults -ApplyResults $allFour -DiscoveryRecords @()) | ForEach-Object { [string]$_.vmName } | Sort-Object)
+    Assert-Equal -Actual ($rebootable -join ',') -Expected 'VM-healthy,VM-unchecked' -Message 'neither kind of refused guest is ever restarted'
+
+    $nextRound = @(@(Get-NextRoundTargetVMNames -ApplyResults $allFour -RebootActions @()) | Sort-Object)
+    Assert-Equal -Actual ($nextRound -join ',') -Expected 'VM-healthy,VM-unchecked' -Message 'neither kind of refused guest enters the next round'
+}
+
 # --- a guest that is merely restarting is retried, not written off -------------------------------
 # The guard reports FOUR kinds of conflict and only one of them clears itself. A phase that treats
 # them alike either fails a VM that was seconds from being available, or waits for a record nobody

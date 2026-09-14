@@ -2155,6 +2155,9 @@ try {
         # PendingReboot holds until a fresh discovery decides, and a refused or unverified
         # restart leaves it there - which is exit 1 without claiming the install failed.
         Set-PatchRunPendingRebootStates -StateMap $finalStateMap -RebootTargets @(Get-RuntimePropertyValue -InputObject $applyOutcome -Name 'RebootTargets' -DefaultValue @()) -RebootActions $applyOutcome.RebootActions
+        # After the reboot states, because a refused guest is never a reboot target: the two
+        # cannot both claim the same VM, and this one is the more specific answer.
+        Set-PatchRunRefusedStates -StateMap $finalStateMap -ApplyResults @(Get-RuntimePropertyValue -InputObject $applyOutcome -Name 'ApplyResults' -DefaultValue @())
 
         # A machine that was told to restart and has not provably come back must not be
         # re-discovered: the read would either fail or describe a half-booted guest.

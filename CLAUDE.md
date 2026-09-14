@@ -336,6 +336,23 @@ of reboot targets (`Select-RebootRequiredApplyResults`) and out of the next roun
 the run cannot exit 0 — even though the refused agent's own process has already ended, which is
 exactly what makes it look finished to everything else.
 
+**A refused workspace seal is the same kind of fact and gets the same treatment.**
+`Test-IsApplyResultRefused` is the single predicate for "the guest refused this tool" — a run
+guard conflict, or a seal that did not verify — and all three places consult it: the reboot
+filter, `Get-NextRoundTargetVMNames`, and `Set-PatchRunRefusedStates`. They have to agree, or a
+refusal recorded in one place is undone by another. That is not hypothetical: before the predicate
+existed, a refused seal was not a next-round exclusion, so round two re-discovered the VM and its
+ordinary `Pending` verdict **overwrote the refusal from round one**. A seal that was never checked
+(`$null` — no token supplied, an older agent) is deliberately not a refusal.
+
+`Set-PatchRunRefusedStates` exists because the state map is built from **discovery**, and
+discovery is exactly what still succeeded in the window a refusal happens in: another run took the
+guest, or a reboot was requested, or the directory was replaced, between discovery and apply. So a
+refused VM read as `Pending` — "still has selectable updates" — which points whoever reads
+`summary.md` at updates to install rather than at a guest that has to be reconciled. The exit code
+was already right (`Pending` is not in the all-green allow-list); the description was not. It does
+not overwrite `Excluded`, which is a decision about a machine somebody understood.
+
 #### Four kinds of refusal, one of which waits
 
 The refusal also carries a **kind** (`guestRunConflictKind`), because the four are not the same
