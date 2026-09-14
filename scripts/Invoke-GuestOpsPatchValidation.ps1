@@ -275,6 +275,10 @@ function Invoke-GuestAgentFleet {
         [string]$CurlPath,
         [string]$AgentPath,
         [string]$IdentityHelperPath,
+        # Left undefaulted on purpose: this function is also built from the orchestrator's AST by
+        # the harness, where $PSScriptRoot is empty, so a default resolved here would be wrong.
+        # An omitted value arrives as an empty string and Start-VMAgentCycle treats that as
+        # "use the shipped script", which is the one place that can resolve it correctly.
         [string]$WorkspaceScriptPath,
         [string]$RunGuardScriptPath,
         [string]$GuestWorkingDirectory,

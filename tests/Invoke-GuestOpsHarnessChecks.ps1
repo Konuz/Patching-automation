@@ -36,6 +36,44 @@ function Assert-Equal {
     }
 }
 
+# Reading a property off a result this harness did not first prove it has is how a recorded
+# failure becomes a crash: Assert-Equal collects, but dereferencing a missing property terminates
+# under this script's Stop preference, and the whole run dies before it prints the failure that
+# explains why. That is exactly what happened to a fleet result whose Payload was $null because
+# the phase preflight had refused the VM - the message naming the refusal was sitting in .Error,
+# one assertion above, and was never shown.
+#
+# So payloads are read through this: it answers with a default and records what the object
+# actually carried, which is the one thing worth knowing when a shape is wrong.
+function Get-HarnessPayloadValue {
+    param($Result, [string]$Name, $DefaultValue = $null, [string]$Context = '')
+
+    $payload = $null
+    if ($null -ne $Result) {
+        $payloadProperty = $Result.PSObject.Properties['Payload']
+        if ($null -ne $payloadProperty) { $payload = $payloadProperty.Value }
+    }
+
+    if ($null -eq $payload) {
+        $resultError = ''
+        if ($null -ne $Result) {
+            $errorProperty = $Result.PSObject.Properties['Error']
+            if ($null -ne $errorProperty -and $null -ne $errorProperty.Value) { $resultError = [string]$errorProperty.Value }
+        }
+        $detail = if ([string]::IsNullOrWhiteSpace($resultError)) { 'no error was recorded either' } else { ('the result carried this error instead: ' + $resultError) }
+        Add-Failure -Message ('{0}: no payload to read {1} from - {2}' -f $Context, $Name, $detail)
+        return $DefaultValue
+    }
+
+    $property = $payload.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        Add-Failure -Message ('{0}: the payload has no {1}; it carries: {2}' -f $Context, $Name, ((@($payload.PSObject.Properties | ForEach-Object { $_.Name }) -join ', ')))
+        return $DefaultValue
+    }
+
+    return $property.Value
+}
+
 function Assert-Contains {
     param([string]$Text, [string]$Needle, [string]$Message)
 
@@ -603,7 +641,7 @@ try {
     Assert-Equal -Actual ([string]@($results | Where-Object { $_.VMName -eq 'VM01' })[0].Payload.Status.outcome) -Expected 'SearchOnly' -Message 'harness: status.json is downloaded and parsed'
     Assert-Equal -Actual ([bool]@($results | Where-Object { $_.VMName -eq 'VM01' })[0].Payload.AgentResult.Completed) -Expected $true -Message 'harness: a finished guest reports a completed process result'
     Assert-Equal -Actual ([string]@($results | Where-Object { $_.VMName -eq 'VM01' })[0].Payload.Mode) -Expected 'SearchOnly' -Message 'harness: search-only cycles carry their mode'
-    Assert-Equal -Actual ([bool]@($results | Where-Object { $_.VMName -eq 'VM01' })[0].Payload.AgentCompletionConfirmed) -Expected $true -Message 'harness: terminal search status confirms completion'
+    Assert-Equal -Actual ([bool](Get-HarnessPayloadValue -Result @($results | Where-Object { $_.VMName -eq 'VM01' })[0] -Name 'AgentCompletionConfirmed' -DefaultValue $false -Context 'harness: healthy fleet')) -Expected $true -Message 'harness: terminal search status confirms completion'
     Assert-Equal -Actual ([string]::IsNullOrWhiteSpace([string]@($results | Where-Object { $_.VMName -eq 'VM01' })[0].Payload.AgentCompletionReason)) -Expected $false -Message 'harness: completion confirmation carries a reason'
     Assert-Equal -Actual (Test-Path -LiteralPath (Join-Path (Join-Path $workspace 'VM01') 'status.json')) -Expected $true -Message 'harness: status.json lands in the per-VM output directory'
 
@@ -683,7 +721,7 @@ try {
     Assert-Equal ([string]$retryResults[0].Error) '' 'harness: transient poll recovery has no error'
     Assert-Equal $script:guestState['VM-retry'].StartProgramCallCount 2 'harness: transient poll recovery starts mkdir and the agent only once'
     Assert-Equal $script:guestState['VM-retry'].ListProcessCallCount 3 'harness: transient poll recovery asks for the process once per poll plus mkdir'
-    Assert-Equal (@($retryResults[0].Payload.AgentCompletionConfirmed) -contains $true) $true 'harness: transient poll recovery retains terminal completion'
+    Assert-Equal (@(Get-HarnessPayloadValue -Result $retryResults[0] -Name 'AgentCompletionConfirmed' -DefaultValue $false -Context 'harness: transient poll recovery') -contains $true) $true 'harness: transient poll recovery retains terminal completion'
 }
 finally {
     Remove-Item -LiteralPath $workspace -Recurse -Force -ErrorAction SilentlyContinue
@@ -734,7 +772,7 @@ try {
     Assert-Equal -Actual ([bool]$results[0].Payload.AgentResult.Completed) -Expected $false -Message 'harness: a vanished process reports an unknown completion'
     Assert-Equal -Actual ([string]$results[0].Payload.Status.outcome) -Expected 'InstallSucceeded' -Message 'harness: the artifacts still decide the outcome'
     Assert-Equal -Actual ([string]$results[0].Payload.Mode) -Expected 'Apply' -Message 'harness: apply cycles carry their mode'
-    Assert-Equal -Actual ([bool]$results[0].Payload.AgentCompletionConfirmed) -Expected $true -Message 'harness: terminal apply status confirms completion despite a vanished process'
+    Assert-Equal -Actual ([bool](Get-HarnessPayloadValue -Result $results[0] -Name 'AgentCompletionConfirmed' -DefaultValue $false -Context 'harness: vanished process')) -Expected $true -Message 'harness: terminal apply status confirms completion despite a vanished process'
     # A process result vSphere has forgotten is not proof the agent finished, so the guest-side
     # files stay where a human can still read them.
     Assert-Equal -Actual ([string]$results[0].Payload.CleanupStatus) -Expected 'Retained' -Message 'harness: a cycle whose process result was lost keeps its guest directory'

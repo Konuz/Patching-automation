@@ -884,6 +884,58 @@ Assert-Equal -Actual $rebootStateMap['VM-skipped'].state -Expected 'PendingReboo
 Assert-Equal -Actual $rebootStateMap['VM-reboot-only'].state -Expected 'Green' -Message 'a confirmed restart is not marked pending; the next discovery decides'
 Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $rebootStateMap) -Expected $false -Message 'a VM pending a reboot cannot produce exit 0'
 
+# --- an omitted script path must not become "no script" -------------------------------------------
+# A parameter default applies only when the caller OMITS the parameter. Invoke-GuestAgentFleet
+# forwards -WorkspaceScriptPath and -RunGuardScriptPath to Start-VMAgentCycle whether or not it
+# was given them, so a caller that omitted them sent an empty string, which OVERRODE the default
+# and left the workspace bootstrap with no script to run. Every VM failed to start, carrying no
+# payload, and the cause was a parameter nobody passed rather than anything the guest did.
+#
+# Only the harness calls the fleet that way, and the harness needs PowerCLI types, so this went
+# unseen everywhere it could have been caught. Asserted here without PowerCLI, on the value the
+# bootstrap is actually handed - stopping any earlier would pass whether or not it resolves.
+& {
+    $script:seenWorkspaceScript = 'never reached'
+    $script:seenRunGuardScript = 'never reached'
+
+    function Get-ExactVM { param($Name, $Servers) return [pscustomobject]@{ Name = $Name; ExtensionData = [pscustomobject]@{ MoRef = 'vm-1' } } }
+    function Assert-VMReadyForGuestOps { param($VM) }
+    function Get-GuestOpsManagers { param($VMView) return [pscustomobject]@{ ProcessManager = $null; FileManager = $null } }
+    function Get-VMHostNameForTransfer { param($VMView) return 'esx.invalid' }
+    function New-Item { param($ItemType, [switch]$Force, $Path) }
+    function Assert-GuestWorkspaceReady {
+        param($ProcessManager, $VMView, $GuestAuth, $VMName, $Path, $WorkspaceScriptPath, $Mode, $SealToken, $TimeoutSeconds, $PollSeconds)
+        $script:seenWorkspaceScript = [string]$WorkspaceScriptPath
+        throw 'stop after the bootstrap was given its script'
+    }
+
+    foreach ($case in @(
+            [pscustomobject]@{ Name = 'omitted'; Workspace = ''; Guard = '' },
+            [pscustomobject]@{ Name = 'whitespace'; Workspace = '   '; Guard = '   ' }
+        )) {
+        $script:seenWorkspaceScript = 'never reached'
+        try {
+            $null = Start-VMAgentCycle -VMName 'vm' -Servers @('vc') -Managers $null -GuestAuth $null -CurlPath 'curl.exe' `
+                -AgentPath 'agent.ps1' -IdentityHelperPath 'identity.ps1' -GuestWorkingDirectory 'C:\ProgramData\PatchingGuestOps' `
+                -VMOutputDirectory 'unused' -MaxUpdates 1 -WorkspaceScriptPath $case.Workspace -RunGuardScriptPath $case.Guard
+        }
+        catch { }
+
+        Assert-Equal -Actual ([string]::IsNullOrWhiteSpace($script:seenWorkspaceScript)) -Expected $false -Message ('an ' + $case.Name + ' script path is resolved before the bootstrap, not passed through empty')
+        Assert-Equal -Actual ($script:seenWorkspaceScript -like '*GuestWorkspace.ps1') -Expected $true -Message ('an ' + $case.Name + ' script path resolves to the shipped guard')
+    }
+
+    # A path the caller did supply is still honoured - the resolution must not overwrite it.
+    $script:seenWorkspaceScript = 'never reached'
+    try {
+        $null = Start-VMAgentCycle -VMName 'vm' -Servers @('vc') -Managers $null -GuestAuth $null -CurlPath 'curl.exe' `
+            -AgentPath 'agent.ps1' -IdentityHelperPath 'identity.ps1' -GuestWorkingDirectory 'C:\ProgramData\PatchingGuestOps' `
+            -VMOutputDirectory 'unused' -MaxUpdates 1 -WorkspaceScriptPath 'C:\custom\Workspace.ps1' -RunGuardScriptPath 'C:\custom\Guard.ps1'
+    }
+    catch { }
+    Assert-Equal -Actual $script:seenWorkspaceScript -Expected 'C:\custom\Workspace.ps1' -Message 'a supplied script path is used as given'
+}
+
 # --- a guest that refused the run is not a guest with work outstanding ---------------------------
 # The state map is built from DISCOVERY, and discovery is exactly what still succeeded in the
 # window a refusal happens in: another run took the guest, or a reboot was requested, or the

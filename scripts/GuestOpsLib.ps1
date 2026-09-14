@@ -1124,6 +1124,20 @@ function Start-VMAgentCycle {
         [string]$RunGuardScriptPath = (Join-Path $PSScriptRoot '..\guest\GuestRunGuard.ps1')
     )
 
+    # An empty value means "not supplied", not "no script". A parameter default only applies when
+    # the caller OMITS the parameter, and the fleet forwards these whether or not it was given
+    # them - so an omitted path arrived here as an empty string, overrode the default above, and
+    # left the workspace bootstrap with nothing to run. Every VM then failed to start with no
+    # payload, naming a parameter nobody passed rather than anything the guest did.
+    # Resolved here because this file is dot-sourced normally, so $PSScriptRoot is real; the
+    # orchestrator's copy of the fleet is built from its AST, where it is not.
+    if ([string]::IsNullOrWhiteSpace($WorkspaceScriptPath)) {
+        $WorkspaceScriptPath = (Join-Path $PSScriptRoot '..\guest\GuestWorkspace.ps1')
+    }
+    if ([string]::IsNullOrWhiteSpace($RunGuardScriptPath)) {
+        $RunGuardScriptPath = (Join-Path $PSScriptRoot '..\guest\GuestRunGuard.ps1')
+    }
+
     $vm = Get-ExactVM -Name $VMName -Servers $Servers
     Assert-VMReadyForGuestOps -VM $vm
 
