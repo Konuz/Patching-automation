@@ -1728,6 +1728,44 @@ $launcherParams['SelectedUpdateKeys'] = $keys
 '@
 Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $guiIndexSource -Rule $guiRule) -Expected 'assignment-SelectedUpdateKeys' -Message 'indexing the parameter onto the splat hashtable trips the GUI rule'
 
+# --- every shipped .ps1 must parse ---------------------------------------------------------------
+# The rules above parse the files they reason about, which is not the same as parsing everything
+# that ships. This tool is hand-copied onto a customer stepping stone, so a file truncated by an
+# interrupted copy or a flaky share is a realistic failure mode - and it surfaced exactly that way:
+# a test file cut mid-line, the static gate green because it never opened that file, and a raw
+# parser error three gates later that reads like a code defect rather than a damaged copy.
+#
+# The first gate is where that belongs. Everything under the repository root is swept, including
+# the tests themselves, so a bad copy is named with its file and line before anything is run.
+& {
+    $sweptRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+    $ignoredSegments = @('\out\', '\spec\', '\.git\', '\docs\superpowers\')
+    foreach ($swept in @(Get-ChildItem -LiteralPath $sweptRoot -Filter '*.ps1' -Recurse -File -ErrorAction SilentlyContinue)) {
+        $sweptPath = [string]$swept.FullName
+        $comparable = ($sweptPath -replace '/', '\')
+        $skip = $false
+        foreach ($ignored in $ignoredSegments) {
+            if ($comparable.IndexOf($ignored, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $skip = $true
+                break
+            }
+        }
+        if ($skip) {
+            continue
+        }
+
+        $sweptErrors = $null
+        $null = [System.Management.Automation.Language.Parser]::ParseFile($sweptPath, [ref]$null, [ref]$sweptErrors)
+        foreach ($sweptError in @($sweptErrors)) {
+            $relative = $sweptPath
+            if ($relative.StartsWith($sweptRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $relative = $relative.Substring($sweptRoot.Length).TrimStart('\', '/')
+            }
+            Add-Failure -Message ("Parse error in {0} at line {1}, column {2}: {3} (a file that does not parse is usually a truncated or partial copy, not a code defect)" -f $relative, $sweptError.Extent.StartLineNumber, $sweptError.Extent.StartColumnNumber, $sweptError.Message)
+        }
+    }
+}
+
 if ($failures.Count -gt 0) {
     Write-Host 'Static checks failed:'
     foreach ($failure in $failures) {
