@@ -208,6 +208,44 @@ finally {
     Remove-Item -LiteralPath $resolvedTestDirectory -Recurse -Force
 }
 
+# A credential refusal after submission cannot release the next reboot batch. Keep
+# observing other members of the current batch, but never submit the waiting batch.
+foreach ($refusalKind in @('CredentialsSkipped', 'CredentialsAborted')) {
+    & {
+        $fixture = @{ Started = @(); Reads = @{}; Prompts = 0 }
+        $targets = @(1..3 | ForEach-Object { [pscustomobject]@{ vmName = ('vm-' + $_); rebootReason = 'pending'; Sequence = $_ } })
+        $records = @(Invoke-RebootBatchCoordinator -RebootTargets $targets -BatchSize 2 -WaitTimeoutSeconds 30 -PollSeconds 1 -GraceSeconds 0 -SleepScript {} -ReadBootTimeScript {
+            param($Items)
+            foreach ($item in $Items) {
+                $name = [string]$item.VMName
+                $submitted = $fixture.Started -contains $name
+                $refused = $submitted -and $name -eq 'vm-1'
+                if ($submitted) { $fixture.Reads[$name] = 1 + [int]$fixture.Reads[$name] }
+                $bootTime = [datetime]'2026-09-14T01:00:00Z'
+                if ($submitted -and -not $refused -and $fixture.Reads[$name] -gt 1) { $bootTime = $bootTime.AddHours(1) }
+                [pscustomobject]@{
+                    VMName = $name
+                    BootTimeUtc = $(if ($refused) { $null } else { $bootTime })
+                    Error = $(if ($refused) { 'Credential recovery refused after submission.' } else { $null })
+                    ErrorKind = $(if ($refused) { $refusalKind } else { $null })
+                    RejectedBeforeStart = $false
+                }
+            }
+        } -InitiateRebootScript {
+            param($Items)
+            foreach ($item in $Items) {
+                $fixture.Started += [string]$item.VMName
+                [pscustomobject]@{ VMName = $item.VMName; ProcessId = 123; Error = $null }
+            }
+        } -DecisionPromptScript { param($Context) $fixture.Prompts++; return 'CONTINUE' })
+        Assert-Equal ($fixture.Started -join ',') 'vm-1,vm-2' ($refusalKind + ': no later batch is submitted without confirmation')
+        Assert-Equal (@($records | Where-Object { $_.vmName -eq 'vm-2' })[0].validationStatus) 'Confirmed' ($refusalKind + ': peers already restarting are still observed')
+        Assert-Equal (@($records | Where-Object { $_.vmName -eq 'vm-3' })[0].action) 'NotStartedAfterAbort' ($refusalKind + ': waiting VM is explicitly not started')
+        Assert-Equal (@($records | Where-Object { $_.vmName -eq 'vm-1' })[0].errorKind) $refusalKind ($refusalKind + ': the original refusal is retained')
+        Assert-Equal $fixture.Prompts 0 ($refusalKind + ': refusal is not replaced by a generic continue prompt')
+    }
+}
+
 if ($failures.Count -gt 0) {
     foreach ($failure in $failures) { Write-Host ('FAIL: ' + $failure) }
     exit 1

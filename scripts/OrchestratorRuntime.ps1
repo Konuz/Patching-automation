@@ -1009,12 +1009,12 @@ function Get-PatchRoundDecision {
     )
 
     $states = @($CompletionStates)
-    $pending = @($states | Where-Object { [string]$_.state -eq 'Pending' })
+    $pending = @($states | Where-Object { [string]$_.state -in @('Pending', 'PendingReboot') })
     $pendingVMNames = @($pending | ForEach-Object { [string]$_.vmName })
     # Excluded VMs (Failover Cluster) can never be patched by this tool, so they must not
     # count against "all green" - otherwise the run would never settle over a VM it will
     # never touch. Failed discovery is not green and is not retryable here either.
-    $allGreen = (@($states | Where-Object { [string]$_.state -in @('Pending', 'Failed') }).Count -eq 0)
+    $allGreen = (@($states | Where-Object { [string]$_.state -in @('Pending', 'PendingReboot', 'Failed') }).Count -eq 0)
 
     # Round one always proceeds to group selection, even with nothing preselected: the
     # operator must still get to see the group list and tick something the default policy
@@ -2061,6 +2061,10 @@ function Invoke-RebootBatchCoordinator {
                 $waitGraceSeconds = 0
                 $records += $wait.Records
                 $pendingItems = $wait.Pending
+                if (@($wait.Records | Where-Object { Test-CredentialRefusalErrorKind -ErrorKind $_.errorKind }).Count -gt 0) {
+                    # Observe remaining batch members, but do not start another batch without confirmation.
+                    $aborted = $true
+                }
 
                 if ($pendingItems.Count -eq 0) {
                     break

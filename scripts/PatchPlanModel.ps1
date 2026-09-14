@@ -793,6 +793,10 @@ function Get-VMPatchCompletionStates {
             $state = 'Failed'
             $reason = ('Discovery did not succeed (outcome {0}).' -f $outcome)
         }
+        elseif ([bool](Get-ModelPropertyValue -InputObject (Get-ModelPropertyValue -InputObject $discoveryRecord -Name 'pendingRebootBefore') -Name 'isPending' -DefaultValue $false)) {
+            $state = 'PendingReboot'
+            $reason = 'The guest still requires a restart.'
+        }
         elseif ($pendingCount -gt 0) {
             $state = 'Pending'
             $reason = ('{0} selectable update group(s) still apply.' -f $pendingCount)

@@ -2235,7 +2235,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
             # Nothing to install, but the guest already carries a pending reboot.
             return @([pscustomobject]@{ vmName = 'VM-reboot'; computerName = 'VM-reboot'; outcome = 'SearchOnly'; errors = @(); roleFlags = $f7Role; pendingRebootBefore = [pscustomobject]@{ isPending = $true }; updates = @() })
         }
-        return @([pscustomobject]@{ vmName = 'VM-reboot'; computerName = 'VM-reboot'; outcome = 'SearchOnly'; errors = @(); roleFlags = $f7Role; pendingRebootBefore = [pscustomobject]@{ isPending = $false }; updates = @($script:f7RoundTwoUpdates) })
+        return @([pscustomobject]@{ vmName = 'VM-reboot'; computerName = 'VM-reboot'; outcome = 'SearchOnly'; errors = @(); roleFlags = $f7Role; pendingRebootBefore = [pscustomobject]@{ isPending = $script:f7PendingAfterReboot }; updates = @($script:f7RoundTwoUpdates) })
     }
     function Read-UpdateGroupSelection { param($UpdateGroups, $PromptProvider) return [pscustomobject]@{ Aborted = $false; Keys = @(@($UpdateGroups) | ForEach-Object { [string]$_.identityKey }) } }
     function Confirm-PatchPlan { param([switch]$SkipConfirmation) $true }
@@ -2276,12 +2276,13 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
     }
 
     $f7Invoke = {
-        param([bool]$RebootApproved, [bool]$RebootConfirmed, $RoundTwoUpdates)
+        param([bool]$RebootApproved, [bool]$RebootConfirmed, $RoundTwoUpdates, [bool]$PendingAfterReboot = $false)
         $script:f7DiscoveryCalls = 0
         $script:f7DiscoveryTargets = @()
         $script:f7RebootApproved = $RebootApproved
         $script:f7RebootConfirmed = $RebootConfirmed
         $script:f7RoundTwoUpdates = @($RoundTwoUpdates)
+        $script:f7PendingAfterReboot = $PendingAfterReboot
 
         $roundNumber = 0
         $targetVMNames = @('VM-reboot')
@@ -2346,6 +2347,11 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         Assert-Equal (@($confirmed.DiscoveryTargets[1]) -join ',') 'VM-reboot' 'F7: the rebooted VM is the target of that discovery even though it installed nothing'
         Assert-Equal $confirmed.State 'Green' 'F7: only the post-reboot discovery may call the VM green'
         Assert-Equal $confirmed.ExitCode 0 'F7: a verified reboot-only round can finish successfully'
+
+        $stillNeedsReboot = & $f7Invoke $true $true @() $true
+        Assert-Equal $stillNeedsReboot.State 'PendingReboot' 'F7: fresh discovery still requiring a reboot cannot become Green'
+        Assert-Equal $stillNeedsReboot.ExitCode 1 'F7: a persistent reboot requirement cannot exit 0'
+        Assert-Equal $stillNeedsReboot.DiscoveryCalls 3 'F7: reboot-only rounds continue up to the configured round cap'
 
         # 2. The post-reboot discovery finds new patches: the VM is pending again and gets another
         #    round rather than being reported as finished.
