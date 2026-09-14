@@ -8,7 +8,7 @@
     inherited permissions, because someone made it first, or because a link points somewhere
     else - they can replace the agent between the upload and the start and have it run under the
     patching account. So this directory has to be created and proven safe BEFORE the first byte
-    is uploaded, which is why this file is executed through `powershell.exe -EncodedCommand`
+    is uploaded, which is why this file is executed through `powershell.exe -Command` with an in-memory GZip payload
     rather than transferred and then run.
 
     Two entry points:
@@ -509,7 +509,7 @@ function Initialize-GuestWorkspace {
 
 # --- bootstrap dispatch ----------------------------------------------------------------------
 # The orchestrator prepends a request object and runs the whole text through
-# `powershell.exe -EncodedCommand`, so this file is never uploaded into a directory it has not
+# `powershell.exe -Command` with an in-memory GZip payload, so this file is never uploaded into a directory it has not
 # yet proven safe. Dot-sourcing it (the offline tests do) defines the functions and runs nothing.
 if (Test-Path -LiteralPath 'Variable:GuestWorkspaceRequest') {
     $guestWorkspaceExitCode = [int]$script:GuestWorkspaceExitCodes['Unexpected']

@@ -92,7 +92,7 @@ Execution flows through layered runtime scripts plus the offline planning model 
 4. **`scripts/PatchPlanModel.ps1`** (offline model) — pure planning/reporting logic for update identity validation, default group selection, Failover Cluster skips, per-VM patch plans, summaries, and PlanOnly exit semantics. Keep it free of PowerCLI, GuestOps calls, `Read-Host`, and top-level runtime flow.
 5. **`scripts/GuestOpsLib.ps1`** (GuestOps helpers) — shared PowerCLI/GuestOps file transfer and process-run helpers. The guest agent cycle is split into `Start-VMAgentCycle` (upload + `StartProgramInGuest`), `Test-VMAgentCycleComplete` (one `ListProcessesInGuest`) and `Complete-VMAgentCycle` (download + parse). Those three are the whole cycle; the single-shot `Invoke-VMAgentCycle`/`Invoke-GuestAgentRun` that preceded them are gone, along with the needles that were keeping them alive after their last caller disappeared.
 6. **`guest/Run-LocalPatch.ps1`** (agent, runs *inside* the guest) — WUA COM only: `Microsoft.Update.Session` → searcher → downloader → installer. Writes `status.json` + `agent.log` to a unique cycle directory (`C:\ProgramData\PatchingGuestOps\<runId>`). **Never reboots** — it only reports `pendingReboot`. `Test-PendingReboot` gates `isPending` on the two servicing flags only — `Component Based Servicing\RebootPending` and `WindowsUpdate\Auto Update\RebootRequired` — because those are what Windows Update sets when a patch it installed still needs a restart. `PendingFileRenameOperations` is detected, filtered to non-blank entries (it is a REG_MULTI_SZ of source/destination pairs and a queued delete has an empty destination), and reported as `advisoryReasons`, but it never gates the prompt on its own: any installer can queue a rename, and it was observed as the only flag set on a fully patched guest with zero applicable updates, offering a reboot no update had asked for. `pendingReasons` names the gating flags that fired; the orchestrator carries them into the reboot target's `rebootReason` so the prompt says which flag it is acting on.
-7. **`guest/GuestWorkspace.ps1`** (guard, runs *inside* the guest, **never uploaded** by the bootstrap) — creates the tool directory with a protected DACL and verifies owner, access rules, reparse points and the parent before anything is written to it, then seals it with a one-time token every later guest-side step re-verifies. Executed through `powershell.exe -EncodedCommand`; uploaded beside the agent and the boot-time helper only so *they* can re-check the seal. See "Securing the guest directory before the first upload".
+7. **`guest/GuestWorkspace.ps1`** (guard, runs *inside* the guest, **never uploaded** by the bootstrap) — creates the tool directory with a protected DACL and verifies owner, access rules, reparse points and the parent before anything is written to it, then seals it with a one-time token every later guest-side step re-verifies. Executed through `powershell.exe -Command` with an in-memory GZip payload; uploaded beside the agent and the boot-time helper only so *they* can re-check the seal. See "Securing the guest directory before the first upload".
 8. **`guest/GuestRunGuard.ps1`** (guard, runs *inside* the guest) — the one-run-per-guest lock and its coordination record; see "One run per guest".
 9. **`guest/Request-GuestReboot.ps1`** (runs *inside* the guest, **never uploaded**) — takes the run guard and invokes `shutdown.exe` while holding it.
 10. **`guest/Read-BootTime.ps1`** (helper, runs *inside* the guest) — reads `Win32_OperatingSystem.LastBootUpTime` and writes a UTC/ISO 8601 result for the reboot validation gate.
@@ -208,7 +208,7 @@ turn into `Green`; timeout recovery only accepts an artifact with confirmed comp
 
 `guest/GuestWorkspace.ps1` runs **inside the guest and is never uploaded**. The orchestrator
 reads the trusted local copy, prepends a request object and runs the whole text through
-`powershell.exe -NoProfile -NonInteractive -EncodedCommand`. Uploading the guard into the
+`powershell.exe -NoProfile -NonInteractive -Command` with an in-memory GZip payload. Uploading the guard into the
 directory it is meant to be guarding would mean writing a file into an unverified location and
 then trusting what came back from it. The requested path travels **base64-encoded as data** and
 is decoded inside the guest: a directory name is operator input, and interpolating it into the
@@ -384,7 +384,7 @@ reboot phase and the next round.
 
 Reboot is the other holder. `shutdown.exe` is no longer started directly over GuestOps; instead
 `guest/Request-GuestReboot.ps1` (concatenated with the workspace guard and the run guard, and run
-through `-EncodedCommand`) takes the guard, writes `RebootRequested`, and invokes `shutdown.exe`
+through an in-memory compressed command) takes the guard, writes `RebootRequested`, and invokes `shutdown.exe`
 itself — so a restart can never be ordered on a guest whose agent is still installing. The order
 of writes is load-bearing: the marker goes down **before** `shutdown.exe` is invoked, and is
 rolled back **only** when this process is certain it never got that far. Once invoked, an

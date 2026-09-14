@@ -544,7 +544,8 @@ Prawo utworzenia nowego elementu obok nie jest błędem (`C:\ProgramData` daje j
 Użytkownicy z założenia) i ACL katalogów wspólnych nie jest zmieniane.
 
 Skrypt kontrolny nie jest wysyłany do gościa — jest uruchamiany z zaufanej kopii lokalnej przez
-`powershell.exe -EncodedCommand`, a ścieżka podróżuje jako dane (base64), nie jako kod. Narzędzie
+`powershell.exe -Command` ze skompresowaną treścią GZip odtwarzaną w pamięci. Ścieżka podróżuje
+jako dane (base64), nie jako kod. Narzędzie
 niczego nie „naprawia”: katalog, który nie spełnia warunków, zatrzymuje **tę** maszynę, bez
 przejmowania własności, zmiany uprawnień i bez usuwania czegokolwiek. Nieudana kontrola oznacza
 zero transferów i zero uruchomień agenta na tej maszynie. Brak odpowiedzi od gościa (utracony kod

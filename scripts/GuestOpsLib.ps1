@@ -499,6 +499,49 @@ function Get-GuestWorkspaceFailureReason {
     return ('the guest reported an unrecognised workspace exit code {0}' -f $code)
 }
 
+function New-CompressedGuestScript {
+    param([string]$ScriptText)
+
+    $stream = New-Object System.IO.MemoryStream
+    try {
+        $gzip = New-Object System.IO.Compression.GZipStream($stream, [System.IO.Compression.CompressionMode]::Compress, $true)
+        try {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($ScriptText)
+            $gzip.Write($bytes, 0, $bytes.Length)
+        }
+        finally { $gzip.Dispose() }
+        $payload = [System.Convert]::ToBase64String($stream.ToArray())
+    }
+    finally { $stream.Dispose() }
+
+    # Only base64 data is substituted. The trusted helper is reconstructed in memory,
+    # before there is any safe guest directory into which a helper could be uploaded.
+    $loader = @'
+$ErrorActionPreference = 'Stop'
+$guestBootstrapStream = New-Object System.IO.MemoryStream(,[System.Convert]::FromBase64String('__PAYLOAD__'))
+$guestBootstrapGzip = New-Object System.IO.Compression.GZipStream($guestBootstrapStream, [System.IO.Compression.CompressionMode]::Decompress)
+$guestBootstrapReader = New-Object System.IO.StreamReader($guestBootstrapGzip, [System.Text.Encoding]::UTF8)
+try { $guestBootstrapSource = $guestBootstrapReader.ReadToEnd() }
+finally { $guestBootstrapReader.Dispose() }
+. ([scriptblock]::Create($guestBootstrapSource))
+'@
+    return $loader.Replace('__PAYLOAD__', $payload)
+}
+
+function New-GuestBootstrapArguments {
+    param([string]$EncodedCommand)
+
+    # Builders retain their encoded return contract. Do not send that UTF-16/base64
+    # expansion to Windows: the compressed loader is already safe command text.
+    $command = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String($EncodedCommand))
+    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "{0}"' -f $command.Replace('"', '\"')
+    # Reserve room for the executable name and terminating null below Windows' 32767 limit.
+    if ($arguments.Length -gt 32000) {
+        throw ('Guest bootstrap arguments are too long ({0} characters; maximum 32000). No guest process was started.' -f $arguments.Length)
+    }
+    return $arguments
+}
+
 function New-GuestWorkspaceBootstrapCommand {
     param(
         [string]$WorkspaceScriptText,
@@ -531,7 +574,7 @@ function New-GuestWorkspaceBootstrapCommand {
         "`$GuestWorkspaceRequest = [pscustomobject]@{ Mode = '$Mode'; PathBase64 = '$pathBase64'; FileBase64 = '$fileBase64'; SealTokenBase64 = '$sealBase64' }"
     ) -join [Environment]::NewLine
 
-    $commandText = $preamble + [Environment]::NewLine + $WorkspaceScriptText
+    $commandText = $preamble + [Environment]::NewLine + (New-CompressedGuestScript -ScriptText $WorkspaceScriptText)
     return [System.Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($commandText))
 }
 
@@ -555,7 +598,7 @@ function Start-GuestWorkspaceBootstrap {
 
     $programSpec = New-Object VMware.Vim.GuestProgramSpec
     $programSpec.ProgramPath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
-    $programSpec.Arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {0}' -f $EncodedCommand)
+    $programSpec.Arguments = New-GuestBootstrapArguments -EncodedCommand $EncodedCommand
     $programSpec.WorkingDirectory = 'C:\Windows\System32'
 
     return $ProcessManager.StartProgramInGuest($VMView.MoRef, $GuestAuth, $programSpec)
@@ -576,7 +619,7 @@ function Assert-GuestWorkspaceReady {
         [int]$PollSeconds = 5
     )
 
-    # Executed straight from the trusted local copy through -EncodedCommand. Uploading the
+    # Executed straight from the trusted local copy through an in-memory compressed command. Uploading the
     # guard into the directory it is supposed to be guarding would mean writing a file into an
     # unverified location and then trusting what came back from it.
     $encodedCommand = New-GuestWorkspaceBootstrapCommand -WorkspaceScriptText (Get-GuestWorkspaceScriptText -WorkspaceScriptPath $WorkspaceScriptPath) -Path $Path -Mode $Mode -FilePath $FilePath -SealToken $SealToken
@@ -813,7 +856,8 @@ function New-GuestRebootBootstrapCommand {
     $commentBase64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$Comment))
     $preamble = "`$GuestRebootRequest = [pscustomobject]@{ RunIdBase64 = '$runIdBase64'; CommentBase64 = '$commentBase64' }"
 
-    $commandText = @($preamble, $WorkspaceScriptText, $RunGuardScriptText, $RebootScriptText) -join [Environment]::NewLine
+    $scriptText = @($WorkspaceScriptText, $RunGuardScriptText, $RebootScriptText) -join [Environment]::NewLine
+    $commandText = $preamble + [Environment]::NewLine + (New-CompressedGuestScript -ScriptText $scriptText)
     return [System.Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($commandText))
 }
 
@@ -841,7 +885,7 @@ function Start-GuestReboot {
 
     $programSpec = New-Object VMware.Vim.GuestProgramSpec
     $programSpec.ProgramPath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
-    $programSpec.Arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {0}' -f $encodedCommand)
+    $programSpec.Arguments = New-GuestBootstrapArguments -EncodedCommand $encodedCommand
     $programSpec.WorkingDirectory = 'C:\Windows\System32'
 
     return $ProcessManager.StartProgramInGuest($VMView.MoRef, $GuestAuth, $programSpec)
@@ -1120,7 +1164,7 @@ function Start-VMAgentCycle {
         [string]$SelectionPath,
         [switch]$SearchOnly,
         [int]$TransferTimeoutSeconds = 300,
-        # Read from the trusted local copy and executed in the guest through -EncodedCommand.
+        # Read from the trusted local copy and executed in the guest through an in-memory compressed command.
         # Defaulted here rather than at the call sites so every caller gets the guard.
         [string]$WorkspaceScriptPath = (Join-Path $PSScriptRoot '..\guest\GuestWorkspace.ps1'),
         # Uploaded beside the agent, which dot-sources both: the workspace primitives and the

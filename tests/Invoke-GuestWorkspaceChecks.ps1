@@ -180,7 +180,7 @@ Assert-Contains (Get-GuestWorkspaceFailureReason -ExitCode 18) 'seal' 'the orche
 }
 
 # --- the bootstrap command ------------------------------------------------------------------------
-# Built from the trusted local copy and run through -EncodedCommand, so the guard is never
+# Built from the trusted local copy and run through an in-memory compressed command, so the guard is never
 # uploaded into the directory it is meant to be guarding.
 
 $workspaceScriptPath = Join-Path $repoRoot 'guest/GuestWorkspace.ps1'
@@ -190,7 +190,7 @@ Assert-Contains $workspaceScriptText 'function Assert-GuestWorkspacePath' 'the h
 $encoded = New-GuestWorkspaceBootstrapCommand -WorkspaceScriptText $workspaceScriptText -Path 'C:\ProgramData\PatchingGuestOps' -Mode 'Initialize'
 $decoded = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String($encoded))
 Assert-Contains $decoded 'GuestWorkspaceRequest' 'the bootstrap carries a request object'
-Assert-Contains $decoded 'function Initialize-GuestWorkspace' 'the bootstrap carries the whole guard'
+Assert-Contains $decoded 'GZipStream' 'the bootstrap carries the guard compressed in memory'
 
 # The path travels as data. A directory name is operator input, so interpolating it into the
 # command text would make it a place where PowerShell syntax can be written.
@@ -203,6 +203,54 @@ Assert-Contains $injectionDecoded ([System.Convert]::ToBase64String([System.Text
 $fileScopedEncoded = New-GuestWorkspaceBootstrapCommand -WorkspaceScriptText 'function Initialize-GuestWorkspace { }' -Path 'C:\ProgramData\PatchingGuestOps' -FilePath 'C:\ProgramData\PatchingGuestOps\Read-BootTime-vm.ps1'
 $fileScopedDecoded = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String($fileScopedEncoded))
 Assert-Contains $fileScopedDecoded ([System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes('C:\ProgramData\PatchingGuestOps\Read-BootTime-vm.ps1'))) 'a re-used guest file is named as data too'
+
+# Exercise the exact native command line on Windows, not just a permissive fake vSphere.
+& {
+    $runBootstrap = {
+        param([string]$EncodedCommand)
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $startInfo.Arguments = New-GuestBootstrapArguments -EncodedCommand $EncodedCommand
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $process = [System.Diagnostics.Process]::Start($startInfo)
+        try {
+            if (-not $process.WaitForExit(30000)) {
+                $process.Kill()
+                throw 'The local bootstrap test did not finish in 30 seconds.'
+            }
+            return [pscustomobject]@{ ExitCode = $process.ExitCode; Output = $process.StandardOutput.ReadToEnd().Trim(); Error = $process.StandardError.ReadToEnd() }
+        }
+        finally { $process.Dispose() }
+    }
+    # Assert rejects a relative path before accessing any guest directory or changing ACLs.
+    $workspaceCommand = New-GuestWorkspaceBootstrapCommand -WorkspaceScriptText $workspaceScriptText -Path 'relative' -Mode Assert
+    $workspaceResult = & $runBootstrap $workspaceCommand
+    Assert-Equal $workspaceResult.ExitCode 10 'the complete compressed workspace guard runs in Windows PowerShell and preserves its refusal exit code'
+    Assert-Equal $workspaceResult.Error '' 'the compressed workspace guard produces no parser or decompression errors'
+
+    $runGuardText = Get-Content (Join-Path $repoRoot 'guest/GuestRunGuard.ps1') -Raw
+    $rebootText = Get-Content (Join-Path $repoRoot 'guest/Request-GuestReboot.ps1') -Raw
+    $realRebootCommand = New-GuestRebootBootstrapCommand -WorkspaceScriptText $workspaceScriptText -RunGuardScriptText $runGuardText -RebootScriptText $rebootText -RunId 'size-check'
+    Assert-Equal ((New-GuestBootstrapArguments $realRebootCommand).Length -le 32000) $true 'the complete real reboot command fits the Windows limit'
+    # Never execute the reboot request locally. A harmless final script checks that both real
+    # libraries and the request data survive decompression into the same scope.
+    $comment = "test 'quoted' " + [char]0x0142 + '; exit 99'
+    $commentBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($comment))
+    $probe = 'if ((Get-GuestWorkspaceExitCode -Status PathRefused) -ne 10 -or -not (Get-Command Enter-GuestRunGuard)) { exit 99 }; Write-Output $GuestRebootRequest.CommentBase64; exit 20'
+    $rebootCommand = New-GuestRebootBootstrapCommand -WorkspaceScriptText $workspaceScriptText -RunGuardScriptText $runGuardText -RebootScriptText $probe -RunId 'safe-probe' -Comment $comment
+    $rebootResult = & $runBootstrap $rebootCommand
+    Assert-Equal $rebootResult.ExitCode 20 'the compressed reboot payload preserves its exit code and helper scope'
+    Assert-Equal $rebootResult.Output $commentBase64 'Unicode and quoted reboot data survive as data'
+    Assert-Equal $rebootResult.Error '' 'the compressed reboot probe produces no parser or decompression errors'
+
+    $oversized = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(('x' * 33000)))
+    $sizeError = ''
+    try { $null = New-GuestBootstrapArguments $oversized } catch { $sizeError = $_.Exception.Message }
+    Assert-Contains $sizeError 'too long' 'oversized future bootstraps fail locally before GuestOps'
+}
 
 # --- what the orchestrator does with the verdict ---------------------------------------------------
 
@@ -225,7 +273,7 @@ Assert-Contains $fileScopedDecoded ([System.Convert]::ToBase64String([System.Tex
     # this fixture stands in for it and records what would have been asked of the guest.
     function Start-GuestWorkspaceBootstrap {
         param($ProcessManager, $VMView, $GuestAuth, [string]$EncodedCommand)
-        return $ProcessManager.StartProgramInGuest($VMView.MoRef, $GuestAuth, [pscustomobject]@{ Arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {0}' -f $EncodedCommand) })
+        return $ProcessManager.StartProgramInGuest($VMView.MoRef, $GuestAuth, [pscustomobject]@{ Arguments = (New-GuestBootstrapArguments -EncodedCommand $EncodedCommand) })
     }
     function Wait-GuestProcess {
         param($ProcessManager, $VMView, $GuestAuth, [long]$ProcessId, [int]$TimeoutSeconds, [int]$PollSeconds)
@@ -246,7 +294,7 @@ Assert-Contains $fileScopedDecoded ([System.Convert]::ToBase64String([System.Tex
     }
 
     Assert-Equal (& $invokeWorkspace 0 $true) '' 'a guest that reports success lets the phase continue'
-    Assert-Contains $script:workspaceArguments '-EncodedCommand' 'the guard runs through -EncodedCommand, never as an uploaded file'
+    Assert-Contains $script:workspaceArguments '-Command' 'the guard runs in memory, never as an uploaded file'
     Assert-Equal ($script:workspaceArguments -like '*-NoProfile*') $true 'the guard runs without a profile'
 
     foreach ($case in @(

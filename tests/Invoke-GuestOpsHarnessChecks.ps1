@@ -150,9 +150,9 @@ function New-FakeManagers {
         param($MoRef, $Auth, $Spec)
         $this.State.StartProgramCallCount++
         $this.State.NextProcessId++
-        # The workspace guard is an -EncodedCommand run that has to finish before anything is
+        # The workspace guard is an in-memory compressed command that has to finish before anything is
         # uploaded; it reports through its exit code, which this fixture can steer.
-        if ([string]$Spec.Arguments -like '*-EncodedCommand*') {
+        if ([string]$Spec.Arguments -like '*-Command*') {
             $this.State.WorkspaceSpecs += $Spec
             $this.State.SetupProcessIds[[string]$this.State.NextProcessId] = [int]$this.State.WorkspaceExitCode
         }
@@ -432,19 +432,21 @@ try {
     $okHandle = Start-VMAgentCycle -VMName 'VM-workspace-ok' -Servers $harnessServerScope -Managers $okManagers -GuestAuth (New-GuestAuthentication -Credential $harnessCredential) -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -VMOutputDirectory (Join-Path $workspaceGuardWorkspace 'VM-workspace-ok') -MaxUpdates 1
     $okState = $script:guestState['VM-workspace-ok']
     Assert-Equal -Actual @($okState.WorkspaceSpecs).Count -Expected 1 -Message 'harness: the workspace guard runs once per cycle'
+    Assert-Equal -Actual (([string]$okState.WorkspaceSpecs[0].Arguments).Length -lt 32000) -Expected $true -Message 'harness: the workspace bootstrap fits the Windows command-line limit'
     Assert-Equal -Actual ([string]@($okState.WorkspaceSpecs)[0].ProgramPath -like '*powershell.exe') -Expected $true -Message 'harness: the workspace guard runs through powershell.exe'
     Assert-Equal -Actual ([string]@($okState.WorkspaceSpecs)[0].ProgramPath) -Expected 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -Message 'harness: the workspace guard uses the exact Windows PowerShell executable path'
-    Assert-Contains -Text ([string]@($okState.WorkspaceSpecs)[0].Arguments) -Needle '-EncodedCommand' -Message 'harness: the workspace guard is never uploaded, it is encoded into the command'
+    Assert-Contains -Text ([string]@($okState.WorkspaceSpecs)[0].Arguments) -Needle '-Command' -Message 'harness: the workspace guard is never uploaded, it is compressed into the command'
     Assert-Equal -Actual ($okState.UploadedPaths.Count -gt 0) -Expected $true -Message 'harness: a secured workspace still uploads the agent'
     Assert-Equal -Actual ($okHandle.GuestCycleDirectory -like ($guestWorkingDirectory + '*')) -Expected $true -Message 'harness: the secured path is the cycle directory'
+    $null = Start-GuestReboot -ProcessManager $okHandle.Managers.ProcessManager -VMView $okHandle.VMView -GuestAuth $null -RunId 'bootstrap-size-probe' -WorkspaceScriptPath (Join-Path $Root 'guest/GuestWorkspace.ps1') -RunGuardScriptPath (Join-Path $Root 'guest/GuestRunGuard.ps1') -RebootScriptPath (Join-Path $Root 'guest/Request-GuestReboot.ps1')
+    Assert-Equal -Actual (([string]$okState.WorkspaceSpecs[-1].Arguments).Length -lt 32000) -Expected $true -Message 'harness: the reboot bootstrap fits the Windows command-line limit'
 
     # The seal only works if the token the bootstrap wrote is the token the agent is asked to
     # verify. Nothing else couples the two calls, and if they diverge the agent refuses every
     # apply in the field while every offline test still passes.
     $bootstrapArguments = [string]@($okState.WorkspaceSpecs)[0].Arguments
-    $encodedIndex = $bootstrapArguments.IndexOf('-EncodedCommand')
-    $encodedBootstrap = ($bootstrapArguments.Substring($encodedIndex + '-EncodedCommand'.Length)).Trim().Trim('"')
-    $decodedBootstrap = [System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String($encodedBootstrap))
+    $commandIndex = $bootstrapArguments.IndexOf('-Command')
+    $decodedBootstrap = ($bootstrapArguments.Substring($commandIndex + '-Command'.Length)).Trim().Trim('"')
     $sealBase64Match = [regex]::Match($decodedBootstrap, "SealTokenBase64 = '([^']*)'")
     Assert-Equal -Actual $sealBase64Match.Success -Expected $true -Message 'harness: the bootstrap carries a seal token'
     $bootstrapSealToken = ''
