@@ -12,8 +12,31 @@ function Assert-Equal {
     if ($Actual -ne $Expected) { $script:failures += ('{0}: expected {1}, got {2}' -f $Message, $Expected, $Actual) }
 }
 
+# A real exception type for the fixtures that are THROWN. PSTypeNames is a PowerShell-side
+# decoration on an instance, and an instance stored as the InnerException of another exception is
+# re-wrapped when it is read back - so the decoration cannot be relied on to survive that round
+# trip on every host. Get-GuestOperationErrorKind matches the SHORT type name, so a test namespace
+# carries the meaning without colliding with PowerCLI's own type when it is installed, and without
+# force-loading a VMware assembly.
+if (-not ('PatchingGuestOpsTests.Vim.InvalidGuestLogin' -as [type])) {
+    Add-Type -TypeDefinition @'
+namespace PatchingGuestOpsTests.Vim {
+    public class InvalidGuestLogin : System.Exception {
+        public InvalidGuestLogin(string message) : base(message) { }
+    }
+}
+'@
+}
+
+function New-InvalidGuestLoginException {
+    param([string]$Message)
+
+    return (New-Object PatchingGuestOpsTests.Vim.InvalidGuestLogin -ArgumentList $Message)
+}
+
 # Offline error fixtures carry the production type names as PowerShell type-name
-# metadata, so these tests never force-load VMware assemblies.
+# metadata, so these tests never force-load VMware assemblies. Only fixtures that are INSPECTED
+# rather than thrown may use this; anything thrown goes through New-InvalidGuestLoginException.
 function New-ErrorTypeFixture {
     param(
         [string]$TypeName,
@@ -1340,9 +1363,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         if (@($Servers).Count -eq 0) { throw 'a boot-time read must scope its lookup' }
         $script:f5BootReadCalls++
         if ($script:f5RebootMode -eq 'BootReadRejected' -and $script:f5BootReadCalls -eq 1) {
-            $invalidLogin = New-Object System.Exception('Synthetic InvalidGuestLogin during boot-time read.')
-            $invalidLogin.PSTypeNames.Insert(0, 'VMware.Vim.InvalidGuestLogin')
-            throw $invalidLogin
+            throw (New-InvalidGuestLoginException -Message 'Synthetic InvalidGuestLogin during boot-time read.')
         }
         $bootTime = if ($script:f5BootReadCalls -le 2) { $baseBootTime } else { $newBootTime }
         return [pscustomobject]@{ VMName = $VMName; BootTimeUtc = $bootTime; UptimeSeconds = 60 }
@@ -1511,9 +1532,13 @@ function Invoke-VMGuestReboot {
         throw (New-Object System.TimeoutException -ArgumentList 'synthetic transport failure sending shutdown')
     }
     if ($env:F5_JOB_MODE -eq 'RebootRejected') {
-        $invalidLogin = New-Object System.Exception -ArgumentList 'synthetic rejected login sending shutdown'
-        $invalidLogin.PSTypeNames.Insert(0, 'VMware.Vim.InvalidGuestLogin')
-        throw $invalidLogin
+        # Defined here rather than decorated with PSTypeNames: this runs in a child job, the
+        # exception crosses back to the parent through the job's serialization, and only a real
+        # type name survives that. The classifier matches the short name.
+        if (-not ('PatchingGuestOpsTests.Vim.InvalidGuestLogin' -as [type])) {
+            Add-Type -TypeDefinition 'namespace PatchingGuestOpsTests.Vim { public class InvalidGuestLogin : System.Exception { public InvalidGuestLogin(string message) : base(message) { } } }'
+        }
+        throw (New-Object PatchingGuestOpsTests.Vim.InvalidGuestLogin -ArgumentList 'synthetic rejected login sending shutdown')
     }
     return [pscustomobject]@{ ProcessId = 4242 }
 }
@@ -1580,9 +1605,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
 & {
     function Read-VMAgentCycleStatus {
         param($Handle)
-        $invalidLogin = New-Object System.Exception -ArgumentList 'synthetic rejected login during status download'
-        $invalidLogin.PSTypeNames.Insert(0, 'VMware.Vim.InvalidGuestLogin')
-        throw $invalidLogin
+        throw (New-InvalidGuestLoginException -Message 'synthetic rejected login during status download')
     }
     function Receive-GuestFile {
         param($FileManager, $VMView, $GuestAuth, $HostName, $CurlPath, $GuestPath, $LocalPath, $TimeoutSeconds)
@@ -1636,9 +1659,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
 
     function New-InvalidGuestLoginError {
         param([string]$Message)
-        $invalidLogin = New-Object System.Exception -ArgumentList $Message
-        $invalidLogin.PSTypeNames.Insert(0, 'VMware.Vim.InvalidGuestLogin')
-        return $invalidLogin
+        return (New-InvalidGuestLoginException -Message $Message)
     }
     function New-GuestAuthentication {
         param([pscredential]$Credential)
@@ -1712,7 +1733,13 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
 
         Assert-Equal -Actual $script:f5StagePrompts -Expected 1 -Message ('F5: a rejected login during {0} asks for one replacement credential' -f $stage)
         Assert-Equal -Actual ([string]$stageResults[0].Error) -Expected '' -Message ('F5: a rejected login during {0} recovers instead of failing the VM' -f $stage)
-        Assert-Equal -Actual ([bool]$stageResults[0].Payload.AgentCompletionConfirmed) -Expected $true -Message ('F5: a rejected login during {0} still yields a confirmed cycle' -f $stage)
+        # Guarded, because Assert-Equal collects a failure but dereferencing a payload that
+        # recovery never produced TERMINATES under this script's Stop preference - and this file
+        # runs as a child of the runtime gate, so the throw discards every check after it and
+        # reports as a crash rather than as the one assertion that actually failed.
+        $stagePayload = Get-RuntimePropertyValue -InputObject $stageResults[0] -Name 'Payload'
+        $stageConfirmed = [bool](Get-RuntimePropertyValue -InputObject $stagePayload -Name 'AgentCompletionConfirmed' -DefaultValue $false)
+        Assert-Equal -Actual $stageConfirmed -Expected $true -Message ('F5: a rejected login during {0} still yields a confirmed cycle' -f $stage)
         Assert-Equal -Actual $stageMap['vm-stage.corp.test'].UserName -Expected 'CORP\adm-new' -Message ('F5: a rejected login during {0} leaves the replacement credential in the map' -f $stage)
         $expectedStarts = if ($stage -eq 'Start') { 2 } else { 1 }
         Assert-Equal -Actual $script:f5StageStarts -Expected $expectedStarts -Message ('F5: recovering a rejected login during {0} starts the agent the expected number of times' -f $stage)

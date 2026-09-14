@@ -601,32 +601,40 @@ if (-not (Test-IsWindowsHost)) {
     $skipped += 'Windows access-control rules (owner, access rules, reparse points, parent) - this host has no Windows security descriptors.'
 }
 else {
-    # The root has to be built the way production builds each level, not with a plain New-Item.
-    # %TEMP% grants the running user FullControl, that inheritance lands on anything created here
-    # with New-Item, and FullControl includes Delete - so every DIRECT child of a plain root is
-    # ParentRefused by the parent rule. Sections that use a two-level path never saw it, because
-    # their immediate parent is one Initialize-GuestWorkspace protected itself; the one-level
-    # cases silently failed their 'Ok' assertions and then the tail of section 9 threw on a seal
-    # file that was never written. This section is skipped off Windows, so it had never run.
+    # %TEMP% grants the running user FullControl by design, and FullControl carries every right
+    # in the parent-replacement mask - so nothing directly under it can pass, elevated or not.
+    # The cases below therefore live one level deeper, under a base directory built with the same
+    # protected descriptor production applies to each level. Its OWN parent is still %TEMP%, which
+    # is why the base is never itself asserted: what is under test is a directory whose parent
+    # this code protected, which is exactly the production shape (C:\ProgramData\PatchingGuestOps).
+    #
+    # The cases using a two-level path already worked for this reason. The one-level cases did not,
+    # and their 'Ok' assertions had been failing silently into the collected list; the crash a
+    # Windows run hit was simply the first one loud enough to notice. This section is skipped off
+    # Windows, so none of it had ever run.
     $aclRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-acl-' + [guid]::NewGuid().ToString('N'))
-    $aclRootReady = $false
-    $aclRootReason = ''
+    $null = New-Item -ItemType Directory -Force -Path $aclRoot
+    $aclBase = Join-Path $aclRoot 'base'
+    $aclBaseReady = $false
+    $aclBaseReason = ''
     try {
-        $null = [System.IO.Directory]::CreateDirectory($aclRoot, (New-GuestWorkspaceSecurity))
-        $aclRootVerdict = Assert-GuestWorkspacePath -Path $aclRoot
-        $aclRootReady = ($aclRootVerdict.Status -eq 'Ok')
-        if (-not $aclRootReady) { $aclRootReason = [string]$aclRootVerdict.Reason }
+        $null = [System.IO.Directory]::CreateDirectory($aclBase, (New-GuestWorkspaceSecurity))
+        # Proven by behaviour rather than by asserting the base itself: a directory created under
+        # it must pass, which is the precondition every case below depends on.
+        $aclProbe = Initialize-GuestWorkspace -Path (Join-Path $aclBase 'probe')
+        $aclBaseReady = ($aclProbe.Status -eq 'Ok')
+        if (-not $aclBaseReady) { $aclBaseReason = [string]$aclProbe.Reason }
     }
     catch {
-        $aclRootReason = $_.Exception.Message
+        $aclBaseReason = $_.Exception.Message
     }
 
-    # Setting the owner to the local Administrators needs an elevated token. Without it the root
-    # cannot be made to pass, and every case below would fail for that reason rather than the one
-    # it is testing - so say so once and run nothing, instead of printing a cascade.
-    if (-not $aclRootReady) {
-        $skipped += ('Windows access-control rules - the private test root could not be given a protected descriptor, which needs an elevated session: ' + $aclRootReason)
-        if (Test-Path -LiteralPath $aclRoot) {
+    # Setting the owner to the local Administrators needs an elevated token. Without it the base
+    # cannot be built, and every case below would fail for that reason rather than the one it is
+    # testing - so say so once and run nothing, instead of printing a cascade.
+    if (-not $aclBaseReady) {
+        $skipped += ('Windows access-control rules - the private test base could not be given a protected descriptor, which needs an elevated session: ' + $aclBaseReason)
+        if ($aclRoot -like '*guestops-acl-*') {
             Remove-Item -LiteralPath $aclRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
@@ -636,10 +644,10 @@ else {
         $administratorsSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
 
         # 1. A directory this code creates is accepted, and its levels are created protected.
-        $createdPath = Join-Path $aclRoot 'created\PatchingGuestOps'
+        $createdPath = Join-Path $aclBase 'created\PatchingGuestOps'
         $created = Initialize-GuestWorkspace -Path $createdPath
         Assert-Equal $created.Status 'Ok' 'a workspace this code creates is accepted'
-        Assert-Equal (Test-Path -LiteralPath (Join-Path $aclRoot 'created') -PathType Container) $true 'the missing intermediate level was created too'
+        Assert-Equal (Test-Path -LiteralPath (Join-Path $aclBase 'created') -PathType Container) $true 'the missing intermediate level was created too'
 
         $createdSecurity = Get-Acl -LiteralPath $createdPath
         Assert-Equal $createdSecurity.AreAccessRulesProtected $true 'the created directory does not inherit its permissions'
@@ -648,7 +656,7 @@ else {
 
         # The intermediate level is protected in its own right: being able to write there is
         # enough to move the leaf.
-        $intermediateSecurity = Get-Acl -LiteralPath (Join-Path $aclRoot 'created')
+        $intermediateSecurity = Get-Acl -LiteralPath (Join-Path $aclBase 'created')
         Assert-Equal $intermediateSecurity.AreAccessRulesProtected $true 'an intermediate level is created protected, not with inherited permissions'
 
         # 2. Initialize on an existing, correct directory is accepted and changes nothing.
@@ -656,7 +664,7 @@ else {
         Assert-Equal $reinitialized.Status 'Ok' 'an already-correct workspace is accepted as it is'
 
         # 3. An access rule that lets ordinary users write is refused, and is NOT repaired.
-        $writablePath = Join-Path $aclRoot 'writable'
+        $writablePath = Join-Path $aclBase 'writable'
         $null = New-Item -ItemType Directory -Force -Path $writablePath
         $writableSecurity = Get-Acl -LiteralPath $writablePath
         $writableSecurity.SetAccessRuleProtection($true, $false)
@@ -671,7 +679,7 @@ else {
         Assert-Equal (Initialize-GuestWorkspace -Path $writablePath).Status 'AccessRuleRefused' 'Initialize does not adopt an unsafe existing directory either'
 
         # 4. A read-only rule for ordinary users is fine: this directory is not secret.
-        $readablePath = Join-Path $aclRoot 'readable'
+        $readablePath = Join-Path $aclBase 'readable'
         $null = New-Item -ItemType Directory -Force -Path $readablePath
         $readableSecurity = Get-Acl -LiteralPath $readablePath
         $readableSecurity.SetAccessRuleProtection($true, $false)
@@ -683,7 +691,7 @@ else {
 
         # 5. An owner outside the allow-list is refused even when the rules look right: an owner
         #    can rewrite the DACL whenever they like, so a correct DACL proves nothing.
-        $ownedPath = Join-Path $aclRoot 'foreign-owner'
+        $ownedPath = Join-Path $aclBase 'foreign-owner'
         $null = New-Item -ItemType Directory -Force -Path $ownedPath
         $ownedSecurity = Get-Acl -LiteralPath $ownedPath
         $ownedSecurity.SetAccessRuleProtection($true, $false)
@@ -699,9 +707,9 @@ else {
         }
 
         # 6. A reparse point anywhere in the path is refused: it redirects the whole subtree.
-        $linkTarget = Join-Path $aclRoot 'link-target'
+        $linkTarget = Join-Path $aclBase 'link-target'
         $null = New-Item -ItemType Directory -Force -Path $linkTarget
-        $linkPath = Join-Path $aclRoot 'link'
+        $linkPath = Join-Path $aclBase 'link'
         $linkFailed = $false
         try { $null = New-Item -ItemType Junction -Path $linkPath -Target $linkTarget -ErrorAction Stop } catch { $linkFailed = $true }
         if ($linkFailed) {
@@ -717,7 +725,7 @@ else {
         # 7. A parent that lets ordinary users delete its children is refused - that is enough to
         #    swap the protected directory for one of their own. Being able to create a new entry
         #    beside it is not, which is why C:\ProgramData's own layout stays acceptable.
-        $replaceableParent = Join-Path $aclRoot 'replaceable'
+        $replaceableParent = Join-Path $aclBase 'replaceable'
         $null = New-Item -ItemType Directory -Force -Path $replaceableParent
         $parentSecurity = Get-Acl -LiteralPath $replaceableParent
         $parentSecurity.SetAccessRuleProtection($true, $false)
@@ -729,7 +737,7 @@ else {
         $childCreated = Initialize-GuestWorkspace -Path $childUnderReplaceable
         Assert-Equal $childCreated.Status 'ParentRefused' 'a parent that lets ordinary users delete its children is refused'
 
-        $creatableParent = Join-Path $aclRoot 'creatable'
+        $creatableParent = Join-Path $aclBase 'creatable'
         $null = New-Item -ItemType Directory -Force -Path $creatableParent
         $creatableSecurity = Get-Acl -LiteralPath $creatableParent
         $creatableSecurity.SetAccessRuleProtection($true, $false)
@@ -740,7 +748,7 @@ else {
         Assert-Equal (Initialize-GuestWorkspace -Path (Join-Path $creatableParent 'PatchingGuestOps')).Status 'Ok' 'a parent that only lets ordinary users add new entries is accepted'
 
         # 8. A file already in a safe directory is not vouched for by the directory.
-        $helperHome = Join-Path $aclRoot 'helper-home'
+        $helperHome = Join-Path $aclBase 'helper-home'
         Assert-Equal (Initialize-GuestWorkspace -Path $helperHome).Status 'Ok' 'the helper directory is protected'
         $trustedHelper = Join-Path $helperHome 'Read-BootTime-vm.ps1'
         Set-Content -LiteralPath $trustedHelper -Value '# fixture' -Encoding UTF8
@@ -760,7 +768,7 @@ else {
         # 9. The seal, end to end against real security descriptors: the bootstrap writes it, the
         #    directory still verifies with the token it was sealed with, and the seal file itself
         #    is subject to the same file rules as the helper above.
-        $sealedHome = Join-Path $aclRoot 'sealed'
+        $sealedHome = Join-Path $aclBase 'sealed'
         $sealedToken = New-GuestWorkspaceSealToken
         Assert-Equal (Initialize-GuestWorkspace -Path $sealedHome -SealToken $sealedToken).Status 'Ok' 'a directory is created, verified and then sealed'
         Assert-Equal (Assert-GuestWorkspaceSeal -Path $sealedHome -Token $sealedToken).Status 'Ok' 'the sealed directory verifies against its own token'
@@ -768,7 +776,7 @@ else {
 
         # Initialize without a token leaves no seal, so nothing later can pretend to have checked
         # one: Assert-GuestWorkspaceSeal refuses instead of finding a stale file to match.
-        $unsealedHome = Join-Path $aclRoot 'unsealed'
+        $unsealedHome = Join-Path $aclBase 'unsealed'
         Assert-Equal (Initialize-GuestWorkspace -Path $unsealedHome).Status 'Ok' 'a directory can still be created without a seal'
         Assert-Equal (Test-Path -LiteralPath (Get-GuestWorkspaceSealPath -Path $unsealedHome) -PathType Leaf) $false 'no token means no seal file is written'
         Assert-Equal (Assert-GuestWorkspaceSeal -Path $unsealedHome -Token $sealedToken).Status 'SealRefused' 'an unsealed directory cannot satisfy a seal check'
