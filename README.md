@@ -735,6 +735,20 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-GuestOpsH
 Launcher odpala te bramki automatycznie przed każdym przebiegiem (chyba że dodasz
 `-SkipStaticChecks`).
 
+**CI.** `.github/workflows/powershell-checks.yml` uruchamia te same bramki na `windows-2022`
+(Windows PowerShell 5.1, nie PS7 — chodzi właśnie o semantykę 5.1), każdą w osobnym procesie
+i w osobnym kroku, więc błąd zatrzymuje przebieg dokładnie na tej, która go zgłosiła.
+Uprawnienia workflow to `contents: read`, a `actions/checkout` jest przypięty do konkretnego
+commita (v4.2.2) z `persist-credentials: false` — bramka nie ma powodu trzymać poświadczenia,
+które może pushować.
+
+**Czego CI nie sprawdza.** PowerCLI **nie jest** instalowane na runnerze, więc
+`GuestOpsHarnessChecks` pomija samą siebie i kończy kodem 0 — workflow raportuje to jawnie jako
+`SKIPPED`, bo pominięta bramka to nie jest bramka zaliczona. To samo dotyczy sekcji reguł ACL
+w `Invoke-GuestWorkspaceChecks.ps1`: bez windowsowych deskryptorów bezpieczeństwa jest
+raportowana jako pominięta. Tych dwóch obszarów nadal trzeba dotknąć na maszynie z PowerCLI
+i z prawdziwym Windows. Żadna bramka nie dotyka też vCenter, ESXi, gościa ani WUA.
+
 ---
 
 ## Co zrobić, gdy…

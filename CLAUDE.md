@@ -54,6 +54,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Start-PatchingGuestOps
 
 There is no build step, no linter, and no Pester. `Invoke-StaticChecks.ps1` is a monolithic AST/text check, and `Invoke-ModelChecks.ps1` is the offline model behavior check — there is no "run one test" subset.
 
+`.github/workflows/powershell-checks.yml` runs the same four gates on `windows-2022`, each in its
+own process and its own step so a failure stops at the gate that reported it. It uses
+`shell: powershell` (Windows PowerShell 5.1, not pwsh — 5.1 semantics are the point),
+`permissions: contents: read`, and `actions/checkout` pinned to a commit with
+`persist-credentials: false`. **PowerCLI is deliberately not installed there**, so the harness
+skips itself and the workflow reports that as `SKIPPED` rather than letting an exit 0 read as a
+pass; the same is true of the Windows ACL section of `Invoke-GuestWorkspaceChecks.ps1`. Both still
+have to be exercised on a Windows machine with PowerCLI.
+
 `Invoke-GuestOpsHarnessChecks.ps1` is the odd one out: it runs the **real** `Start-`/`Test-`/`Complete-VMAgentCycle` against a fake vSphere (stubbed `Get-ExactVM`, `Get-VMHostNameForTransfer` and `Invoke-Curl`, plus hand-built process/file managers). It needs the PowerCLI submodules installed for their .NET types — `GuestProgramSpec`, `GuestFileAttributes`, `NamePasswordAuthentication` — but no vCenter, no VM and no ESXi data plane. Without those types it **skips itself and exits 0**, which is why it lives outside `Invoke-RuntimeChecks.ps1`: that gate has to stay runnable anywhere. It covers what unit tests cannot: that a fleet timeout still downloads `status.json`, that a guest which dropped out of vSphere's process list ends its poll instead of spinning, that every transfer carries `--max-time`, and that vSphere is asked about a process once per round rather than twice.
 
 ## Architecture: two planes, runtime scripts, offline model

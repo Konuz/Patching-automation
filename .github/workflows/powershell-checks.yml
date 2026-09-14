@@ -1,0 +1,104 @@
+# The four offline gates, on the runtime they are written for: Windows PowerShell 5.1.
+#
+# There is no build, no linter and no Pester in this project - Invoke-StaticChecks.ps1 is the
+# AST/text gate, Invoke-ModelChecks.ps1 the offline planning model, Invoke-RuntimeChecks.ps1 the
+# runtime behaviour gate (which itself runs the workspace, regression, safety and audit checks in
+# their own processes), and Invoke-GuestOpsHarnessChecks.ps1 the fake-vSphere harness.
+#
+# Nothing here touches a vCenter, an ESXi host or a guest. No secrets are read, nothing is
+# published, and the checkout is read-only.
+name: PowerShell checks
+
+# Pushes to every branch, because this project is developed on feature branches that do not
+# always have a pull request open, and a gate that only runs on a PR would not have run at all.
+# pull_request is kept as well so a merge has a status check of its own; for a same-repository PR
+# that means one extra run of the same commit, which is a deliberate trade rather than an oversight.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+# A superseded push has nothing to say. In-progress runs for the same ref are cancelled so a
+# quick series of commits does not queue four identical suites.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only. These gates need the source and nothing else.
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    # Windows PowerShell 5.1 is the target runtime, and windows-2022 has it as powershell.exe.
+    # pwsh (PowerShell 7) is deliberately NOT used: the whole point of these gates is the 5.1
+    # semantics the customer stepping stone has - StrictMode 2.0 behaviour, ConvertFrom-Json
+    # collapsing single-element arrays, no ForEach-Object -Parallel.
+    #
+    # Pinned to the image label rather than windows-latest, which moved to Windows Server 2025
+    # with Visual Studio 2026 in June 2026. Both ship Windows PowerShell 5.1, so the pin is about
+    # predictability, not capability: these gates should not change underneath the project because
+    # a label was repointed.
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    defaults:
+      run:
+        shell: powershell
+
+    steps:
+      # Pinned to the v4.2.2 commit rather than a moving tag, and with the token left out of the
+      # local git config: a gate run has no reason to hold a credential that can push.
+      - name: Check out the repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Report the host runtime
+        run: |
+          $PSVersionTable | Format-List | Out-String | Write-Host
+          Write-Host ('PowerShell edition: {0}' -f $PSVersionTable.PSEdition)
+
+      # Each gate is its own process and its own step, so a failure stops the job at the gate that
+      # failed instead of being folded into one exit code. $LASTEXITCODE is checked explicitly:
+      # a native process exiting non-zero does not fail a powershell step on its own.
+      - name: Static checks
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-StaticChecks.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Model checks
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-ModelChecks.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # This one nests the workspace, regression, safety-regression and audit-followup checks,
+      # each in its own process. Its own output names them as they run.
+      - name: Runtime checks
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-RuntimeChecks.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The harness needs the PowerCLI submodules installed for their .NET types
+      # (GuestProgramSpec, GuestFileAttributes, NamePasswordAuthentication) - no vCenter, no VM,
+      # no ESXi data plane. PowerCLI is deliberately NOT installed here, so this gate skips
+      # itself and exits 0. That is why it is reported as SKIPPED explicitly rather than being
+      # allowed to look like a pass: the coverage it provides - a fleet timeout still downloading
+      # status.json, a guest that dropped out of the process list ending its poll, every transfer
+      # carrying --max-time, one process query per round, and the workspace seal spanning the
+      # bootstrap and the agent start - is NOT exercised by this workflow and still has to be run
+      # on a machine that has PowerCLI.
+      - name: GuestOps harness checks
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-GuestOpsHarnessChecks.ps1
+          $harnessExitCode = $LASTEXITCODE
+          if ($harnessExitCode -ne 0) { exit $harnessExitCode }
+          Write-Host '::warning title=Harness not exercised::SKIPPED - the GuestOps harness needs the PowerCLI .NET types, which are not installed on this runner. It exited 0 by skipping itself; this is not evidence that the harness passes.'
+
+      - name: Report what this workflow did not cover
+        if: always()
+        run: |
+          Write-Host 'Covered: static, model and runtime gates (incl. workspace, regression, safety-regression and audit-followup) on Windows PowerShell 5.1.'
+          Write-Host 'SKIPPED here: the GuestOps harness (needs PowerCLI .NET types).'
+          Write-Host 'Never covered by any gate: a real vCenter, a real ESXi data plane, a real guest, WUA, and Windows ACL behaviour against a live C:\ProgramData.'
