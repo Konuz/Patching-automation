@@ -396,7 +396,15 @@ exit 0
                 '-RepoRoot', $repoRoot, '-CoordinationDirectory', $CoordinationDirectory,
                 '-RunId', $RunId, '-Mode', $Mode, '-SignalPath', $SignalPath, '-ReleasePath', $ReleasePath
             )
-            return (Start-Process -FilePath $powershellPath -ArgumentList $arguments -PassThru)
+            # Hidden on Windows: this check starts several real processes and each one otherwise
+            # flashes a console window over whatever the operator is doing. -WindowStyle is a
+            # Windows-only parameter, so it is added rather than hard-coded - the same file runs
+            # on hosts where passing it would fail the call.
+            $startArguments = @{ FilePath = $powershellPath; ArgumentList = $arguments; PassThru = $true }
+            if (Test-IsWindowsHost) {
+                $startArguments['WindowStyle'] = 'Hidden'
+            }
+            return (Start-Process @startArguments)
         }
 
         $waitForSignal = {
@@ -593,8 +601,36 @@ if (-not (Test-IsWindowsHost)) {
     $skipped += 'Windows access-control rules (owner, access rules, reparse points, parent) - this host has no Windows security descriptors.'
 }
 else {
+    # The root has to be built the way production builds each level, not with a plain New-Item.
+    # %TEMP% grants the running user FullControl, that inheritance lands on anything created here
+    # with New-Item, and FullControl includes Delete - so every DIRECT child of a plain root is
+    # ParentRefused by the parent rule. Sections that use a two-level path never saw it, because
+    # their immediate parent is one Initialize-GuestWorkspace protected itself; the one-level
+    # cases silently failed their 'Ok' assertions and then the tail of section 9 threw on a seal
+    # file that was never written. This section is skipped off Windows, so it had never run.
     $aclRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('guestops-acl-' + [guid]::NewGuid().ToString('N'))
-    $null = New-Item -ItemType Directory -Force -Path $aclRoot
+    $aclRootReady = $false
+    $aclRootReason = ''
+    try {
+        $null = [System.IO.Directory]::CreateDirectory($aclRoot, (New-GuestWorkspaceSecurity))
+        $aclRootVerdict = Assert-GuestWorkspacePath -Path $aclRoot
+        $aclRootReady = ($aclRootVerdict.Status -eq 'Ok')
+        if (-not $aclRootReady) { $aclRootReason = [string]$aclRootVerdict.Reason }
+    }
+    catch {
+        $aclRootReason = $_.Exception.Message
+    }
+
+    # Setting the owner to the local Administrators needs an elevated token. Without it the root
+    # cannot be made to pass, and every case below would fail for that reason rather than the one
+    # it is testing - so say so once and run nothing, instead of printing a cascade.
+    if (-not $aclRootReady) {
+        $skipped += ('Windows access-control rules - the private test root could not be given a protected descriptor, which needs an elevated session: ' + $aclRootReason)
+        if (Test-Path -LiteralPath $aclRoot) {
+            Remove-Item -LiteralPath $aclRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    else {
     try {
         $usersSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
         $administratorsSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
@@ -739,20 +775,32 @@ else {
 
         # A seal an ordinary user could rewrite is worth nothing, so it goes through the same file
         # check as the boot-time helper.
+        #
+        # Guarded on the file existing, because a recorded assertion failure must not become a
+        # throw: Assert-Equal collects, but Get-Acl on a missing path terminates under this
+        # script's Stop preference - and this file runs as a child process of the runtime gate,
+        # so a throw here discards every check after it and reports as a crash rather than as
+        # the one failed assertion it actually is.
         $sealFilePath = Get-GuestWorkspaceSealPath -Path $sealedHome
-        $sealFileSecurity = Get-Acl -LiteralPath $sealFilePath
-        $sealFileSecurity.SetAccessRuleProtection($true, $false)
-        $sealFileSecurity.SetOwner($administratorsSid)
-        $sealFileSecurity.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($administratorsSid, 'FullControl', 'None', 'None', 'Allow')))
-        $sealFileSecurity.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($usersSid, 'Modify', 'None', 'None', 'Allow')))
-        Set-Acl -LiteralPath $sealFilePath -AclObject $sealFileSecurity
-        Assert-Equal (Assert-GuestWorkspaceSeal -Path $sealedHome -Token $sealedToken).Status 'AccessRuleRefused' 'a seal an ordinary user may rewrite is refused'
+        if (-not (Test-Path -LiteralPath $sealFilePath -PathType Leaf)) {
+            $failures += 'the seal file was never written, so the rules on the seal itself could not be checked'
+        }
+        else {
+            $sealFileSecurity = Get-Acl -LiteralPath $sealFilePath
+            $sealFileSecurity.SetAccessRuleProtection($true, $false)
+            $sealFileSecurity.SetOwner($administratorsSid)
+            $sealFileSecurity.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($administratorsSid, 'FullControl', 'None', 'None', 'Allow')))
+            $sealFileSecurity.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($usersSid, 'Modify', 'None', 'None', 'Allow')))
+            Set-Acl -LiteralPath $sealFilePath -AclObject $sealFileSecurity
+            Assert-Equal (Assert-GuestWorkspaceSeal -Path $sealedHome -Token $sealedToken).Status 'AccessRuleRefused' 'a seal an ordinary user may rewrite is refused'
+        }
     }
     finally {
         # Only ever the private test directory, and only when it is still the one this run made.
         if ($aclRoot -like '*guestops-acl-*') {
             Remove-Item -LiteralPath $aclRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
+    }
     }
 }
 
