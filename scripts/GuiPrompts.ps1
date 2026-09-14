@@ -278,29 +278,36 @@ function Show-LauncherDialog {
     $outputBox = New-GuiTextBox -Text ([string]$Settings.LocalOutputDirectory) -Top 195
 
     $ignoreCert = New-Object System.Windows.Forms.CheckBox
-    $ignoreCert.Text = 'Ignore vCenter certificate'
+    $ignoreCert.Text = 'Ignore vCenter certificate (not ESXi)'
     $ignoreCert.Left = 220
     $ignoreCert.Top = 230
     $ignoreCert.Width = 300
     $ignoreCert.Checked = [bool]$Settings.IgnoreVCenterCertificate
 
+    $ignoreESXiCert = New-Object System.Windows.Forms.CheckBox
+    $ignoreESXiCert.Text = 'Ignore ESXi certificates (file transfers)'
+    $ignoreESXiCert.Left = 220
+    $ignoreESXiCert.Top = 255
+    $ignoreESXiCert.Width = 360
+    $ignoreESXiCert.Checked = [bool]$Settings.IgnoreESXiCertificate
+
     $keepConnected = New-Object System.Windows.Forms.CheckBox
     $keepConnected.Text = 'Keep vCenter session connected'
     $keepConnected.Left = 220
-    $keepConnected.Top = 255
+    $keepConnected.Top = 280
     $keepConnected.Width = 300
     $keepConnected.Checked = [bool]$Settings.KeepConnected
 
     $searchOnly = New-Object System.Windows.Forms.CheckBox
     $searchOnly.Text = 'Search only (no download or install)'
     $searchOnly.Left = 220
-    $searchOnly.Top = 280
+    $searchOnly.Top = 305
     $searchOnly.Width = 300
 
     $notice = New-Object System.Windows.Forms.Label
     $notice.Text = 'The run starts with local checks; they take roughly 20-40 seconds before anything touches vCenter.'
     $notice.Left = 12
-    $notice.Top = 315
+    $notice.Top = 340
     $notice.Width = 640
 
     $start = New-Object System.Windows.Forms.Button
@@ -334,7 +341,7 @@ function Show-LauncherDialog {
         (New-GuiLabel -Text 'Reboot batch size' -Top 125), $batchBox,
         (New-GuiLabel -Text 'Max patch rounds' -Top 160), $roundsBox,
         (New-GuiLabel -Text 'Output directory (blank = .\out)' -Top 195), $outputBox,
-        $ignoreCert, $keepConnected, $searchOnly, $notice, $start, $quit
+        $ignoreCert, $ignoreESXiCert, $keepConnected, $searchOnly, $notice, $start, $quit
     ))
     $form.AcceptButton = $start
     $form.CancelButton = $quit
@@ -351,6 +358,7 @@ function Show-LauncherDialog {
         MaxPatchRounds = $roundsBox.Text
         LocalOutputDirectory = $outputBox.Text
         IgnoreVCenterCertificate = $ignoreCert.Checked
+        IgnoreESXiCertificate = $ignoreESXiCert.Checked
         KeepConnected = $keepConnected.Checked
         SearchOnly = $searchOnly.Checked
     }

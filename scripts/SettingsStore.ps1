@@ -110,6 +110,7 @@ function New-DefaultGuiSettings {
         PollSeconds = 15
         LocalOutputDirectory = ''
         IgnoreVCenterCertificate = $false
+        IgnoreESXiCertificate = $false
         KeepConnected = $false
     }
 }
@@ -168,6 +169,8 @@ function Read-GuiSettings {
     }
 
     $settings.IgnoreVCenterCertificate = [bool](Get-ObjectPropertyValue -InputObject $raw -Path @('IgnoreVCenterCertificate'))
+    $ignoreESXi = Get-ObjectPropertyValue -InputObject $raw -Path @('IgnoreESXiCertificate')
+    $settings.IgnoreESXiCertificate = ($ignoreESXi -is [bool]) -and ($ignoreESXi -eq $true)
     $settings.KeepConnected = [bool](Get-ObjectPropertyValue -InputObject $raw -Path @('KeepConnected'))
 
     return [pscustomobject]@{ Settings = $settings; Warnings = @($warnings) }
@@ -195,6 +198,7 @@ function Write-GuiSettings {
         PollSeconds = $Settings.PollSeconds
         LocalOutputDirectory = [string]$Settings.LocalOutputDirectory
         IgnoreVCenterCertificate = [bool]$Settings.IgnoreVCenterCertificate
+        IgnoreESXiCertificate = [bool](Get-ObjectPropertyValue -InputObject $Settings -Path @('IgnoreESXiCertificate') -DefaultValue $false)
         KeepConnected = [bool]$Settings.KeepConnected
     }
 

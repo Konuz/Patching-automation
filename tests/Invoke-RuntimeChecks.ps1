@@ -3336,6 +3336,12 @@ if ($failures.Count -gt 0) {
     exit 1
 }
 
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Invoke-LauncherChecks.ps1')
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Invoke-CertificateChecks.ps1')
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Invoke-GuestWorkspaceChecks.ps1')
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

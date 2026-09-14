@@ -34,6 +34,7 @@ param(
     [switch]$PlanOnly,
     [switch]$SkipConfirmation,
     [switch]$IgnoreVCenterCertificate,
+    [switch]$IgnoreESXiCertificate,
     [switch]$KeepConnected,
     [switch]$SkipStaticChecks,
     [hashtable]$PromptProvider,
@@ -46,6 +47,35 @@ $ErrorActionPreference = 'Stop'
 
 if ($SearchOnly -and -not [string]::IsNullOrWhiteSpace($PatchPlanPath)) {
     throw 'SearchOnly cannot be combined with PatchPlanPath. Use PlanOnly to inspect a saved plan.'
+}
+
+function Invoke-LocalCheck {
+    param([string]$Name, [string]$ScriptPath, [string]$LogPath)
+
+    Write-Host ('Running local {0} checks...' -f $Name)
+    $previousPreference = $ErrorActionPreference
+    try {
+        # Native stderr must not bypass the exit-code check in Windows PowerShell 5.1.
+        $ErrorActionPreference = 'Continue'
+        $output = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ScriptPath 2>&1)
+        $checkExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    $lines = @($output | ForEach-Object { [string]$_ })
+    $lines | Set-Content -LiteralPath $LogPath -Encoding UTF8
+    if ($checkExitCode -ne 0) {
+        Write-Host ('{0}: FAILED (exit {1}). Log: {2}' -f $Name, $checkExitCode, $LogPath)
+        $lines | ForEach-Object { Write-Host $_ }
+    }
+    else {
+        $skips = @($lines | Where-Object { $_ -match '(?i)^SKIPPED:|^.*checks skipped:' })
+        $verdict = if ($skips.Count -gt 0) { 'PASSED WITH SKIPS' } else { 'PASSED' }
+        Write-Host ('{0}: {1}' -f $Name, $verdict)
+        $skips | ForEach-Object { Write-Host $_ }
+    }
+    return $checkExitCode
 }
 
 function Resolve-RequiredFile {
@@ -114,30 +144,17 @@ if (-not $LocalOutputDirectory) {
 }
 
 if (-not $SkipStaticChecks) {
-    Write-Host 'Running local static checks...'
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $staticCheckPath
-    if ($LASTEXITCODE -ne 0) {
-        exit $LASTEXITCODE
-    }
-
-    Write-Host 'Running local model checks...'
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $modelCheckPath
-    if ($LASTEXITCODE -ne 0) {
-        exit $LASTEXITCODE
-    }
-
-    Write-Host 'Running local runtime checks...'
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $runtimeCheckPath
-    if ($LASTEXITCODE -ne 0) {
-        exit $LASTEXITCODE
-    }
-
-    # Exercises the real guest agent cycle against a fake vSphere. Skips itself when the
-    # VMware.Vim types are unavailable, so it costs nothing on a machine without PowerCLI.
-    Write-Host 'Running local GuestOps harness checks...'
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $harnessCheckPath
-    if ($LASTEXITCODE -ne 0) {
-        exit $LASTEXITCODE
+    $checkLogDirectory = Join-Path $LocalOutputDirectory ('local-checks-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Path $checkLogDirectory -Force
+    Write-Host ('Local checks use simulated failures. Detailed output: {0}' -f $checkLogDirectory)
+    foreach ($check in @(
+        @{ Name = 'Static'; Path = $staticCheckPath },
+        @{ Name = 'Model'; Path = $modelCheckPath },
+        @{ Name = 'Runtime'; Path = $runtimeCheckPath },
+        @{ Name = 'GuestOps harness'; Path = $harnessCheckPath }
+    )) {
+        $checkExitCode = Invoke-LocalCheck -Name $check.Name -ScriptPath $check.Path -LogPath (Join-Path $checkLogDirectory ($check.Name + '.log'))
+        if ($checkExitCode -ne 0) { exit $checkExitCode }
     }
 }
 
@@ -201,6 +218,10 @@ if ($SkipConfirmation) {
 
 if ($IgnoreVCenterCertificate) {
     $orchestratorParams.IgnoreVCenterCertificate = $true
+}
+
+if ($IgnoreESXiCertificate) {
+    $orchestratorParams.IgnoreESXiCertificate = $true
 }
 
 if ($KeepConnected) {

@@ -89,6 +89,7 @@ $settingsToSave = $settingsResult.Settings
 $settingsToSave.VIServers = @($guiVIServers)
 $settingsToSave.LocalOutputDirectory = $answer.LocalOutputDirectory
 $settingsToSave.IgnoreVCenterCertificate = $answer.IgnoreVCenterCertificate
+$settingsToSave.IgnoreESXiCertificate = $answer.IgnoreESXiCertificate
 $settingsToSave.KeepConnected = $answer.KeepConnected
 
 $parsedThrottle = 0
@@ -205,6 +206,7 @@ if (-not [string]::IsNullOrWhiteSpace($settingsToSave.LocalOutputDirectory)) {
 }
 
 if ($settingsToSave.IgnoreVCenterCertificate) { $launcherParams.IgnoreVCenterCertificate = $true }
+if ($settingsToSave.IgnoreESXiCertificate) { $launcherParams.IgnoreESXiCertificate = $true }
 if ($settingsToSave.KeepConnected) { $launcherParams.KeepConnected = $true }
 if ($answer.SearchOnly) { $launcherParams.SearchOnly = $true }
 

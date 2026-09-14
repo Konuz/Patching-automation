@@ -178,8 +178,11 @@ start/poll/complete scriptblocks, so it is tested offline. Three consequences ar
   phase, and VMs on other hosts proceed. Aborting the phase instead turned one slow host into a
   fleet-wide stop and, in a verification round, discarded the run summary. Inventory/readiness
   failures remain per-VM results too. Credential recovery runs before each target's probe, so
-  skipped or aborted accounts never cost a probe. Transfers still verify TLS themselves if a VM
-  changes hosts.
+  skipped or aborted accounts never cost a probe. Transfers use the same TLS policy even if a VM
+  changes hosts. Verification is on by default; the separate `-IgnoreESXiCertificate` switch
+  (also exposed and saved by the GUI) enables `--insecure` centrally in `Invoke-Curl` for that run.
+  The orchestrator explicitly assigns `GuestTransferIgnoreCertificate` on every run, independent
+  of `IgnoreVCenterCertificate`; boot-time transfers share this scope, reboot jobs use SOAP only.
 - **A timed-out item still runs the completion script.** `status.json` is the primary result, the
   job path always downloaded the artifacts even when the process result timed out, and dropping
   them would turn a guest run that actually finished into a reported failure. The timeout error is

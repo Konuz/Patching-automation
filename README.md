@@ -162,7 +162,10 @@ flowchart TD
 Krok po kroku:
 
 1. **Uruchom** `.\Start-PatchingGuestOps.ps1`. Skrypt najpierw odpala lokalne testy (chyba że
-   dodasz `-SkipStaticChecks`).
+   dodasz `-SkipStaticChecks`). Konsola pokazuje wynik każdego zestawu oraz pominięte kontrole.
+   Ostrzeżenia z symulowanych awarii i szczegóły testów są zapisywane w
+   `<LocalOutputDirectory>/local-checks-<id>/*.log`. Niezaliczony zestaw wyświetla diagnostykę
+   i zatrzymuje uruchomienie; `PASSED WITH SKIPS` oznacza, że część kontroli pominięto.
 2. **Odpowiedz na pytania o brakujące dane.** Skrypt pyta po kolei: najpierw o adres
    **vCenter** (jedno lub wiele, oddzielone `;`), potem — **tylko jeśli nie podałeś żadnej maszyny** przez `-VMName`, `-VMNames`
    ani `-VMListPath` — **o nazwy VM** (możesz wpisać wiele naraz, oddzielone `;`),
@@ -246,6 +249,7 @@ Krok po kroku:
 | `-SkipConfirmation` | Pomiń pytanie o plan i zakończ po rundzie 1 zamiast pytać `CONTINUE`/`FINISH` (**nie** pomija promptu o restart ani o rozmiar paczki). |
 | `-SkipStaticChecks` | Pomiń lokalne testy przed uruchomieniem. |
 | `-IgnoreVCenterCertificate` | Zignoruj błąd certyfikatu vCenter. |
+| `-IgnoreESXiCertificate` | Wyłącz weryfikację certyfikatów ESXi dla sprawdzania połączenia i transferów plików. Domyślnie wyłączone. |
 | `-KeepConnected` | Nie rozłączaj się z vCenter po zakończeniu. |
 
 `-SearchOnly` nie można łączyć z `-PatchPlanPath`. Do sprawdzenia zapisanego planu bez instalacji służy `-PlanOnly -PatchPlanPath <plik>`.
@@ -480,15 +484,19 @@ certyfikatów**:
 | Kanał | Czym idzie | Czego wymaga |
 |---|---|---|
 | Sterowanie (SOAP) | PowerCLI / .NET → **vCenter:443** | zaufanie do certyfikatu vCenter **albo** `-IgnoreVCenterCertificate` |
-| Dane (bajty plików) | **`curl.exe`** → **ESXi:443** | zaufanie do certyfikatu ESXi — **zawsze**, bez wyjątku |
+| Dane (bajty plików) | **`curl.exe`** → **ESXi:443** | zaufanie do certyfikatu ESXi **albo** `-IgnoreESXiCertificate` |
 
 **`-IgnoreVCenterCertificate` dotyczy wyłącznie sesji PowerCLI do vCenter.** Ustawia
 `Set-PowerCLIConfiguration -InvalidCertificateAction Ignore` i nie ma żadnego wpływu na curl —
 to osobny proces z własnym magazynem zaufania (Schannel, czyli magazyn certyfikatów Windows).
-Transfery nie są uruchamiane z `--insecure`, więc **niezaufany certyfikat ESXi zatrzyma transfer
-plików, nawet jeśli połączenie z vCenter przeszło**.
+Domyślnie **niezaufany certyfikat ESXi zatrzyma transfer plików, nawet jeśli połączenie
+z vCenter przeszło**. Osobna opcja GUI **Ignore ESXi certificates (file transfers)** lub
+parametr `-IgnoreESXiCertificate` dodaje `--insecure` do wywołań curl w tym przebiegu.
+Obejmuje sprawdzanie połączenia, wysyłanie i pobieranie plików oraz odczyty czasu rozruchu.
+HTTPS nadal szyfruje połączenie, lecz nie weryfikuje tożsamości serwera. GUI zapamiętuje
+wybór; po wyłączeniu opcji kolejny przebieg ponownie weryfikuje certyfikaty.
 
-**Nazwa też musi się zgadzać.** vSphere zwraca adres transferu z gwiazdką (`https://*/...`),
+**Przy włączonej weryfikacji nazwa też musi się zgadzać.** vSphere zwraca adres transferu z gwiazdką (`https://*/...`),
 a narzędzie podstawia w jej miejsce **nazwę hosta ESXi z inwentarza vCenter**. Certyfikat ESXi
 musi być ważny dokładnie dla tej nazwy. Jeśli vCenter ma host wpisany po adresie IP albo po
 nazwie krótkiej, a certyfikat wystawiono na FQDN — curl odrzuci połączenie, mimo że sam
@@ -497,9 +505,24 @@ certyfikat jest zaufany.
 W praktyce: zaimportuj na maszynie sterującej certyfikat CA, który podpisał certyfikaty ESXi,
 i upewnij się, że hosty figurują w vCenter pod nazwami zgodnymi z tymi certyfikatami.
 
+Komunikat `SEC_E_UNTRUSTED_ROOT (0x80090325)` oznacza, że Windows na maszynie sterującej
+nie ufa łańcuchowi certyfikatu ESXi. Uzyskaj od administratora infrastruktury właściwy
+certyfikat głównego CA oraz ewentualnych pośrednich CA. Główny CA należy dodać do magazynu
+zaufanych głównych urzędów certyfikacji, a pośrednie CA do magazynu pośrednich urzędów
+certyfikacji, dostępnego kontu uruchamiającemu narzędzie. Nie wystarczy zmiana opcji vCenter.
+Po skonfigurowaniu zaufania sprawdź na tej samej maszynie i tym samym koncie:
+
+```powershell
+curl.exe --disable --silent --show-error --head --output NUL --max-time 30 https://esxi1.domain.com/
+$LASTEXITCODE
+```
+
+Zastąp adres rzeczywistą nazwą ESXi zwróconą w błędzie. Oczekiwany kod to `0`.
+Opis weryfikacji i magazynu Windows: [dokumentacja curl](https://curl.se/docs/sslcerts.html).
+
 Przed każdą fazą wykrywania lub instalacji narzędzie sprawdza HTTPS każdego unikalnego hosta
 ESXi gotowych celów, zanim utworzy katalogi cyklu lub uruchomi agentów. Próba używa tego samego
-`curl.exe` i nazwy ESXi, ma limit 30 sekund i nie wyłącza walidacji certyfikatów. Błąd dotyczy
+`curl.exe` i nazwy ESXi, ma limit 30 sekund i respektuje `-IgnoreESXiCertificate`. Błąd dotyczy
 tylko maszyn na tym hoście: każda dostaje własny błąd startu z nazwą hosta i wskazówką dotyczącą
 zaufania, nazwy certyfikatu oraz łączności, a maszyny na pozostałych hostach są przetwarzane
 dalej. Wynik próby jest pamiętany do końca fazy, więc kolejne VM na tym samym hoście nie czekają
@@ -606,7 +629,7 @@ znaczenie: curl stosuje plik konfiguracyjny przed dalszymi flagami, więc `--dis
 później jest już za późno. Wrapper jest jedynym miejscem, które je dodaje — żadna lista
 argumentów go nie powtarza.
 To kontrola aktualnego punktu końcowego, a nie gwarancja późniejszego transferu: każdy transfer
-nadal niezależnie sprawdza certyfikat, również po zmianie hosta VM.
+stosuje wybraną politykę certyfikatów, również po zmianie hosta VM.
 
 ---
 

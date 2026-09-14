@@ -1,4 +1,5 @@
 $script:SuppressStepMessages = $false
+$script:GuestTransferIgnoreCertificate = $false
 
 function Write-Step {
     param([string]$Message)
@@ -412,6 +413,9 @@ function Invoke-Curl {
     # late --disable is too late. This is the only place it is added - an argument list that
     # also carried it would send it twice.
     $effectiveArguments = @('--disable') + @($Arguments)
+    if ($script:GuestTransferIgnoreCertificate) {
+        $effectiveArguments = @('--disable', '--insecure') + @($Arguments)
+    }
 
     # curl reports failures on stderr; under $ErrorActionPreference='Stop' a native
     # stderr write captured via 2>&1 is promoted to a terminating error before we can

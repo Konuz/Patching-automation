@@ -536,8 +536,16 @@ exit 0
     Assert-Equal -Actual ($putArguments -contains '-k') -Expected $false -Message 'harness: an upload never disables TLS verification'
     Assert-Equal -Actual ($putArguments -contains '--insecure') -Expected $false -Message 'harness: an upload has no alternate insecure flag'
     Assert-Equal -Actual ($putArguments -contains '--max-time') -Expected $true -Message 'harness: an upload still carries its deadline'
+    foreach ($ignore in @($true, $false)) {
+        $script:GuestTransferIgnoreCertificate = $ignore
+        Send-GuestFile -FileManager $putManagers.FileManager -VMView (New-FakeVMView -VMName 'VM-put-probe') -GuestAuth $null -HostName 'esxi-fake.invalid' -CurlPath $putFakeCurlPath -LocalPath $putSourcePath -GuestPath 'C:\guest\payload.txt'
+        $putArguments = @(Get-Content -LiteralPath $putFakeCurlLogPath)
+        Assert-Equal -Actual ($putArguments -contains '--insecure') -Expected $ignore -Message 'harness: upload honors the explicit ESXi certificate option and restores verification'
+        Assert-Equal -Actual $putArguments[0] -Expected '--disable' -Message 'harness: certificate override still ignores curl configuration'
+    }
 }
 finally {
+    $script:GuestTransferIgnoreCertificate = $false
     Set-Item Function:\Invoke-Curl -Value $originalPutInvokeCurl
     Remove-Item -LiteralPath $putProbeWorkspace -Recurse -Force -ErrorAction SilentlyContinue
 }

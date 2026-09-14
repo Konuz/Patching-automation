@@ -61,6 +61,8 @@ param(
 
     [switch]$IgnoreVCenterCertificate,
 
+    [switch]$IgnoreESXiCertificate,
+
     [switch]$KeepConnected,
 
     [hashtable]$PromptProvider,
@@ -1773,6 +1775,13 @@ if ($hasExplicitSelectedUpdateKeys -and @($SelectedUpdateKeys).Count -eq 0) {
 . (Join-Path $PSScriptRoot 'OrchestratorRuntime.ps1')
 
 $curlPath = Assert-LocalPrerequisites -LocalAgentPath $AgentPath
+
+# All ESXi transfers, including boot-time reads, run in this script scope through Invoke-Curl.
+# Reboot jobs use SOAP only. Assign on every run so a later strict run cannot inherit a bypass.
+$script:GuestTransferIgnoreCertificate = [bool]$IgnoreESXiCertificate
+if ($script:GuestTransferIgnoreCertificate) {
+    Write-Warning 'ESXi certificate verification is disabled for this run (preflight and file transfers).'
+}
 
 Import-Module VMware.VimAutomation.Core -ErrorAction Stop
 

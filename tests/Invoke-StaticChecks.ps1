@@ -380,7 +380,8 @@ if ($existingScripts.ContainsKey($guestOpsLibPath)) {
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle 'Connect-VIServersWithCredentialMap'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle '[ValidateRange(1,2147483647)][int]$TimeoutSeconds = 300'
     Assert-TextContains -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Needle '--max-time'
-    Assert-TextDoesNotMatch -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Pattern '(?i)(?<![A-Za-z])(?:-k|--insecure)(?![A-Za-z])' -Reason 'GuestOps transfers must verify TLS certificates'
+    # Certificate policy is exercised by Invoke-CertificateChecks: strict by default,
+    # with an explicit run-scoped ESXi override independent of vCenter.
     Assert-TextDoesNotMatch -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Pattern '(?i)Get-View\s+ServiceInstance' -Reason 'GuestOps managers must come from the VM client'
 }
 
