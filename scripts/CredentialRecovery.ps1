@@ -260,7 +260,10 @@ function Resolve-GuestCredentialForTarget {
             $validation = & $ValidateScript $VMName $candidateCredential
         }
         catch {
-            return New-GuestCredentialResolution -Status Failed -AccountKey $accountKey -Reason 'Credential validation failed before a result was returned.'
+            # Carry the message. Without it the operator is told that validation failed and
+            # nothing whatever about why - and the one failure this actually catches is a fault
+            # in the validate script itself, which is exactly the case nobody can guess at.
+            return New-GuestCredentialResolution -Status Failed -AccountKey $accountKey -Reason ('Credential validation failed before a result was returned: {0}' -f $_.Exception.Message)
         }
 
         if ($null -eq $validation) {

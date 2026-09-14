@@ -1729,7 +1729,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         $script:f5StagePrompts = 0
         $stageMap = @{ 'vm-stage.corp.test' = $stageOld }
         $stageContext = New-GuestCredentialContext -TargetNames @('vm-stage.corp.test') -CredentialMap $stageMap
-        $stageResults = @(Invoke-GuestAgentFleet -FleetItems @($stageItem) -Managers $null -GuestCredentialMap $stageMap -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -TimeoutSeconds 60 -PollSeconds 1 -MaxInFlight 1 -CredentialContext $stageContext -CredentialDecisionScript $stageDecision -CredentialInteractive $true)
+        $stageResults = @(Invoke-GuestAgentFleet -FleetItems @($stageItem) -VIServerScope @('vc.synthetic.invalid') -Managers $null -GuestCredentialMap $stageMap -CurlPath 'unused' -AgentPath 'unused' -IdentityHelperPath 'unused' -GuestWorkingDirectory 'C:\synthetic' -TimeoutSeconds 60 -PollSeconds 1 -MaxInFlight 1 -CredentialContext $stageContext -CredentialDecisionScript $stageDecision -CredentialInteractive $true)
 
         Assert-Equal -Actual $script:f5StagePrompts -Expected 1 -Message ('F5: a rejected login during {0} asks for one replacement credential' -f $stage)
         Assert-Equal -Actual ([string]$stageResults[0].Error) -Expected '' -Message ('F5: a rejected login during {0} recovers instead of failing the VM' -f $stage)
@@ -1744,6 +1744,49 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         $expectedStarts = if ($stage -eq 'Start') { 2 } else { 1 }
         Assert-Equal -Actual $script:f5StageStarts -Expected $expectedStarts -Message ('F5: recovering a rejected login during {0} starts the agent the expected number of times' -f $stage)
     }
+}
+
+# F5: the vCenter scope has to reach the validate script BY VALUE. The script that validates a
+# credential is built in the orchestrator and invoked from CredentialRecovery.ps1 - another file,
+# another scope chain - so a dynamic lookup of $VIServerScope resolves wherever the invocation
+# happens to be. It resolved on PowerShell 7 and not on Windows PowerShell 5.1, which is the
+# target runtime: under StrictMode the unresolved variable throws, the throw is caught as
+# "validation failed", and every VM reports a credential error before an agent is ever started.
+#
+# Asserted by behaviour rather than by scope semantics, so it holds on whichever host runs it:
+# the validate script is invoked from a scope that has no $VIServerScope of its own, and it still
+# has to see the one the caller was given.
+& {
+    $script:scopeSeenByValidate = 'never called'
+
+    function Test-GuestCredentialForTarget {
+        param([string]$VMName, [object[]]$VIServerScope, [pscredential]$Credential)
+        $script:scopeSeenByValidate = (@($VIServerScope) -join ',')
+        return [pscustomobject]@{ Status = 'Valid'; ErrorKind = $null; Error = $null }
+    }
+    function New-GuestAuthentication { param([pscredential]$Credential) return [pscustomobject]@{ UserName = $Credential.UserName } }
+
+    # Stands in for CredentialRecovery.ps1: it invokes the block from its own scope, which is the
+    # whole point - nothing here defines $VIServerScope.
+    function Resolve-GuestCredentialForTarget {
+        param($VMName, $Context, [scriptblock]$ValidateScript, $DecisionScript, $OnValidatedScript, [switch]$ForcePrompt, [switch]$Interactive)
+        $validation = $null
+        $validationError = ''
+        try { $validation = & $ValidateScript $VMName $Context.Credential }
+        catch { $validationError = $_.Exception.Message }
+        if ([string]::IsNullOrWhiteSpace($validationError) -and $null -ne $validation -and $validation.Status -eq 'Valid') {
+            return [pscustomobject]@{ Status = 'Ready'; Credential = $Context.Credential; Reason = '' }
+        }
+        return [pscustomobject]@{ Status = 'Failed'; Credential = $null; Reason = $validationError }
+    }
+
+    $scopeCredential = New-Object System.Management.Automation.PSCredential('CORP\adm', (ConvertTo-SecureString 'synthetic-scope' -AsPlainText -Force))
+    $scopeResult = Invoke-GuestOperationWithCredentialRecovery -VMName 'vm-scope.corp.test' -VIServerScope @('vc-one.invalid', 'vc-two.invalid') `
+        -CredentialContext @{ Credential = $scopeCredential } -CredentialDecisionScript $null -CredentialValidatedScript $null `
+        -CredentialInteractive $false -OperationScript { param($ItemAuth) return 'operation ran' }
+
+    Assert-Equal $script:scopeSeenByValidate 'vc-one.invalid,vc-two.invalid' 'F5: the validate script is handed the vCenter scope its caller was given'
+    Assert-Equal $scopeResult 'operation ran' 'F5: a credential that validates lets the operation run'
 }
 
 # F3: the guest working directory is shared with whatever else the customer keeps under it, and
