@@ -298,9 +298,11 @@ if ($existingScripts.ContainsKey($workspaceHelperPath)) {
     Assert-NoOrphanedBranchKeyword -Ast $workspaceHelperAst -RelativePath $workspaceHelperPath
     Assert-TextDoesNotMatch -RelativePath $workspaceHelperPath -Text $workspaceHelperText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
 
-    # The guard never repairs what it finds. Taking ownership or rewriting an ACL would turn a
-    # refusal - the one safe answer - into a silent adoption of somebody else's directory.
-    Assert-TextDoesNotMatch -RelativePath $workspaceHelperPath -Text $workspaceHelperText -Pattern '(?i)\bSet-Acl\b' -Reason 'the guest workspace guard reports, it never re-permissions what it finds'
+    # Legacy-root migration is the only ACL writer; ordinary verification stays read-only.
+    foreach ($verifyName in @('Assert-GuestWorkspacePath', 'Assert-GuestWorkspaceFilePath', 'Assert-GuestWorkspaceSeal')) {
+        $verifyAst = $workspaceHelperAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $verifyName }, $true)
+        Assert-TextDoesNotMatch -RelativePath $workspaceHelperPath -Text $verifyAst.Extent.Text -Pattern '(?i)\b(Set-Acl|takeown|Set-GuestWorkspaceRootSecurity)\b' -Reason 'verification must not migrate permissions'
+    }
     Assert-TextDoesNotMatch -RelativePath $workspaceHelperPath -Text $workspaceHelperText -Pattern '(?i)\bRemove-Item\b' -Reason 'the guest workspace guard never deletes anything'
 }
 

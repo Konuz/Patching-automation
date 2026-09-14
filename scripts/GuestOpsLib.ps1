@@ -551,7 +551,8 @@ function New-GuestWorkspaceBootstrapCommand {
         # root does not vouch for a file that was already sitting in it.
         [string]$FilePath,
         # Seals the directory on Initialize, and requires that exact seal on Assert.
-        [string]$SealToken
+        [string]$SealToken,
+        [string]$LegacyRootPath
     )
 
     if ([string]::IsNullOrWhiteSpace($WorkspaceScriptText)) {
@@ -570,8 +571,9 @@ function New-GuestWorkspaceBootstrapCommand {
     if (-not [string]::IsNullOrWhiteSpace($SealToken)) {
         $sealBase64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$SealToken))
     }
+    $legacyRootBase64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]$LegacyRootPath))
     $preamble = @(
-        "`$GuestWorkspaceRequest = [pscustomobject]@{ Mode = '$Mode'; PathBase64 = '$pathBase64'; FileBase64 = '$fileBase64'; SealTokenBase64 = '$sealBase64' }"
+        "`$GuestWorkspaceRequest = [pscustomobject]@{ Mode = '$Mode'; PathBase64 = '$pathBase64'; FileBase64 = '$fileBase64'; SealTokenBase64 = '$sealBase64'; LegacyRootBase64 = '$legacyRootBase64' }"
     ) -join [Environment]::NewLine
 
     $commandText = $preamble + [Environment]::NewLine + (New-CompressedGuestScript -ScriptText $WorkspaceScriptText)
@@ -615,6 +617,7 @@ function Assert-GuestWorkspaceReady {
         [ValidateSet('Initialize', 'Assert')][string]$Mode = 'Initialize',
         [string]$FilePath,
         [string]$SealToken,
+        [string]$LegacyRootPath,
         [int]$TimeoutSeconds = 120,
         [int]$PollSeconds = 5
     )
@@ -622,7 +625,7 @@ function Assert-GuestWorkspaceReady {
     # Executed straight from the trusted local copy through an in-memory compressed command. Uploading the
     # guard into the directory it is supposed to be guarding would mean writing a file into an
     # unverified location and then trusting what came back from it.
-    $encodedCommand = New-GuestWorkspaceBootstrapCommand -WorkspaceScriptText (Get-GuestWorkspaceScriptText -WorkspaceScriptPath $WorkspaceScriptPath) -Path $Path -Mode $Mode -FilePath $FilePath -SealToken $SealToken
+    $encodedCommand = New-GuestWorkspaceBootstrapCommand -WorkspaceScriptText (Get-GuestWorkspaceScriptText -WorkspaceScriptPath $WorkspaceScriptPath) -Path $Path -Mode $Mode -FilePath $FilePath -SealToken $SealToken -LegacyRootPath $LegacyRootPath
     $processId = Start-GuestWorkspaceBootstrap -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -EncodedCommand $encodedCommand
     $result = Wait-GuestProcess -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -ProcessId $processId -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds
 
@@ -1219,7 +1222,7 @@ function Start-VMAgentCycle {
     # re-checks the seal, so a directory swapped or re-permissioned between this check and the
     # agent start is caught instead of being trusted on the strength of one check.
     $workspaceSealToken = New-GuestWorkspaceSealToken
-    Assert-GuestWorkspaceReady -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -VMName $VMName -Path $guestCycleDirectory -WorkspaceScriptPath $WorkspaceScriptPath -Mode 'Initialize' -SealToken $workspaceSealToken -TimeoutSeconds 120 -PollSeconds 5
+    Assert-GuestWorkspaceReady -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -VMName $VMName -Path $guestCycleDirectory -WorkspaceScriptPath $WorkspaceScriptPath -Mode 'Initialize' -SealToken $workspaceSealToken -LegacyRootPath $GuestWorkingDirectory -TimeoutSeconds 120 -PollSeconds 5
 
     # Every transfer carries a budget. The fleet puts no job wrapper around these calls, so
     # nothing else bounds a curl hanging against an unresponsive ESXi data plane.
@@ -1800,8 +1803,9 @@ function Invoke-VMGuestBootTimeRead {
         # but it does mean a dead query would leave the previous attempt's JSON in place, which is
         # why the exit code of the query below is checked and not just its completion.
         $safeVmName = ([string]$VMName) -replace '[^a-zA-Z0-9_.-]', '_'
-        $guestHelperPath = Join-Path $GuestWorkingDirectory ('Read-BootTime-{0}.ps1' -f $safeVmName)
-        $guestOutputPath = Join-Path $GuestWorkingDirectory ('boot-time-{0}.json' -f $safeVmName)
+        $guestBootDirectory = Join-Path $GuestWorkingDirectory '.boot-time'
+        $guestHelperPath = Join-Path $guestBootDirectory ('Read-BootTime-{0}.ps1' -f $safeVmName)
+        $guestOutputPath = Join-Path $guestBootDirectory ('boot-time-{0}.json' -f $safeVmName)
         $operationDeadline = (Get-Date).AddSeconds([math]::Max(1, $TimeoutSeconds))
         $getRemainingSeconds = {
             $remaining = ($operationDeadline - (Get-Date)).TotalSeconds
@@ -1829,16 +1833,16 @@ function Invoke-VMGuestBootTimeRead {
         # so it is checked too. A fresh upload replaces whatever is there, so it is not.
         $workspaceFilePath = if ($SkipHelperUpload) { $guestHelperPath } else { '' }
         $bootTimeSealToken = New-GuestWorkspaceSealToken
-        Assert-GuestWorkspaceReady -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -VMName $VMName -Path $GuestWorkingDirectory -WorkspaceScriptPath $WorkspaceScriptPath -Mode 'Initialize' -FilePath $workspaceFilePath -SealToken $bootTimeSealToken -TimeoutSeconds $workspaceTimeoutSeconds -PollSeconds $shortOperationPollSeconds
+        Assert-GuestWorkspaceReady -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -VMName $VMName -Path $guestBootDirectory -WorkspaceScriptPath $WorkspaceScriptPath -Mode 'Initialize' -FilePath $workspaceFilePath -SealToken $bootTimeSealToken -LegacyRootPath $GuestWorkingDirectory -TimeoutSeconds $workspaceTimeoutSeconds -PollSeconds $shortOperationPollSeconds
 
         if (-not $SkipHelperUpload) {
             Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $BootTimeHelperPath -GuestPath $guestHelperPath -TimeoutSeconds (& $getRemainingSeconds)
             # The helper dot-sources this to check the seal, so it has to sit beside it. The
             # directory was verified above, so writing into it is safe.
-            Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $WorkspaceScriptPath -GuestPath (Join-Path $GuestWorkingDirectory 'GuestWorkspace.ps1') -TimeoutSeconds (& $getRemainingSeconds)
+            Send-GuestFile -FileManager $Managers.FileManager -VMView $vmView -GuestAuth $GuestAuth -HostName $hostName -CurlPath $CurlPath -LocalPath $WorkspaceScriptPath -GuestPath (Join-Path $guestBootDirectory 'GuestWorkspace.ps1') -TimeoutSeconds (& $getRemainingSeconds)
         }
 
-        $queryProcessId = Start-GuestBootTimeQuery -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -BootTimeHelperPath $guestHelperPath -OutputPath $guestOutputPath -WorkspacePath $GuestWorkingDirectory -WorkspaceSealToken $bootTimeSealToken
+        $queryProcessId = Start-GuestBootTimeQuery -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -BootTimeHelperPath $guestHelperPath -OutputPath $guestOutputPath -WorkspacePath $guestBootDirectory -WorkspaceSealToken $bootTimeSealToken
         $queryTimeoutSeconds = & $getRemainingSeconds
         $queryResult = Wait-GuestProcess -ProcessManager $Managers.ProcessManager -VMView $vmView -GuestAuth $GuestAuth -ProcessId $queryProcessId -TimeoutSeconds $queryTimeoutSeconds -PollSeconds $shortOperationPollSeconds
         if (-not $queryResult.Completed) {

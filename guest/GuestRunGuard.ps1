@@ -237,7 +237,7 @@ function Enter-GuestRunGuard {
     }
 
     $directory = Get-GuestRunGuardDirectory
-    $workspace = Initialize-GuestWorkspace -Path $directory
+    $workspace = Initialize-GuestWorkspace -Path $directory -LegacyRootPath ([System.IO.Path]::GetDirectoryName($directory))
     if ([string]$workspace.Status -ne 'Ok') {
         # Without a directory this tool controls there is no lock worth taking, and pretending
         # otherwise would let two runs meet in a directory anyone can rewrite.

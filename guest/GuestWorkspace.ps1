@@ -15,8 +15,8 @@
       Initialize-GuestWorkspace -Path <string>   create what is missing, protected, then verify
       Assert-GuestWorkspacePath -Path <string>   verify only
 
-    Nothing here ever takes ownership of, re-permissions, or deletes anything it finds. An
-    existing directory that does not meet the contract stops this VM; it is not "fixed".
+    Only an explicitly designated legacy root may have its inherited ACL migrated. Existing
+    protected directories and files are verified, never adopted or deleted.
 #>
 
 Set-StrictMode -Version 2.0
@@ -443,12 +443,24 @@ function Assert-GuestWorkspaceFilePath {
     return New-GuestWorkspaceVerdict -Status 'Ok' -Path $canonical
 }
 
+function Set-GuestWorkspaceRootSecurity {
+    param([string]$Path)
+
+    # No recursion: old artifacts and the coordination lock must remain in place.
+    # takeown enables the privilege needed when an earlier patching account owns the root.
+    $takeown = Join-Path $env:SystemRoot 'System32\takeown.exe'
+    $output = & $takeown /F $Path /A 2>&1
+    if ($LASTEXITCODE -ne 0) { throw ('Cannot take ownership of the legacy workspace: {0}' -f ($output -join ' ')) }
+    Set-Acl -LiteralPath $Path -AclObject (New-GuestWorkspaceSecurity) -ErrorAction Stop
+}
+
 function Initialize-GuestWorkspace {
     param(
         [string]$Path,
         # When given, the directory is sealed with this token once it has been proven safe, and
         # the seal is verified before this call returns.
-        [string]$SealToken
+        [string]$SealToken,
+        [string]$LegacyRootPath
     )
 
     $shape = Test-GuestWorkspacePathShape -Path $Path
@@ -456,6 +468,45 @@ function Initialize-GuestWorkspace {
         return $shape
     }
     $canonical = [string]$shape.Path
+
+    if (-not [string]::IsNullOrWhiteSpace($LegacyRootPath)) {
+        $rootShape = Test-GuestWorkspacePathShape -Path $LegacyRootPath
+        if ($rootShape.Status -ne 'Ok') { return $rootShape }
+        $legacyRoot = [string]$rootShape.Path
+        if ($canonical -ne $legacyRoot -and -not $canonical.StartsWith($legacyRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            return New-GuestWorkspaceVerdict -Status 'PathRefused' -Reason 'The migration root must contain the workspace.' -Path $canonical
+        }
+        try {
+            foreach ($segment in @(Get-GuestWorkspacePathChain -CanonicalPath $canonical)) {
+                if ((Test-Path -LiteralPath $segment) -and (Test-GuestWorkspaceReparsePoint -Path $segment)) {
+                    return New-GuestWorkspaceVerdict -Status 'ReparsePoint' -Reason 'A link redirects the legacy workspace.' -Path $canonical
+                }
+            }
+            if (Test-Path -LiteralPath $legacyRoot -PathType Container) {
+                $security = Get-Acl -LiteralPath $legacyRoot
+                if (-not $security.AreAccessRulesProtected) {
+                    # Only the inherited descriptor left by mkdir is eligible. Explicit local
+                    # permissions require operator review, rather than silently discarding them.
+                    $explicitRules = @($security.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))
+                    if ($explicitRules.Count -gt 0) {
+                        return New-GuestWorkspaceVerdict -Status 'AccessRuleRefused' -Reason 'The legacy root has explicit access rules.' -Path $canonical
+                    }
+                    $parent = [System.IO.Path]::GetDirectoryName($legacyRoot)
+                    $parentSecurity = Get-Acl -LiteralPath $parent
+                    $unsafeParent = Test-GuestWorkspaceAccessRules -Security $parentSecurity -Mask (Get-GuestWorkspaceReplaceMask) -IgnoreInheritOnly
+                    if ($null -ne $unsafeParent) {
+                        return New-GuestWorkspaceVerdict -Status 'ParentRefused' -Reason $unsafeParent -Path $canonical
+                    }
+                    Set-GuestWorkspaceRootSecurity -Path $legacyRoot
+                }
+                $rootVerdict = Assert-GuestWorkspacePath -Path $legacyRoot
+                if ($rootVerdict.Status -ne 'Ok') { return $rootVerdict }
+            }
+        }
+        catch {
+            return New-GuestWorkspaceVerdict -Status 'SecurityUnreadable' -Reason ('Legacy workspace migration failed: {0}' -f $_.Exception.Message) -Path $canonical
+        }
+    }
 
     # Each missing level is created with the protected descriptor in its own right. Letting
     # CreateDirectory create the intermediate levels would give them the inherited permissions
@@ -531,7 +582,9 @@ if (Test-Path -LiteralPath 'Variable:GuestWorkspaceRequest') {
             }
         }
         else {
-            Initialize-GuestWorkspace -Path $requestedPath -SealToken $requestedSealToken
+            $legacyRootBase64 = [string](& { try { [string]$request.LegacyRootBase64 } catch { '' } })
+            $legacyRootPath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($legacyRootBase64))
+            Initialize-GuestWorkspace -Path $requestedPath -SealToken $requestedSealToken -LegacyRootPath $legacyRootPath
         }
 
         # An optional second question, asked only once the directory itself is acceptable: is

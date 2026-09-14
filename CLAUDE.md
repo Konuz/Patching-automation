@@ -222,10 +222,14 @@ it run under the patching account. So `Assert-GuestWorkspaceReady` replaces the 
 `Test-GuestUploadsAreGuarded` in the static gate, and asserted by behaviour (zero uploads, zero
 agent starts) in `tests/Invoke-GuestWorkspaceChecks.ps1` and the harness.
 
-Two entry points, and nothing else: `Initialize-GuestWorkspace` creates what is missing and then
-verifies; `Assert-GuestWorkspacePath` only verifies. **Nothing is ever adopted, re-permissioned,
-taken ownership of or deleted** — the static gate forbids `Set-Acl` and `Remove-Item` in that
-file. An existing directory that does not meet the contract stops that VM.
+`Initialize-GuestWorkspace` creates missing directories and verifies them;
+`Assert-GuestWorkspacePath` only verifies. Initialization may migrate an explicitly designated
+`LegacyRootPath` left by main's mkdir: an unprotected directory with inherited access rules only.
+After rejecting links and unsafe parent permissions, migration takes ownership for Administrators
+and sets a protected SYSTEM/Administrators DACL on that root only. It does not delete old artifacts
+or reset the coordination lock. Explicit ACLs and protected unsafe directories remain refusals.
+Discovery, boot-time reads and the fixed coordination path all prepare their root before use.
+Boot-time helpers now live in a protected `.boot-time` subdirectory, avoiding main's old files.
 
 Creation is `Directory.CreateDirectory(path, DirectorySecurity)` with
 `SetAccessRuleProtection($true, $false)` so the inherited rules from `C:\ProgramData` — which let

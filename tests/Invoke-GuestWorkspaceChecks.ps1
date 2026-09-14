@@ -252,6 +252,48 @@ Assert-Contains $fileScopedDecoded ([System.Convert]::ToBase64String([System.Tex
     Assert-Contains $sizeError 'too long' 'oversized future bootstraps fail locally before GuestOps'
 }
 
+# Legacy mkdir roots: migrate only the designated root, then verify cycle and reboot paths.
+& {
+    $root = 'C:\ProgramData\PatchingGuestOps'
+    $cycle = Join-Path $root '11111111111111111111111111111111'
+    $secure = New-GuestWorkspaceSecurity
+    $fixture = @{ Writes = 0; Link = $false; RefuseWrite = $false }
+    function Test-Path { param($LiteralPath, $PathType) return $true }
+    function Test-GuestWorkspaceReparsePoint { param($Path) return $fixture.Link }
+    function Get-Acl { param($LiteralPath) if ($LiteralPath -eq $root) { return $fixture.Acl }; return $secure }
+    function Set-GuestWorkspaceRootSecurity {
+        param($Path)
+        if ($fixture.RefuseWrite) { throw 'denied' }
+        Assert-Equal $Path $root 'migration changes only the designated root'
+        $fixture.Writes++
+        $fixture.Acl = New-GuestWorkspaceSecurity
+    }
+    foreach ($owner in @('BA', 'S-1-5-21-1111111111-2222222222-3333333333-1105')) {
+        $fixture.Acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $fixture.Acl.SetSecurityDescriptorSddlForm(('O:{0}G:SYD:AI(A;ID;FA;;;{0})(A;OICIID;FA;;;SY)(A;OICIIOID;FA;;;BA)(A;CIID;DCLCRPCR;;;BU)' -f $owner))
+        $fixture.Writes = 0
+        Assert-Equal (Initialize-GuestWorkspace -Path $cycle -LegacyRootPath $root).Status 'Ok' ($owner + ': legacy root permits discovery after migration')
+        Assert-Equal (Assert-GuestWorkspacePath -Path $root).Status 'Ok' ($owner + ': migrated root permits boot-time reads')
+        Assert-Equal $fixture.Writes 1 'legacy root migrated once'
+        $null = Initialize-GuestWorkspace -Path $cycle -LegacyRootPath $root
+        Assert-Equal $fixture.Writes 1 'protected root is not rewritten on later rounds'
+    }
+    $fixture.Link = $true
+    Assert-Equal (Initialize-GuestWorkspace -Path $cycle -LegacyRootPath $root).Status 'ReparsePoint' 'migration refuses links'
+    Assert-Equal $fixture.Writes 1 'link refusal writes no ACL'
+    $fixture.Link = $false
+    Assert-Equal (Initialize-GuestWorkspace -Path $cycle -LegacyRootPath 'C:\Other').Status 'PathRefused' 'migration root must contain the requested workspace'
+    $fixture.Acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $fixture.Acl.SetSecurityDescriptorSddlForm('O:BAG:SYD:AI(A;ID;FA;;;BA)(A;CIID;DCLCRPCR;;;BU)')
+    $fixture.RefuseWrite = $true
+    Assert-Equal (Initialize-GuestWorkspace -Path $cycle -LegacyRootPath $root).Status 'SecurityUnreadable' 'failed migration cannot permit a cycle'
+    Assert-Equal $fixture.Writes 1 'failed migration is not reported as a successful write'
+    $fixture.RefuseWrite = $false
+    $fixture.Acl.SetSecurityDescriptorSddlForm('O:BAG:SYD:(A;;FA;;;BA)(A;CI;DCLCRPCR;;;BU)')
+    Assert-Equal (Initialize-GuestWorkspace -Path $cycle -LegacyRootPath $root).Status 'AccessRuleRefused' 'explicit permissions require review'
+    Assert-Equal $fixture.Writes 1 'explicit permissions are not rewritten'
+}
+
 # --- what the orchestrator does with the verdict ---------------------------------------------------
 
 & {
@@ -794,6 +836,22 @@ else {
         $creatableSecurity.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($usersSid, 'CreateFiles,CreateDirectories,ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
         Set-Acl -LiteralPath $creatableParent -AclObject $creatableSecurity
         Assert-Equal (Initialize-GuestWorkspace -Path (Join-Path $creatableParent 'PatchingGuestOps')).Status 'Ok' 'a parent that only lets ordinary users add new entries is accepted'
+
+        # Exercise real ownership and ACL writes when the session permits protected descriptors.
+        foreach ($legacyOwner in @($administratorsSid, [System.Security.Principal.WindowsIdentity]::GetCurrent().User)) {
+            $legacyPath = Join-Path $creatableParent ('legacy-' + [guid]::NewGuid().ToString('N'))
+            $null = [System.IO.Directory]::CreateDirectory($legacyPath)
+            $legacySecurity = Get-Acl -LiteralPath $legacyPath
+            $legacySecurity.SetOwner($legacyOwner)
+            Set-Acl -LiteralPath $legacyPath -AclObject $legacySecurity
+            $artifactPath = Join-Path $legacyPath 'agent.log'
+            Set-Content -LiteralPath $artifactPath -Value 'legacy artifact' -NoNewline
+            $legacyCycle = Join-Path $legacyPath ([guid]::NewGuid().ToString('N'))
+            Assert-Equal (Initialize-GuestWorkspace -Path $legacyCycle -LegacyRootPath $legacyPath -SealToken 'cycle').Status 'Ok' 'real legacy root supports a sealed cycle'
+            Assert-Equal (Initialize-GuestWorkspace -Path (Join-Path $legacyPath '.boot-time') -LegacyRootPath $legacyPath -SealToken 'boot').Status 'Ok' 'real migrated root supports the reboot helper'
+            Assert-Equal (Get-Content -LiteralPath $artifactPath -Raw) 'legacy artifact' 'migration preserves old artifact contents'
+            Assert-Equal (Get-Acl -LiteralPath $legacyPath).AreAccessRulesProtected $true 'real migration disables inheritance'
+        }
 
         # 8. A file already in a safe directory is not vouched for by the directory.
         $helperHome = Join-Path $aclBase 'helper-home'
