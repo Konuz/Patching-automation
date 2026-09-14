@@ -274,14 +274,33 @@ function Test-PendingReboot {
     $sessionManagerPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
     try {
         $sessionManager = Get-ItemProperty -LiteralPath $sessionManagerPath -Name PendingFileRenameOperations -ErrorAction Stop
-        $checks.pendingFileRename = ($null -ne $sessionManager.PendingFileRenameOperations)
+        # Presence of the value is not a pending rename. It is a REG_MULTI_SZ of source and
+        # destination pairs, a queued delete is encoded as a source path with an empty
+        # destination, and the value can survive as blank entries alone. Only a non-blank
+        # entry is a real queued operation, so filter before judging.
+        $renameEntries = @($sessionManager.PendingFileRenameOperations)
+        $checks.pendingFileRename = (@($renameEntries | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count -gt 0)
     }
     catch {
         $checks.pendingFileRename = $false
     }
 
+    # Only the two servicing flags gate the reboot prompt. Windows Update sets one of them
+    # whenever a patch it installed still needs a restart to complete, so between them they
+    # answer the question this tool actually asks: did patching leave work outstanding?
+    # PendingFileRenameOperations does not. Any installer can queue a rename, the entry
+    # survives until the next boot whatever put it there, and it was observed as the only
+    # flag set on a fully patched guest with zero applicable updates -- offering a reboot
+    # that no update had asked for. It stays recorded and reported, but it no longer forces
+    # the prompt on its own.
+    $gatingCheckNames = @('componentBasedServicing', 'windowsUpdate')
+    $pendingReasons = @($gatingCheckNames | Where-Object { [bool]$checks[$_] })
+    $advisoryReasons = @($checks.Keys | Where-Object { $_ -notin $gatingCheckNames -and [bool]$checks[$_] })
+
     return [ordered]@{
-        isPending = ($checks.componentBasedServicing -or $checks.windowsUpdate -or $checks.pendingFileRename)
+        isPending = ($pendingReasons.Count -gt 0)
+        pendingReasons = $pendingReasons
+        advisoryReasons = $advisoryReasons
         checks = $checks
     }
 }

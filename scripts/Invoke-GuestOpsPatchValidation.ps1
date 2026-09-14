@@ -1426,7 +1426,15 @@ function Write-FinalReport {
     $patched = @($ApplyResults | Where-Object { $_.outcome -eq 'InstallSucceeded' })
     $noUpdates = @($PatchPlanRecords | Where-Object { $_.action -eq 'NoSelectedUpdates' })
     $skipped = @($PatchPlanRecords | Where-Object { $_.action -eq 'Skip' })
-    $rebootRequired = if ($null -eq $RebootTargets) { @(Select-RebootRequiredApplyResults -ApplyResults $ApplyResults) } else { @($RebootTargets) }
+    # Wrap the whole expression, not each branch. An if-expression assigns its branch's
+    # pipeline output, and an empty collection emits nothing at all - so @() inside a branch
+    # assigns $null, and the count below then threw under StrictMode on any fleet with no
+    # reboot targets. That state used to be unreachable here because a stale
+    # PendingFileRenameOperations kept every guest on the list.
+    $rebootRequired = @(
+        if ($null -eq $RebootTargets) { Select-RebootRequiredApplyResults -ApplyResults $ApplyResults }
+        else { $RebootTargets }
+    )
     $errors = @($ApplyResults | Where-Object { Test-IsApplyResultError -ApplyResult $_ })
     $clusters = @($PatchPlanRecords | Where-Object { $_.reason -eq 'Skipped: Failover Cluster detected. Please update manually one by one.' })
 
@@ -1704,6 +1712,13 @@ function Invoke-DiscoveryPhase {
         }
         $pendingRebootBefore = Get-ObjectPropertyValue -InputObject $record -Path @('pendingRebootBefore', 'isPending')
         $rebootText = if ($null -eq $pendingRebootBefore) { '?' } elseif ([bool]$pendingRebootBefore) { 'yes' } else { 'no' }
+        # Flags that were seen but deliberately do not gate the reboot prompt still belong on
+        # screen. Dropping them entirely would replace one confusing prompt with a silent
+        # omission, and this line is where an operator looks first.
+        $advisoryReboot = @(Get-ObjectPropertyValue -InputObject $record -Path @('pendingRebootBefore', 'advisoryReasons') -DefaultValue @())
+        if ($advisoryReboot.Count -gt 0) {
+            $rebootText = '{0} (advisory: {1})' -f $rebootText, ($advisoryReboot -join ', ')
+        }
         Write-Host ('{0}: outcome={1}; updates={2}; reboot={3}; roles={4}' -f $record.vmName, $record.outcome, $record.availableUpdateCount, $rebootText, (Get-RoleFlagText -RoleFlags $record.roleFlags)) -ForegroundColor $summaryColor
         Write-Host ''
     }
@@ -2211,9 +2226,18 @@ try {
     }
 }
 catch {
-    # -ErrorAction Continue is load-bearing: under the script's 'Stop' preference a bare
-    # Write-Error re-throws, and the run would leave without reaching the exit code below.
-    Write-Error $_.Exception.Message -ErrorAction Continue
+    # Keep the origin. The message alone is reported against the launcher's call operator,
+    # which locates a failure no better than "somewhere in the run" and turns a one-line bug
+    # into a bisection.
+    $failureOrigin = ''
+    if ($null -ne $_.InvocationInfo -and -not [string]::IsNullOrWhiteSpace([string]$_.InvocationInfo.ScriptName)) {
+        $failureOrigin = ' [{0}:{1}]' -f (Split-Path -Leaf ([string]$_.InvocationInfo.ScriptName)), $_.InvocationInfo.ScriptLineNumber
+    }
+    # -ErrorAction Continue is load-bearing and survives the added origin: under the script's
+    # 'Stop' preference a bare Write-Error re-throws, and the run would leave without reaching
+    # the exit code below. Behaviour check N2 in tests/Invoke-AuditFollowupChecks.ps1 runs this
+    # catch body for exactly that reason.
+    Write-Error ('{0}{1}' -f $_.Exception.Message, $failureOrigin) -ErrorAction Continue
     $scriptExitCode = 1
 }
 finally {

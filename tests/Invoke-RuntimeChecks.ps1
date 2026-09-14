@@ -582,13 +582,24 @@ Assert-Equal -Actual $timeoutCompleted -Expected $true -Message 'a timeout still
 Assert-Equal -Actual $timeoutResults[0].Payload.Harvested -Expected $true -Message 'a timed out item carries the harvested payload alongside its error'
 Assert-Equal -Actual $timeoutResults[0].ResultKind -Expected 'Timeout' -Message 'a timeout has a structural result kind'
 
-# Harvesting must not be able to hide the timeout.
-$timeoutThrowResults = @(Invoke-InProcessAgentFleet -Items @($fleetItems[0]) -MaxInFlight 1 -PollSeconds 1 -ItemTimeoutSeconds 0 `
-    -StartScript { param($Item) return [pscustomobject]@{ VMName = $Item.VMName } } `
-    -PollScript { param($Handle) return $false } `
-    -CompleteScript { param($Handle) throw 'status.json was not downloaded' } `
-    -SleepScript { param([int]$Seconds) })
+# Harvesting must not be able to hide the timeout. The failed harvest is expected to warn, so the
+# warning stream is redirected into the output and asserted here: an expected warning printed during
+# a passing run reads like a real problem, and silencing it outright would drop the proof that a
+# timed out VM still explains why its artifacts are missing.
+$timeoutThrowStream = @(& {
+    Invoke-InProcessAgentFleet -Items @($fleetItems[0]) -MaxInFlight 1 -PollSeconds 1 -ItemTimeoutSeconds 0 `
+        -StartScript { param($Item) return [pscustomobject]@{ VMName = $Item.VMName } } `
+        -PollScript { param($Handle) return $false } `
+        -CompleteScript { param($Handle) throw 'status.json was not downloaded' } `
+        -SleepScript { param([int]$Seconds) }
+} 3>&1)
+$harvestWarnings = @($timeoutThrowStream | Where-Object { $_ -is [System.Management.Automation.WarningRecord] })
+$timeoutThrowResults = @($timeoutThrowStream | Where-Object { $_ -isnot [System.Management.Automation.WarningRecord] })
 
+Assert-Equal -Actual $harvestWarnings.Count -Expected 1 -Message 'a failed harvest warns exactly once'
+Assert-Contains -Text ([string]$harvestWarnings[0]) -Needle 'VM01' -Message 'the harvest warning names the VM it could not collect'
+Assert-Contains -Text ([string]$harvestWarnings[0]) -Needle 'status.json was not downloaded' -Message 'the harvest warning carries the underlying error'
+Assert-Equal -Actual $timeoutThrowResults.Count -Expected 1 -Message 'a failed harvest still yields exactly one result'
 Assert-Contains -Text ([string]$timeoutThrowResults[0].Error) -Needle 'timed out' -Message 'a failed harvest still reports the original timeout'
 Assert-Equal -Actual $timeoutThrowResults[0].Payload -Expected $null -Message 'a failed harvest leaves no payload'
 Assert-Equal -Actual $timeoutThrowResults[0].ResultKind -Expected 'Timeout' -Message 'a failed timeout keeps the timeout result kind'
@@ -771,6 +782,59 @@ Assert-Equal -Actual $secondCombinedRebootTargetName -Expected 'VM02' -Message '
 Assert-Equal -Actual $secondCombinedRebootTargetReason -Expected 'Pending before patching' -Message 'pending-before reboot target explains why reboot is requested'
 Assert-Equal -Actual (@($combinedRebootTargets | Where-Object { $_.vmName -eq 'VM04' }).Count) -Expected 0 -Message 'pending-before discovery outside apply results is not rebooted'
 
+# A reboot target must name the flag that put it there. Without it a VM offered a reboot after a
+# single Defender definition update is indistinguishable from one that genuinely needs restarting.
+$signalDiscovery = @(
+    [pscustomobject]@{ vmName = 'VM02'; pendingRebootBefore = [pscustomobject]@{ isPending = $true; pendingReasons = @('pendingFileRename') } }
+)
+# Built through the shared constructor, so the fixture cannot drift from the record shape the
+# apply phase actually produces - and so agentCompletionConfirmed is set, which the reboot
+# filter requires before it will restart anything.
+$signalApplyResults = @(
+    (New-ApplyResultRecord -VMName 'VM01' -Outcome 'InstallSucceeded' -RebootRequired $true -AgentCompletionConfirmed $true -RebootSignals @('installResult.rebootRequired', 'pendingRebootAfter.componentBasedServicing')),
+    (New-ApplyResultRecord -VMName 'VM02' -Outcome 'InstallSucceeded' -RebootRequired $false -AgentCompletionConfirmed $true)
+)
+$signalTargets = @(Select-RebootRequiredApplyResults -ApplyResults $signalApplyResults -DiscoveryRecords $signalDiscovery)
+Assert-Equal -Actual $signalTargets.Count -Expected 2 -Message 'signal-carrying reboot targets are still selected'
+Assert-Contains -Text ([string]$signalTargets[0].rebootReason) -Needle 'Reported after apply: installResult.rebootRequired, pendingRebootAfter.componentBasedServicing' -Message 'apply reboot reason names the flags that fired'
+Assert-Contains -Text ([string]$signalTargets[1].rebootReason) -Needle 'Pending before patching: pendingRebootBefore.pendingFileRename' -Message 'pending-before reboot reason names the flag that fired'
+
+# An apply result with no signal list must keep the bare phrasing rather than gaining a stray
+# separator, because a resumed -PatchPlanPath run has no discovery records to draw signals from.
+$unnamedSignalTargets = @(Select-RebootRequiredApplyResults -ApplyResults @((New-ApplyResultRecord -VMName 'VM09' -Outcome 'InstallSucceeded' -RebootRequired $true -AgentCompletionConfirmed $true)))
+Assert-Equal -Actual ([string]$unnamedSignalTargets[0].rebootReason) -Expected 'Reported after apply' -Message 'a reboot target without signals keeps the bare reason'
+
+# New-ApplyResultFromCycle must derive the signals from status.json, not be handed them.
+$signalCycle = [pscustomobject]@{
+    AgentCompletionConfirmed = $true
+    AgentResult = [pscustomobject]@{ Completed = $true; ExitCode = 0 }
+    Status = [pscustomobject]@{
+        outcome = 'InstallSucceeded'
+        finishedAt = '2026-01-01T00:00:00.0000000Z'
+        installResult = [pscustomobject]@{ result = 'Succeeded'; rebootRequired = $false }
+        pendingRebootAfter = [pscustomobject]@{ isPending = $true; pendingReasons = @('windowsUpdate') }
+    }
+}
+$signalApplyResult = New-ApplyResultFromCycle -VMName 'VM10' -Cycle $signalCycle
+Assert-Equal -Actual ([bool]$signalApplyResult.rebootRequired) -Expected $true -Message 'a pending reboot after apply still requires a reboot'
+Assert-Equal -Actual (@($signalApplyResult.rebootSignals) -join ',') -Expected 'pendingRebootAfter.windowsUpdate' -Message 'apply result carries the named pending reboot signal'
+
+# The Defender-definition case: nothing pending, nothing reported, so nothing to offer.
+$quietCycle = [pscustomobject]@{
+    AgentCompletionConfirmed = $true
+    AgentResult = [pscustomobject]@{ Completed = $true; ExitCode = 0 }
+    Status = [pscustomobject]@{
+        outcome = 'InstallSucceeded'
+        finishedAt = '2026-01-01T00:00:00.0000000Z'
+        installResult = [pscustomobject]@{ result = 'Succeeded'; rebootRequired = $false }
+        pendingRebootAfter = [pscustomobject]@{ isPending = $false; pendingReasons = @() }
+    }
+}
+$quietApplyResult = New-ApplyResultFromCycle -VMName 'VM11' -Cycle $quietCycle
+Assert-Equal -Actual ([bool]$quietApplyResult.rebootRequired) -Expected $false -Message 'an install that needs no reboot does not require one'
+Assert-Equal -Actual (@($quietApplyResult.rebootSignals).Count) -Expected 0 -Message 'an install that needs no reboot carries no signals'
+Assert-Equal -Actual (@(Select-RebootRequiredApplyResults -ApplyResults @($quietApplyResult) -DiscoveryRecords @([pscustomobject]@{ vmName = 'VM11'; pendingRebootBefore = [pscustomobject]@{ isPending = $false } })).Count) -Expected 0 -Message 'a VM with no pending reboot is never offered one'
+
 $skippedRebootActions = @(New-SkippedRebootActionRecords -RebootTargets $rebootTargets)
 Assert-Equal -Actual $skippedRebootActions.Count -Expected 1 -Message 'skipped reboot action is created for every reboot target'
 Assert-Equal -Actual $skippedRebootActions[0].action -Expected 'SkippedByOperator' -Message 'operator skip action is explicit'
@@ -941,7 +1005,7 @@ Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $rebootStateMap) -Expected
         'vmName', 'action', 'outcome', 'installResult', 'reason', 'roleFlags', 'rebootRequired',
         'agentCompletionConfirmed', 'agentCompletionReason', 'cleanupStatus', 'cleanupReason',
         'errors', 'guestRunConflict', 'guestRunConflictKind', 'workspaceSealVerified',
-        'missingUpdateKeys', 'selectionDrift', 'requiresVerification'
+        'missingUpdateKeys', 'selectionDrift', 'requiresVerification', 'rebootSignals'
     )
 
     $applyVariants = @(
@@ -953,7 +1017,7 @@ Assert-Equal -Actual (Test-PatchRunAllGreen -StateMap $rebootStateMap) -Expected
         [pscustomobject]@{ Name = 'a guest still restarting'; Record = (New-ApplyResultRecord -VMName 'VM-restarting' -Outcome 'Failed' -GuestRunConflict $true -GuestRunConflictKind 'RebootPending') },
         [pscustomobject]@{ Name = 'selection drift'; Record = (New-ApplyResultRecord -VMName 'VM-drift' -Outcome 'InstallSucceeded' -MissingUpdateKeys @('aaaa|1') -SelectionDrift $true -RequiresVerification $true) },
         [pscustomobject]@{ Name = 'a refused workspace seal'; Record = (New-ApplyResultRecord -VMName 'VM-seal' -Outcome 'Failed' -WorkspaceSealVerified $false -Errors @('seal refused')) },
-        [pscustomobject]@{ Name = 'a success'; Record = (New-ApplyResultRecord -VMName 'VM-ok' -Outcome 'InstallSucceeded' -AgentCompletionConfirmed $true -RebootRequired $true) },
+        [pscustomobject]@{ Name = 'a success'; Record = (New-ApplyResultRecord -VMName 'VM-ok' -Outcome 'InstallSucceeded' -AgentCompletionConfirmed $true -RebootRequired $true -RebootSignals @('pendingRebootAfter.windowsUpdate')) },
         [pscustomobject]@{ Name = 'a skip'; Record = (New-ApplyResultRecord -VMName 'VM-skip' -Action 'Skipped' -Outcome 'Skipped' -Reason 'excluded' -RoleFlags ([pscustomobject]@{ failoverCluster = $true })) }
     )
 
@@ -2829,6 +2893,60 @@ else {
     Assert-Equal -Actual $otherKey -Expected 'console' -Message 'a provider carrying a different key does not answer this prompt'
 }
 
+# Write-FinalReport counts six groups of VMs, and the reboot group is the one that can legally
+# be empty. An if-expression assigns its branch's pipeline output and an empty collection emits
+# nothing, so @() inside a branch assigned $null and the count threw under StrictMode. That state
+# was unreachable while a stale PendingFileRenameOperations kept every guest on the reboot list;
+# it is the normal case now, so it gets a test.
+$finalReportDefinition = @($orchestratorFunctions | Where-Object { $_.Name -eq 'Write-FinalReport' })
+if ($finalReportDefinition.Count -eq 0) {
+    Add-Failure -Message 'Orchestrator function not found: Write-FinalReport'
+}
+else {
+    $finalReportDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('final-report-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $finalReportDirectory | Out-Null
+    try {
+        # ConvertTo-PatchSummaryRows belongs to the offline model and has its own gate; stubbing
+        # it inside this scope keeps the dependency out of the runtime checks and never shadows
+        # anything for the rest of this file.
+        $finalReportProbe = [scriptblock]::Create(@'
+param($PlanRecords, $ApplyResults, [string]$OutputDirectory, $RebootTargets)
+
+function ConvertTo-PatchSummaryRows {
+    param($PatchPlanRecords)
+    return @(@($PatchPlanRecords) | ForEach-Object { [pscustomobject]@{ VMName = $_.vmName; Action = $_.action } })
+}
+
+'@ + $finalReportDefinition[0].Extent.Text + [Environment]::NewLine + 'Write-FinalReport -PatchPlanRecords $PlanRecords -ApplyResults $ApplyResults -CycleOutputDirectory $OutputDirectory -RebootTargets $RebootTargets')
+
+        $quietPlanRecords = @([pscustomobject]@{ vmName = 'VM01'; action = 'NoSelectedUpdates'; reason = 'No selected updates apply.' })
+        $quietApplyResults = @([pscustomobject]@{ vmName = 'VM01'; action = 'NoSelectedUpdates'; outcome = 'Skipped'; installResult = $null; reason = 'No selected updates apply.'; rebootRequired = $false; errors = @() })
+
+        $emptyRebootThrew = $false
+        try { & $finalReportProbe $quietPlanRecords $quietApplyResults $finalReportDirectory @() 6>$null | Out-Null }
+        catch { $emptyRebootThrew = $true; Add-Failure -Message ('Write-FinalReport threw on an empty reboot target list: {0}' -f $_.Exception.Message) }
+        Assert-Equal -Actual $emptyRebootThrew -Expected $false -Message 'a fleet with no reboot targets still produces a final report'
+
+        $emptySummaryText = Get-Content -LiteralPath (Join-Path $finalReportDirectory 'summary.md') -Raw
+        Assert-Contains -Text $emptySummaryText -Needle '- VMs requiring reboot: 0' -Message 'an empty reboot target list is counted as zero, not skipped'
+
+        # $null means "work it out from the apply results" and must survive the same way.
+        $nullRebootThrew = $false
+        try { & $finalReportProbe $quietPlanRecords $quietApplyResults $finalReportDirectory $null 6>$null | Out-Null }
+        catch { $nullRebootThrew = $true; Add-Failure -Message ('Write-FinalReport threw when deriving reboot targets: {0}' -f $_.Exception.Message) }
+        Assert-Equal -Actual $nullRebootThrew -Expected $false -Message 'deriving reboot targets from apply results survives an empty result'
+
+        # A populated list must still be counted and listed.
+        & $finalReportProbe $quietPlanRecords $quietApplyResults $finalReportDirectory @([pscustomobject]@{ vmName = 'VM01'; rebootRequired = $true; rebootReason = 'Reported after apply' }) 6>$null | Out-Null
+        $populatedSummaryText = Get-Content -LiteralPath (Join-Path $finalReportDirectory 'summary.md') -Raw
+        Assert-Contains -Text $populatedSummaryText -Needle '- VMs requiring reboot: 1' -Message 'a populated reboot target list is still counted'
+        Assert-Contains -Text $populatedSummaryText -Needle 'VM01 (Reported after apply)' -Message 'a populated reboot target list is still listed with its reason'
+    }
+    finally {
+        Remove-Item -LiteralPath $finalReportDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $selectionResultDefinition = @($orchestratorFunctions | Where-Object { $_.Name -eq 'New-UpdateSelectionResult' })
 if ($selectionResultDefinition.Count -eq 0) {
     Add-Failure -Message 'Orchestrator function not found: New-UpdateSelectionResult'
@@ -3080,6 +3198,82 @@ else {
         Remove-Item Function:\Show-UpdateGroupDialog -ErrorAction SilentlyContinue
         Remove-Item Function:\Show-CredentialDialog -ErrorAction SilentlyContinue
     }
+}
+
+# guest/Run-LocalPatch.ps1 cannot be dot-sourced (it runs WUA COM at top level), so
+# Test-PendingReboot is lifted out by AST and exercised against stubbed registry access. This is
+# the check that decides whether the operator is offered a reboot at all, and a false positive
+# here is invisible until it happens on a live fleet.
+$agentScriptPath = Join-Path $repoRoot 'guest\Run-LocalPatch.ps1'
+$agentTokens = $null
+$agentErrors = $null
+$agentAst = [System.Management.Automation.Language.Parser]::ParseFile($agentScriptPath, [ref]$agentTokens, [ref]$agentErrors)
+$pendingRebootDefinition = @($agentAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | Where-Object { $_.Name -eq 'Test-PendingReboot' })
+if ($pendingRebootDefinition.Count -eq 0) {
+    Add-Failure -Message 'Agent function not found: Test-PendingReboot'
+}
+else {
+    # The stubs are defined inside the probe scriptblock so they stay scoped to each invocation
+    # and never shadow the real cmdlets for the rest of this file.
+    $pendingRebootProbeText = @'
+param([bool]$CbsPending, [bool]$WindowsUpdatePending, $RenameValue, [bool]$RenameMissing)
+
+function Test-Path {
+    param([string]$LiteralPath)
+    if ($LiteralPath -like '*Component Based Servicing*') { return $CbsPending }
+    return $WindowsUpdatePending
+}
+
+function Get-ItemProperty {
+    param([string]$LiteralPath, [string]$Name, $ErrorAction)
+    if ($RenameMissing) { throw 'Property PendingFileRenameOperations does not exist.' }
+    return [pscustomobject]@{ PendingFileRenameOperations = $RenameValue }
+}
+
+'@ + $pendingRebootDefinition[0].Extent.Text + [Environment]::NewLine + 'Test-PendingReboot'
+    $pendingRebootProbe = [scriptblock]::Create($pendingRebootProbeText)
+
+    $quietReboot = & $pendingRebootProbe $false $false $null $true
+    Assert-Equal -Actual ([bool]$quietReboot.isPending) -Expected $false -Message 'a clean guest reports no pending reboot'
+    Assert-Equal -Actual (@($quietReboot.pendingReasons).Count) -Expected 0 -Message 'a clean guest names no pending reboot reason'
+
+    # The regression: Windows leaves the value behind as blank entries, and reading presence as
+    # pending made every guest look like it needed a reboot.
+    $blankRenameReboot = & $pendingRebootProbe $false $false @('', '   ', '') $false
+    Assert-Equal -Actual ([bool]$blankRenameReboot.isPending) -Expected $false -Message 'a blank PendingFileRenameOperations value is not a pending reboot'
+    Assert-Equal -Actual ([bool]$blankRenameReboot.checks.pendingFileRename) -Expected $false -Message 'a blank PendingFileRenameOperations check is false'
+
+    $emptyRenameReboot = & $pendingRebootProbe $false $false @() $false
+    Assert-Equal -Actual ([bool]$emptyRenameReboot.isPending) -Expected $false -Message 'an empty PendingFileRenameOperations array is not a pending reboot'
+
+    # A real queued rename is detected and reported, but it does not gate the prompt: any
+    # installer can queue one, and on its own it says nothing about whether patching left work
+    # outstanding. This is the case that offered a reboot on a guest with zero applicable
+    # updates and neither servicing flag set.
+    $realRenameReboot = & $pendingRebootProbe $false $false @('\??\C:\Windows\file.dll', '') $false
+    Assert-Equal -Actual ([bool]$realRenameReboot.checks.pendingFileRename) -Expected $true -Message 'a queued file rename is still detected'
+    Assert-Equal -Actual ([bool]$realRenameReboot.isPending) -Expected $false -Message 'a queued file rename alone does not require a reboot'
+    Assert-Equal -Actual (@($realRenameReboot.pendingReasons).Count) -Expected 0 -Message 'a queued file rename is not a gating reason'
+    Assert-Equal -Actual (@($realRenameReboot.advisoryReasons) -join ',') -Expected 'pendingFileRename' -Message 'a queued file rename is reported as advisory'
+
+    $scalarRenameReboot = & $pendingRebootProbe $false $false '\??\C:\Windows\file.dll' $false
+    Assert-Equal -Actual ([bool]$scalarRenameReboot.checks.pendingFileRename) -Expected $true -Message 'a single queued rename returned as a scalar is still detected'
+    Assert-Equal -Actual ([bool]$scalarRenameReboot.isPending) -Expected $false -Message 'a scalar queued rename alone does not require a reboot'
+
+    # A servicing flag alongside an advisory one must still gate, and must not swallow it.
+    $mixedReboot = & $pendingRebootProbe $true $false @('\??\C:\Windows\file.dll', '') $false
+    Assert-Equal -Actual ([bool]$mixedReboot.isPending) -Expected $true -Message 'a servicing flag still requires a reboot when a rename is queued too'
+    Assert-Equal -Actual (@($mixedReboot.pendingReasons) -join ',') -Expected 'componentBasedServicing' -Message 'only the servicing flag is a gating reason'
+    Assert-Equal -Actual (@($mixedReboot.advisoryReasons) -join ',') -Expected 'pendingFileRename' -Message 'the advisory flag survives alongside a gating one'
+
+    $cbsReboot = & $pendingRebootProbe $true $false $null $true
+    Assert-Equal -Actual ([bool]$cbsReboot.isPending) -Expected $true -Message 'component based servicing still reports a pending reboot'
+    Assert-Equal -Actual (@($cbsReboot.pendingReasons) -join ',') -Expected 'componentBasedServicing' -Message 'component based servicing names itself as the reason'
+
+    $wuReboot = & $pendingRebootProbe $false $true @('') $false
+    Assert-Equal -Actual ([bool]$wuReboot.isPending) -Expected $true -Message 'the Windows Update flag still reports a pending reboot'
+    Assert-Equal -Actual (@($wuReboot.pendingReasons) -join ',') -Expected 'windowsUpdate' -Message 'the Windows Update flag names itself as the reason'
+    Assert-Equal -Actual (@($wuReboot.advisoryReasons).Count) -Expected 0 -Message 'a blank rename value is not even advisory'
 }
 
 if ($failures.Count -gt 0) {

@@ -368,6 +368,10 @@ function New-ApplyResultRecord {
         # True when this guest was already busy with another run of this tool, or carried an
         # unreconciled trace of one. Absolute: no reboot and no further cycle for this VM.
         [bool]$GuestRunConflict = $false,
+        # Which signal put this VM on the reboot list, not just that one did. A VM offered a
+        # restart after a single definition update is indistinguishable from one that genuinely
+        # needs it unless the prompt can name the flag behind it.
+        [string[]]$RebootSignals = @(),
         # Which kind of conflict the guest reported. 'RebootPending' is the only one the fleet
         # waits out; the rest are recorded and the VM stops. Empty when there was no conflict.
         [string]$GuestRunConflictKind = '',
@@ -389,6 +393,7 @@ function New-ApplyResultRecord {
         reason = $Reason
         roleFlags = $RoleFlags
         rebootRequired = $RebootRequired
+        rebootSignals = @($RebootSignals)
         agentCompletionConfirmed = $AgentCompletionConfirmed
         agentCompletionReason = $AgentCompletionReason
         cleanupStatus = $CleanupStatus
@@ -421,6 +426,22 @@ function New-ApplyResultFromCycle {
     $pendingAfter = [bool](Get-ObjectPropertyValue -InputObject $status -Path @('pendingRebootAfter', 'isPending') -DefaultValue $false)
     $rebootFromInstall = [bool](Get-ObjectPropertyValue -InputObject $status -Path @('installResult', 'rebootRequired') -DefaultValue $false)
     $rebootRequired = ($pendingAfter -or $rebootFromInstall)
+    # Carry which signal fired, not just that one did. A VM offered a reboot after a single
+    # definition update is indistinguishable from a VM that genuinely needs one unless the
+    # prompt can name the flag behind it.
+    $rebootSignals = @()
+    if ($rebootFromInstall) {
+        $rebootSignals += 'installResult.rebootRequired'
+    }
+    if ($pendingAfter) {
+        $pendingAfterReasons = @(Get-ObjectPropertyValue -InputObject $status -Path @('pendingRebootAfter', 'pendingReasons') -DefaultValue @())
+        if ($pendingAfterReasons.Count -gt 0) {
+            $rebootSignals += @($pendingAfterReasons | ForEach-Object { 'pendingRebootAfter.{0}' -f $_ })
+        }
+        else {
+            $rebootSignals += 'pendingRebootAfter'
+        }
+    }
     $errors = @(Get-ObjectPropertyValue -InputObject $status -Path @('errors') -DefaultValue @())
     $agentCompletionConfirmed = [bool](Get-RuntimePropertyValue -InputObject $Cycle -Name 'AgentCompletionConfirmed' -DefaultValue $false)
     $agentCompletionReason = [string](Get-RuntimePropertyValue -InputObject $Cycle -Name 'AgentCompletionReason' -DefaultValue '')
@@ -460,7 +481,7 @@ function New-ApplyResultFromCycle {
         }
         $errors += $reason
         return New-ApplyResultRecord -VMName $VMName -Outcome 'Failed' -InstallResult $installResult -Reason $reason `
-            -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
+            -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired -RebootSignals $rebootSignals `
             -AgentCompletionConfirmed $false -AgentCompletionReason $agentCompletionReason `
             -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
             -Errors $errors -GuestRunConflict $guestRunConflict -GuestRunConflictKind $guestRunConflictKind -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
@@ -480,7 +501,7 @@ function New-ApplyResultFromCycle {
             $reason = 'Apply guest process did not complete.'
             $errors += $reason
             return New-ApplyResultRecord -VMName $VMName -Outcome 'Failed' -InstallResult $installResult -Reason $reason `
-                -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
+                -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired -RebootSignals $rebootSignals `
                 -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
                 -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
                 -Errors $errors -GuestRunConflict $guestRunConflict -GuestRunConflictKind $guestRunConflictKind -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
@@ -493,14 +514,14 @@ function New-ApplyResultFromCycle {
         $reason = 'Apply guest process exited with code {0}.' -f $agentResult.ExitCode
         $errors += $reason
         return New-ApplyResultRecord -VMName $VMName -Outcome 'Failed' -InstallResult $installResult -Reason $reason `
-            -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
+            -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired -RebootSignals $rebootSignals `
             -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
             -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
             -Errors $errors -GuestRunConflict $guestRunConflict -GuestRunConflictKind $guestRunConflictKind -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
     }
 
     return New-ApplyResultRecord -VMName $VMName -Outcome $outcome -InstallResult $installResult `
-        -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired `
+        -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired -RebootSignals $rebootSignals `
         -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
         -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
         -Errors $errors -GuestRunConflict $guestRunConflict -GuestRunConflictKind $guestRunConflictKind -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
@@ -731,18 +752,29 @@ function Get-RuntimePropertyValue {
 function Get-RebootTargetReason {
     param(
         [bool]$RebootRequiredAfterApply,
-        [bool]$PendingBeforeApply
+        [bool]$PendingBeforeApply,
+        [string[]]$Signals = @()
     )
 
-    if ($RebootRequiredAfterApply -and $PendingBeforeApply) {
-        return 'Pending before patching and after apply'
+    $reason = if ($RebootRequiredAfterApply -and $PendingBeforeApply) {
+        'Pending before patching and after apply'
+    }
+    elseif ($PendingBeforeApply) {
+        'Pending before patching'
+    }
+    else {
+        'Reported after apply'
     }
 
-    if ($PendingBeforeApply) {
-        return 'Pending before patching'
+    # Append the flags themselves. The three phrases above say when the flag was seen, never
+    # which one it was, so a reboot offered after a definition update reads as arbitrary and
+    # the operator has to open status.json to judge it.
+    $namedSignals = @($Signals | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($namedSignals.Count -gt 0) {
+        $reason = '{0}: {1}' -f $reason, (($namedSignals | Select-Object -Unique) -join ', ')
     }
 
-    return 'Reported after apply'
+    return $reason
 }
 
 function Select-RebootRequiredApplyResults {
@@ -778,7 +810,8 @@ function Select-RebootRequiredApplyResults {
         $pendingRebootBefore = Get-RuntimePropertyValue -InputObject $record -Name 'pendingRebootBefore'
         $isPending = Get-RuntimePropertyValue -InputObject $pendingRebootBefore -Name 'isPending' -DefaultValue $false
         if ([bool]$isPending) {
-            $pendingBeforeByVmName[$vmName] = $true
+            $beforeReasons = @(Get-RuntimePropertyValue -InputObject $pendingRebootBefore -Name 'pendingReasons' -DefaultValue @())
+            $pendingBeforeByVmName[$vmName] = @($beforeReasons | ForEach-Object { 'pendingRebootBefore.{0}' -f $_ })
         }
     }
 
@@ -822,10 +855,18 @@ function Select-RebootRequiredApplyResults {
             continue
         }
 
+        $signals = @()
+        if ($pendingBeforeApply) {
+            $signals += @($pendingBeforeByVmName[$vmName])
+        }
+        if ($rebootRequiredAfterApply) {
+            $signals += @(Get-RuntimePropertyValue -InputObject $result -Name 'rebootSignals' -DefaultValue @())
+        }
+
         $targets += [pscustomobject]@{
             vmName = $vmName
             rebootRequired = $true
-            rebootReason = Get-RebootTargetReason -RebootRequiredAfterApply $rebootRequiredAfterApply -PendingBeforeApply $pendingBeforeApply
+            rebootReason = Get-RebootTargetReason -RebootRequiredAfterApply $rebootRequiredAfterApply -PendingBeforeApply $pendingBeforeApply -Signals $signals
         }
     }
 
