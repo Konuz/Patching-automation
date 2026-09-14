@@ -135,6 +135,7 @@ function New-FakeGuest {
         # The workspace guard runs before the first upload and reports through its exit code.
         WorkspaceSpecs = @()
         WorkspaceExitCode = 0
+        WorkspaceNeverFinishes = $false
     }
 }
 
@@ -170,6 +171,9 @@ function New-FakeManagers {
         $processId = @($ProcessIds)[0]
 
         if ($this.State.SetupProcessIds.ContainsKey([string]$processId)) {
+            if ($this.State.WorkspaceNeverFinishes) {
+                return @([pscustomobject]@{ Pid = $processId; EndTime = $null; ExitCode = $null })
+            }
             return @([pscustomobject]@{ Pid = $processId; EndTime = (Get-Date); ExitCode = $this.State.SetupProcessIds[[string]$processId] })
         }
 
@@ -429,6 +433,7 @@ try {
     $okState = $script:guestState['VM-workspace-ok']
     Assert-Equal -Actual @($okState.WorkspaceSpecs).Count -Expected 1 -Message 'harness: the workspace guard runs once per cycle'
     Assert-Equal -Actual ([string]@($okState.WorkspaceSpecs)[0].ProgramPath -like '*powershell.exe') -Expected $true -Message 'harness: the workspace guard runs through powershell.exe'
+    Assert-Equal -Actual ([string]@($okState.WorkspaceSpecs)[0].ProgramPath) -Expected 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -Message 'harness: the workspace guard uses the exact Windows PowerShell executable path'
     Assert-Contains -Text ([string]@($okState.WorkspaceSpecs)[0].Arguments) -Needle '-EncodedCommand' -Message 'harness: the workspace guard is never uploaded, it is encoded into the command'
     Assert-Equal -Actual ($okState.UploadedPaths.Count -gt 0) -Expected $true -Message 'harness: a secured workspace still uploads the agent'
     Assert-Equal -Actual ($okHandle.GuestCycleDirectory -like ($guestWorkingDirectory + '*')) -Expected $true -Message 'harness: the secured path is the cycle directory'
@@ -474,17 +479,28 @@ try {
 
     # A guest that never answers about the guard is not a pass either.
     $script:guestState = @{}
-    New-FakeGuest -VMName 'VM-workspace-silent' -NeverFinishes
+    New-FakeGuest -VMName 'VM-workspace-silent'
+    $script:guestState['VM-workspace-silent'].WorkspaceNeverFinishes = $true
     $silentManagers = New-FakeManagers -VMName 'VM-workspace-silent'
     $silentError = ''
+    # Keep the real polling and timeout behavior, with a short deadline for this case only.
+    $originalWaitGuestProcess = (Get-Item Function:\Wait-GuestProcess).ScriptBlock
+    function Wait-GuestProcess {
+        param($ProcessManager, $VMView, $GuestAuth, $ProcessId, $TimeoutSeconds, $PollSeconds)
+        & $originalWaitGuestProcess -ProcessManager $ProcessManager -VMView $VMView -GuestAuth $GuestAuth -ProcessId $ProcessId -TimeoutSeconds 1 -PollSeconds 1
+    }
     try {
         Start-VMAgentCycle -VMName 'VM-workspace-silent' -Servers $harnessServerScope -Managers $silentManagers -GuestAuth (New-GuestAuthentication -Credential $harnessCredential) -CurlPath 'curl.exe' -AgentPath $agentPath -IdentityHelperPath $identityHelperPath -GuestWorkingDirectory $guestWorkingDirectory -VMOutputDirectory (Join-Path $workspaceGuardWorkspace 'VM-workspace-silent') -MaxUpdates 1 | Out-Null
     }
     catch {
         $silentError = [string]$_.Exception.Message
     }
+    finally {
+        Set-Item Function:\Wait-GuestProcess -Value $originalWaitGuestProcess
+    }
     Assert-Contains -Text $silentError -Needle 'could not be secured' -Message 'harness: a workspace check that never finishes fails the cycle'
     Assert-Equal -Actual @($script:guestState['VM-workspace-silent'].UploadedPaths).Count -Expected 0 -Message 'harness: a silent workspace check transfers nothing'
+    Assert-Equal -Actual ($null -eq $script:guestState['VM-workspace-silent'].AgentSpec) -Expected $true -Message 'harness: a silent workspace check starts no agent'
 }
 finally {
     Remove-Item -LiteralPath $workspaceGuardWorkspace -Recurse -Force -ErrorAction SilentlyContinue

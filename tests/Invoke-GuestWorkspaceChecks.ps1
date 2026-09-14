@@ -392,9 +392,9 @@ exit 0
         $startGuardProcess = {
             param($CoordinationDirectory, $RunId, $Mode, $SignalPath, $ReleasePath)
             $arguments = @(
-                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $driverPath,
-                '-RepoRoot', $repoRoot, '-CoordinationDirectory', $CoordinationDirectory,
-                '-RunId', $RunId, '-Mode', $Mode, '-SignalPath', $SignalPath, '-ReleasePath', $ReleasePath
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $driverPath),
+                '-RepoRoot', ('"{0}"' -f $repoRoot), '-CoordinationDirectory', ('"{0}"' -f $CoordinationDirectory),
+                '-RunId', $RunId, '-Mode', $Mode, '-SignalPath', ('"{0}"' -f $SignalPath), '-ReleasePath', ('"{0}"' -f $ReleasePath)
             )
             # Hidden on Windows: this check starts several real processes and each one otherwise
             # flashes a console window over whatever the operator is doing. -WindowStyle is a

@@ -550,7 +550,7 @@ function Start-GuestWorkspaceBootstrap {
     )
 
     $programSpec = New-Object VMware.Vim.GuestProgramSpec
-    $programSpec.ProgramPath = 'C:\Windows\System32\WindowsPowerShell1.0\powershell.exe'
+    $programSpec.ProgramPath = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
     $programSpec.Arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {0}' -f $EncodedCommand)
     $programSpec.WorkingDirectory = 'C:\Windows\System32'
 
