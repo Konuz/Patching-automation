@@ -796,6 +796,15 @@ function Read-ContinuePatchingDecision {
     return $answer
 }
 
+function Read-RescanDecision {
+    while ($true) {
+        $answer = ([string](Read-Host 'Ponownie przeskanować te same VM? [T/N]')).Trim().ToUpperInvariant()
+        if ($answer -eq 'T') { return $true }
+        if ($answer -eq 'N' -or $answer -eq '') { return $false }
+        Write-Host 'Wpisz T lub N.'
+    }
+}
+
 function Write-PatchRoundVerification {
     param($CompletionStates, [int]$Round)
 
@@ -1915,9 +1924,6 @@ try {
         exit $scriptExitCode
     }
 
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $runOutputDirectory = New-UniqueOutputDirectory -BasePath (Join-Path $LocalOutputDirectory $timestamp)
-
     if ($null -ne $StoredGuestCredentials) {
         $guestCredentialMap = $StoredGuestCredentials
     }
@@ -1926,6 +1932,12 @@ try {
     }
     $guestCredentialContext = New-GuestCredentialContext -TargetNames $targetVMNames -CredentialMap $guestCredentialMap
 
+    # Connections, corrected credentials and credential refusal decisions belong to the session.
+    # Everything from the output directory through the summary belongs to one fresh scan cycle.
+    do {
+        $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $runOutputDirectory = New-UniqueOutputDirectory -BasePath (Join-Path $LocalOutputDirectory $timestamp)
+        $scriptExitCode = 1
     $roundTargetVMNames = @($targetVMNames)
     $roundNumber = 0
     $roundSummaries = @()
@@ -2237,6 +2249,9 @@ try {
 
         Write-RunEvent -State $runEventLog -Event 'RunFinished' -Phase 'Finalization' -Outcome ([string]$scriptExitCode)
     }
+    # Saved plans exit above. Explicit keys, dry runs and unattended runs must not acquire a
+    # new interactive prompt or silently reuse update revisions in another scan cycle.
+    } while (-not ($SearchOnly -or $PlanOnly -or $SkipConfirmation -or $hasExplicitSelectedUpdateKeys) -and (Read-RescanDecision))
 }
 catch {
     # Keep the origin. The message alone is reported against the launcher's call operator,

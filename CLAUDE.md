@@ -548,6 +548,17 @@ both travel through grouping, the plan and the saved-plan reader.
 
 ### Patch rounds
 
+Interactive discovery-driven patching has an outer scan-cycle loop. After each cycle's summary,
+`Read-RescanDecision` asks `Ponownie przeskanować te same VM? [T/N]`: T starts a fresh cycle over
+the original target list; N or empty input ends the session. Connections and the guest credential
+context (including corrected credentials and skip/abort decisions) live outside that loop. Each
+cycle creates a unique output directory and resets round counters, state maps, deselected keys,
+failure flags and outstanding verification records. Local launcher checks run once. The final
+exit code is the last cycle's result; earlier reports remain intact. The outer finally closes
+only owned connections, respecting explicit `-KeepConnected`. SearchOnly, PlanOnly, explicit
+selected keys, SkipConfirmation and saved-plan resume retain single-cycle behavior. Offline
+coverage lives in `tests/Invoke-RescanChecks.ps1`, included in the Runtime gate.
+
 A run repeats **discovery → group selection → plan → confirm → apply → reboot** until every VM is
 green or the operator stops. There is no separate verification phase: round N+1's discovery *is*
 the verification of round N.

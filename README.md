@@ -220,6 +220,17 @@ Krok po kroku:
    zbiera stan końcowy. Kolejna runda **nie** startuje, jeśli którakolwiek restartowana maszyna nie
    potwierdziła nowszego czasu startu.
 
+10. **Ponowny skan** — po zapisaniu podsumowania skrypt pyta
+    `Ponownie przeskanować te same VM? [T/N]`. `T` rozpoczyna nowy cykl dla całej pierwotnej
+    listy VM, z nowym wyborem aktualizacji, wyzerowanymi wynikami i licznikiem rund oraz
+    osobnym katalogiem `out\<run>\`. Połączenia i poświadczenia, także poprawione podczas pracy,
+    pozostają w sesji; testy startowe nie są powtarzane. Decyzje o pominięciu kont lub przerwaniu
+    obsługi poświadczeń pozostają ważne w tej sesji. `N` lub pusty Enter kończy pracę i zamyka
+    połączenia otwarte przez ten skrypt, chyba że jawnie użyto `-KeepConnected`.
+    Kod zakończenia dotyczy ostatniego cyklu; raporty wcześniejszych cykli pozostają zachowane.
+    Pytanie nie pojawia się dla `-SearchOnly`, `-PlanOnly`, `-SkipConfirmation`,
+    `-SelectedUpdateKeys` ani przy wykonaniu zapisanego planu przez `-PatchPlanPath`.
+
 > Przebieg nieinteraktywny: `-SkipConfirmation` sprawia, że po rundzie 1 skrypt kończy pracę
 > zamiast pytać `CONTINUE`/`FINISH`. To samo dzieje się przy `-SelectedUpdateKeys`, bo wskazane
 > klucze zawierają `RevisionNumber`, którego nie ma w grupach kolejnej rundy. W obu wypadkach
