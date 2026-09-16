@@ -725,6 +725,10 @@ Gdy korzystasz z launchera GUI (`Start-PatchingGuestOpsGui.ps1`), w profilu uży
   | Plan only | `-PlanOnly` | odznaczone | **nie** |
   | Skip the local checks | `-SkipStaticChecks` | odznaczone | **nie** |
 
+  Każda pozycja ma **opis pod kursorem** (hover) — nazwę parametru, który ustawia, i to, czym
+  grozi jego zmiana. Opis jest przypięty i do etykiety, i do samego pola, bo etykieta jest
+  większym celem dla kursora.
+
   Stan samego pola *Show advanced settings* też jest zapamiętywany, więc okno otwiera się tak, jak
   zostało zamknięte. Trzy ostatnie pozycje to **decyzje o jednym przebiegu, nie preferencje**:
   gdyby trafiły do pliku, kolejne uruchomienie startowałoby ze wznowieniem planu albo z pominiętą

@@ -26,6 +26,40 @@ function New-GuiTextBox {
     return $box
 }
 
+function New-GuiToolTip {
+    $toolTip = New-Object System.Windows.Forms.ToolTip
+    # AutoPopDelay defaults to 5 seconds, which is not long enough to read a sentence that
+    # explains what a parameter does - and a description that vanishes mid-sentence is worse
+    # than none, because it has to be hunted for again. ShowAlways so the text still appears
+    # while another window holds focus.
+    $toolTip.InitialDelay = 400
+    $toolTip.ReshowDelay = 200
+    $toolTip.AutoPopDelay = 30000
+    $toolTip.ShowAlways = $true
+    return $toolTip
+}
+
+function Add-GuiToolTip {
+    param(
+        $ToolTip,
+        # One entry per rendered line. A tooltip is the only place a parameter is explained at
+        # the moment it is set, so these are sentences, and joining them here keeps the call
+        # sites free of escaped line breaks.
+        [string[]]$Lines,
+        # The label and the control it names get the same text: the label is the wider target
+        # and the likelier one to be pointed at, and a description attached to only one of the
+        # two is a description half the hovers never find.
+        $Controls
+    )
+
+    $tipText = (@($Lines) -join [Environment]::NewLine)
+    foreach ($control in @($Controls)) {
+        if ($null -ne $control) {
+            $ToolTip.SetToolTip($control, $tipText)
+        }
+    }
+}
+
 function Show-CredentialDialog {
     param(
         [string]$Title,
@@ -579,12 +613,20 @@ function Show-LauncherDialog {
     $skipChecks.Top = 165
     $skipChecks.Width = 360
 
+    # Held in variables rather than built inline: each label carries the same hover
+    # description as the control it names.
+    $applyTimeoutLabel = New-GuiLabel -Text 'Apply timeout (min)' -Top 22
+    $discoveryTimeoutLabel = New-GuiLabel -Text 'Discovery timeout (min)' -Top 50
+    $rebootTimeoutLabel = New-GuiLabel -Text 'Reboot timeout (min)' -Top 78
+    $guestDirLabel = New-GuiLabel -Text 'Guest working directory' -Top 106
+    $planLabel = New-GuiLabel -Text 'Resume from saved plan' -Top 134
+
     $advancedGroup.Controls.AddRange(@(
-        (New-GuiLabel -Text 'Apply timeout (min)' -Top 22), $applyTimeoutBox,
-        (New-GuiLabel -Text 'Discovery timeout (min)' -Top 50), $discoveryTimeoutBox,
-        (New-GuiLabel -Text 'Reboot timeout (min)' -Top 78), $rebootTimeoutBox,
-        (New-GuiLabel -Text 'Guest working directory' -Top 106), $guestDirBox,
-        (New-GuiLabel -Text 'Resume from saved plan' -Top 134), $planBox, $planBrowse,
+        $applyTimeoutLabel, $applyTimeoutBox,
+        $discoveryTimeoutLabel, $discoveryTimeoutBox,
+        $rebootTimeoutLabel, $rebootTimeoutBox,
+        $guestDirLabel, $guestDirBox,
+        $planLabel, $planBox, $planBrowse,
         $planOnly, $skipChecks
     ))
 
@@ -650,6 +692,72 @@ function Show-LauncherDialog {
         $ignoreCert, $ignoreESXiCert, $keepConnected, $searchOnly,
         $advancedToggle, $advancedGroup, $notice, $start, $quit
     ))
+
+    # Attached after the controls are parented, so every target already exists. Each
+    # description names the parameter it sets: what these values reach is a command line, and
+    # that is the name an operator will search for afterwards.
+    $toolTips = New-GuiToolTip
+
+    Add-GuiToolTip -ToolTip $toolTips -Controls $advancedToggle -Lines @(
+        'Shows the knobs a run normally leaves alone: the three timeouts, the guest directory,',
+        'a resume from a saved plan, a dry run, and the local gates.',
+        'Every one of them keeps its default until you change it.'
+    )
+
+    Add-GuiToolTip -ToolTip $toolTips -Controls @($applyTimeoutLabel, $applyTimeoutBox) -Lines @(
+        '-TimeoutMinutes (default 180).',
+        'How long one guest may spend installing updates before this run gives up on it.',
+        'A Windows Update install can genuinely take hours, which is why this budget is the long one.',
+        'It is not a hard wall clock: a call already in flight is never cancelled, so the real bound',
+        'is this budget, plus one call, plus one bounded collection of the guest''s artifacts.'
+    )
+
+    Add-GuiToolTip -ToolTip $toolTips -Controls @($discoveryTimeoutLabel, $discoveryTimeoutBox) -Lines @(
+        '-DiscoveryTimeoutMinutes (default 30).',
+        'How long one guest may spend on a Windows Update search.',
+        'Separate from the install budget on purpose: a search takes minutes, and sharing the',
+        '180-minute one held a whole discovery phase for three hours when one guest stopped answering.'
+    )
+
+    Add-GuiToolTip -ToolTip $toolTips -Controls @($rebootTimeoutLabel, $rebootTimeoutBox) -Lines @(
+        '-RebootTimeoutMinutes (default 30).',
+        'How long a reboot batch waits for a guest to report a newer boot time before it gives up.',
+        'On a timeout the run asks you for RETRY, CONTINUE or ABORT - it never decides on its own -',
+        'and the next batch is held until this one is settled.'
+    )
+
+    Add-GuiToolTip -ToolTip $toolTips -Controls @($guestDirLabel, $guestDirBox) -Lines @(
+        '-GuestWorkingDirectory (blank = C:\ProgramData\PatchingGuestOps).',
+        'Where this tool uploads its agent inside each guest, and where the guest writes status.json',
+        'and agent.log. Must be an absolute local path written with backslashes.',
+        'This does not move the one-run-per-guest lock: it stays at',
+        'C:\ProgramData\PatchingGuestOps\.coordination whatever you set here.'
+    )
+
+    Add-GuiToolTip -ToolTip $toolTips -Controls @($planLabel, $planBox, $planBrowse) -Lines @(
+        '-PatchPlanPath. Leave blank for a normal run.',
+        'Installs exactly what a saved patch-plan.json approved, skipping discovery and the update',
+        'selection. The run stays single-round: with no fresh discovery there is nothing to verify the',
+        'result against, and the saved keys carry a revision a later round would not match.',
+        'Browse... opens in this run''s output directory, or .\out. A run writes one plan per round,',
+        'at out\<run>\round-NN\patch-plan.json. Never saved between launches.'
+    )
+
+    Add-GuiToolTip -ToolTip $toolTips -Controls $planOnly -Lines @(
+        '-PlanOnly.',
+        'Runs discovery and writes the plan, then stops: nothing is downloaded, nothing is installed,',
+        'nothing is restarted. A dry run that shows what this run would do.',
+        'Never saved between launches.'
+    )
+
+    Add-GuiToolTip -ToolTip $toolTips -Controls $skipChecks -Lines @(
+        '-SkipStaticChecks.',
+        'Skips the static and model gates the launcher runs before it touches vCenter, saving the',
+        '20-40 seconds they take.',
+        'Those gates are what catch a broken script before it reaches the fleet, so skip them only',
+        'while iterating against a live VM. Never saved between launches.'
+    )
+
     $form.AcceptButton = $start
     $form.CancelButton = $quit
 
@@ -694,6 +802,9 @@ function Show-LauncherDialog {
         SkipStaticChecks = $skipChecks.Checked
     }
 
+    # A ToolTip is a component, not a control, so it is not in $form.Controls and the form
+    # does not take it down with itself.
+    $toolTips.Dispose()
     $form.Dispose()
     return $answer
 }
