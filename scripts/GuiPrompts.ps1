@@ -562,6 +562,164 @@ function Show-PatchPlanDialog {
     return ($result -eq [System.Windows.Forms.DialogResult]::OK)
 }
 
+function Show-GuestRebootDialog {
+    param(
+        # Already rendered by Get-RebootTargetDisplayLines, so this window and the console
+        # list the same machines and the same flag that asked for the restart.
+        [string[]]$TargetLines,
+        [int]$TargetCount = 0
+    )
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'PatchingGuestOps - reboot required'
+    $form.Width = 780
+    $form.Height = 600
+    $form.StartPosition = 'CenterScreen'
+    $form.ShowInTaskbar = $true
+
+    $prompt = New-Object System.Windows.Forms.Label
+    $prompt.Text = ('Reboot required on {0} VM(s). Updates are installed; these machines are waiting for a restart.' -f $TargetCount)
+    $prompt.Left = 15
+    $prompt.Top = 15
+    $prompt.Width = 730
+
+    $detail = New-Object System.Windows.Forms.Label
+    $detail.Text = 'Closing this window, or cancelling, leaves them running as they are - the run then ends without a confirmed restart.'
+    $detail.Left = 15
+    $detail.Top = 38
+    $detail.Width = 730
+
+    $targets = New-Object System.Windows.Forms.TextBox
+    $targets.Multiline = $true
+    $targets.ReadOnly = $true
+    # Same reasoning as the plan window: console-shaped lines, so a fixed-width face, both
+    # scrollbars, and no wrapping - a wrapped reason reads as a second machine.
+    $targets.WordWrap = $false
+    $targets.ScrollBars = 'Both'
+    $targets.AcceptsReturn = $false
+    $targets.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $targets.Left = 15
+    $targets.Top = 62
+    $targets.Width = 730
+    $targets.Height = 380
+    $targets.Text = (@($TargetLines) -join [Environment]::NewLine)
+
+    $typeLabel = New-Object System.Windows.Forms.Label
+    $typeLabel.Text = 'Type REBOOT (uppercase) to enable the button:'
+    $typeLabel.Left = 15
+    $typeLabel.Top = 458
+    $typeLabel.Width = 290
+
+    $confirmBox = New-Object System.Windows.Forms.TextBox
+    $confirmBox.Left = 310
+    $confirmBox.Top = 455
+    $confirmBox.Width = 150
+
+    $reboot = New-Object System.Windows.Forms.Button
+    $reboot.Text = 'Reboot these VM(s)'
+    $reboot.Left = 15
+    $reboot.Top = 500
+    $reboot.Width = 190
+    $reboot.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    # Off until the word is typed, exactly as the console only acts on a literal REBOOT.
+    # Disabled rather than warned about, so the operator sees the state of their own answer.
+    $reboot.Enabled = $false
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Skip the reboot'
+    $cancel.Left = 605
+    $cancel.Top = 500
+    $cancel.Width = 140
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+
+    # -ceq, not -eq: the console compares case-sensitively and 'reboot' is not the answer
+    # there either. Trimmed the same way, so a stray space pasted with the word still counts.
+    $confirmBox.Add_TextChanged({
+        $reboot.Enabled = ((([string]$confirmBox.Text).Trim()) -ceq 'REBOOT')
+    })
+
+    $form.Controls.AddRange(@($prompt, $detail, $targets, $typeLabel, $confirmBox, $reboot, $cancel))
+
+    # Enter reaches the reboot button only once it is enabled, which is the console's "type
+    # REBOOT and press Enter". Esc and the close button skip, as an empty console answer does.
+    $form.AcceptButton = $reboot
+    $form.CancelButton = $cancel
+
+    # This window opens hours into a run, behind the console.
+    $form.Add_Shown({ $form.Activate() })
+    $result = $form.ShowDialog()
+    $form.Dispose()
+
+    return ($result -eq [System.Windows.Forms.DialogResult]::OK)
+}
+
+function Show-RebootBatchSizeDialog {
+    param([int]$TargetCount = 0)
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'PatchingGuestOps - reboot batch size'
+    $form.Width = 560
+    $form.Height = 250
+    $form.StartPosition = 'CenterScreen'
+    $form.ShowInTaskbar = $true
+
+    $prompt = New-Object System.Windows.Forms.Label
+    $prompt.Text = ('{0} VM(s) will be restarted. How many at a time?' -f $TargetCount)
+    $prompt.Left = 15
+    $prompt.Top = 15
+    $prompt.Width = 510
+
+    $detail = New-Object System.Windows.Forms.Label
+    $detail.Text = 'The next batch starts only after every VM in the current one reports a newer boot time, so this is blast radius, not speed.'
+    $detail.Left = 15
+    $detail.Top = 40
+    $detail.Width = 510
+    $detail.Height = 40
+
+    $sizeLabel = New-Object System.Windows.Forms.Label
+    $sizeLabel.Text = 'VMs per batch'
+    $sizeLabel.Left = 15
+    $sizeLabel.Top = 95
+    $sizeLabel.Width = 120
+
+    $sizeBox = New-Object System.Windows.Forms.TextBox
+    $sizeBox.Left = 140
+    $sizeBox.Top = 92
+    $sizeBox.Width = 80
+    # One at a time is the console's Enter-for-1 default and the smallest blast radius.
+    $sizeBox.Text = '1'
+
+    $ok = New-Object System.Windows.Forms.Button
+    $ok.Text = 'Start rebooting'
+    $ok.Left = 15
+    $ok.Top = 140
+    $ok.Width = 150
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+
+    # There is no Cancel here: the restart was already approved in the previous window and
+    # this one only sets how many go at once. Closing it is therefore not an abort, and the
+    # number left in the box is not an answer either - only the button is. Anything else is
+    # one VM at a time, the smallest blast radius, which is also what the caller enforces.
+    $form.Controls.AddRange(@($prompt, $detail, $sizeLabel, $sizeBox, $ok))
+    $form.AcceptButton = $ok
+
+    $form.Add_Shown({ $form.Activate() })
+    $result = $form.ShowDialog()
+    $entered = ([string]$sizeBox.Text).Trim()
+    $form.Dispose()
+
+    if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
+        return 1
+    }
+
+    $parsed = 0
+    if ([int]::TryParse($entered, [ref]$parsed) -and $parsed -ge 1) {
+        return $parsed
+    }
+
+    return 1
+}
+
 function Show-LauncherDialog {
     param(
         $Settings,

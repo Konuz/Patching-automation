@@ -792,7 +792,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         }
         function Write-PatchingSummary { param($ApplyResults) }
         function Write-FinalReport { param($PatchPlanRecords, $ApplyResults, $CycleOutputDirectory, $RebootTargets) }
-        function Confirm-GuestReboot { param($RebootTargets) $true }
+        function Confirm-GuestReboot { param($RebootTargets, $PromptProvider) $true }
         function Write-RebootActionArtifacts { param($CycleOutputDirectory, $RebootActions) }
         $script:rebootDispatchCount = 0
         function Invoke-GuestRebootPhase {
@@ -1194,7 +1194,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
     function Write-PatchRunSummary { param($RunOutputDirectory, $RoundSummaries, $FinalStateMap) }
     function Write-PatchingSummary { param($ApplyResults) }
     function Write-FinalReport { param($PatchPlanRecords, $ApplyResults, $CycleOutputDirectory, $RebootTargets) }
-    function Confirm-GuestReboot { param($RebootTargets) $true }
+    function Confirm-GuestReboot { param($RebootTargets, $PromptProvider) $true }
     function Write-RebootActionArtifacts { param($CycleOutputDirectory, $RebootActions) }
     function Invoke-GuestRebootPhase {
         param($RebootTargets, $GuestCredentialMap, [string[]]$VIServers, $VIServerCredentialMap, [switch]$IgnoreVCenterCertificate, [string]$GuestOpsLibPath, [string]$CurlPath, [string]$GuestWorkingDirectory, [int]$RebootTimeoutSeconds, [int]$PollSeconds, [int]$RebootBatchSize)
@@ -2100,7 +2100,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
     function Confirm-PatchPlan { param($PatchPlanRecords, [hashtable]$PromptProvider, [switch]$SkipConfirmation) $true }
     function Read-ContinuePatchingDecision { param($CompletionStates, $Round, $PromptProvider) return 'FINISH' }
     function Invoke-ApplyAndOptionalReboot {
-        param($PatchPlanRecords, $VIServerScope, $Managers, $GuestCredentialMap, $VIServers, $VIServerCredentialMap, [switch]$IgnoreVCenterCertificate, $GuestOpsLibPath, $CurlPath, $AgentPath, $IdentityHelperPath, $WorkspaceScriptPath, $RunGuardScriptPath, $RebootRequestScriptPath, $GuestWorkingDirectory, $TimeoutSeconds, $RebootTimeoutSeconds, $PollSeconds, $CycleOutputDirectory, $ThrottleLimit, $RebootBatchSize, $DiscoveryRecords, $CredentialContext, $CredentialDecisionScript, $CredentialValidatedScript, $CredentialInteractive)
+        param($PatchPlanRecords, $VIServerScope, $Managers, $GuestCredentialMap, $VIServers, $VIServerCredentialMap, [switch]$IgnoreVCenterCertificate, $GuestOpsLibPath, $CurlPath, $AgentPath, $IdentityHelperPath, $WorkspaceScriptPath, $RunGuardScriptPath, $RebootRequestScriptPath, $GuestWorkingDirectory, $TimeoutSeconds, $RebootTimeoutSeconds, $PollSeconds, $CycleOutputDirectory, $ThrottleLimit, $RebootBatchSize, $DiscoveryRecords, $CredentialContext, $CredentialDecisionScript, $CredentialValidatedScript, $CredentialInteractive, $PromptProvider)
         return [pscustomobject]@{ ExitCode = 0; RebootRan = $false; RebootActions = @(); ApplyResults = @() }
     }
     function Write-PatchRoundVerification { param($CompletionStates, $Round) }
@@ -2250,8 +2250,8 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
     function Write-PatchingSummary { param($ApplyResults) }
     function Write-FinalReport { param($PatchPlanRecords, $ApplyResults, $CycleOutputDirectory, $RebootTargets) }
     function Write-RebootActionArtifacts { param($CycleOutputDirectory, $RebootActions) }
-    function Confirm-GuestReboot { param($RebootTargets) return $script:f7RebootApproved }
-    function Read-RebootBatchSize { param($TargetCount) return 1 }
+    function Confirm-GuestReboot { param($RebootTargets, $PromptProvider) return $script:f7RebootApproved }
+    function Read-RebootBatchSize { param($TargetCount, $PromptProvider) return 1 }
 
     # The apply phase is the only stubbed production function here; its result shape is the real
     # one, built by the production constructor.

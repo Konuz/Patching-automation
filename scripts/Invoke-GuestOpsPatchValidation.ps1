@@ -867,49 +867,73 @@ function Write-PatchRoundVerification {
 }
 
 function Read-RebootBatchSize {
-    param([int]$TargetCount)
+    param(
+        [int]$TargetCount,
+        [hashtable]$PromptProvider
+    )
 
     Write-Host ''
     Write-Host 'Reboots run in batches; the next batch starts only after every VM in the current batch reports a newer boot time.'
     Write-Host ('There are {0} VM(s) to reboot.' -f $TargetCount)
 
-    $resolvedBatchSize = 0
-    while ($resolvedBatchSize -lt 1) {
-        $answer = ([string](Read-Host 'How many VMs per reboot batch? (Enter for 1)')).Trim()
-        if ([string]::IsNullOrWhiteSpace($answer)) {
-            $resolvedBatchSize = 1
+    $answered = [int](Invoke-OperatorPrompt -Provider $PromptProvider -Key 'RebootBatchSize' -Arguments @{ TargetCount = $TargetCount } -FallbackScript {
+        param($promptArgs)
+
+        $resolvedBatchSize = 0
+        while ($resolvedBatchSize -lt 1) {
+            $answer = ([string](Read-Host 'How many VMs per reboot batch? (Enter for 1)')).Trim()
+            if ([string]::IsNullOrWhiteSpace($answer)) {
+                $resolvedBatchSize = 1
+            }
+            elseif (-not ([int]::TryParse($answer, [ref]$resolvedBatchSize)) -or $resolvedBatchSize -lt 1) {
+                $resolvedBatchSize = 0
+                Write-Warning 'Enter a whole number greater than or equal to 1, or press Enter for 1.'
+            }
         }
-        elseif (-not ([int]::TryParse($answer, [ref]$resolvedBatchSize)) -or $resolvedBatchSize -lt 1) {
-            $resolvedBatchSize = 0
-            Write-Warning 'Enter a whole number greater than or equal to 1, or press Enter for 1.'
-        }
+
+        return $resolvedBatchSize
+    })
+
+    # The console loop cannot leave here below 1, but a window can: one that was closed, or
+    # answered with something unusable, must never read as "one batch, the whole fleet".
+    # One VM at a time is the smallest blast radius there is, so that is what it becomes.
+    if ($answered -lt 1) {
+        return 1
     }
 
-    return $resolvedBatchSize
+    return $answered
 }
 
 function Confirm-GuestReboot {
-    param($RebootTargets)
+    param(
+        $RebootTargets,
+        [hashtable]$PromptProvider
+    )
 
     $targets = @($RebootTargets)
     if ($targets.Count -eq 0) {
         return $false
     }
 
+    # Printed here whichever surface answers, so the console keeps the record of what was
+    # offered, and rendered by the model so a window cannot list it differently.
     Write-Host ''
     Write-Host ('Reboot required on {0} VM(s):' -f $targets.Count)
-    foreach ($target in $targets) {
-        $rebootReason = [string](Get-ObjectPropertyValue -InputObject $target -Path @('rebootReason'))
-        $reasonText = if ([string]::IsNullOrWhiteSpace($rebootReason)) { '' } else { (' ({0})' -f $rebootReason) }
-        Write-Host ('- {0}{1}' -f $target.vmName, $reasonText)
+    foreach ($line in @(Get-RebootTargetDisplayLines -RebootTargets $targets)) {
+        Write-Host $line
     }
-    Write-Host ''
-    Write-Host 'Actions:'
-    Write-Host '  - Type REBOOT (uppercase) and press Enter to reboot the VM(s) above now.'
-    Write-Host '  - Type anything else (or just press Enter) to skip the reboot and leave them as-is.'
 
-    $answer = Read-Host 'Type REBOOT to continue'
-    return (([string]$answer).Trim() -ceq 'REBOOT')
+    return [bool](Invoke-OperatorPrompt -Provider $PromptProvider -Key 'ConfirmGuestReboot' -Arguments @{ RebootTargets = $targets } -FallbackScript {
+        param($promptArgs)
+
+        Write-Host ''
+        Write-Host 'Actions:'
+        Write-Host '  - Type REBOOT (uppercase) and press Enter to reboot the VM(s) above now.'
+        Write-Host '  - Type anything else (or just press Enter) to skip the reboot and leave them as-is.'
+
+        $answer = Read-Host 'Type REBOOT to continue'
+        return (([string]$answer).Trim() -ceq 'REBOOT')
+    })
 }
 
 function Update-PatchPlanWithDiscoveryFailures {
@@ -1565,7 +1589,11 @@ function Invoke-ApplyAndOptionalReboot {
         [hashtable]$CredentialContext = $null,
         [scriptblock]$CredentialDecisionScript,
         [scriptblock]$CredentialValidatedScript,
-        [bool]$CredentialInteractive = $false
+        [bool]$CredentialInteractive = $false,
+        # Passed rather than read off the script scope: both operator questions of this phase
+        # are asked from inside here, and a prompt seam that works only because of where it
+        # happens to be called from is one a later caller loses without noticing.
+        [hashtable]$PromptProvider
     )
 
     $applyResults = @(Invoke-ApplyPhase -PatchPlanRecords $PatchPlanRecords -VIServerScope $VIServerScope -Managers $Managers -GuestCredentialMap $GuestCredentialMap -CurlPath $CurlPath -AgentPath $AgentPath -IdentityHelperPath $IdentityHelperPath -WorkspaceScriptPath $WorkspaceScriptPath -RunGuardScriptPath $RunGuardScriptPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds $TimeoutSeconds -PollSeconds $PollSeconds -CycleOutputDirectory $CycleOutputDirectory -MaxInFlight $ThrottleLimit -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive)
@@ -1575,13 +1603,13 @@ function Invoke-ApplyAndOptionalReboot {
     $rebootTargets = @(Select-RebootRequiredApplyResults -ApplyResults $applyResults -DiscoveryRecords $DiscoveryRecords)
     Write-FinalReport -PatchPlanRecords $PatchPlanRecords -ApplyResults $applyResults -CycleOutputDirectory $CycleOutputDirectory -RebootTargets $rebootTargets
     if ($rebootTargets.Count -gt 0) {
-        if (Confirm-GuestReboot -RebootTargets $rebootTargets) {
+        if (Confirm-GuestReboot -RebootTargets $rebootTargets -PromptProvider $PromptProvider) {
             # Blast radius is a separate decision from apply concurrency, so it gets its own
             # answer. Like the REBOOT prompt this one is not skipped by -SkipConfirmation;
             # a non-interactive run supplies -RebootBatchSize instead.
             $resolvedRebootBatchSize = $RebootBatchSize
             if ($resolvedRebootBatchSize -lt 1) {
-                $resolvedRebootBatchSize = Read-RebootBatchSize -TargetCount $rebootTargets.Count
+                $resolvedRebootBatchSize = Read-RebootBatchSize -TargetCount $rebootTargets.Count -PromptProvider $PromptProvider
             }
 
             $rebootActions = @(Invoke-GuestRebootPhase -RebootTargets $rebootTargets -GuestCredentialMap $GuestCredentialMap -VIServers $VIServers -VIServerScope $VIServerScope -VIServerCredentialMap $VIServerCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $GuestOpsLibPath -CurlPath $CurlPath -WorkspaceScriptPath $WorkspaceScriptPath -RunGuardScriptPath $RunGuardScriptPath -RebootRequestScriptPath $RebootRequestScriptPath -GuestWorkingDirectory $GuestWorkingDirectory -RebootTimeoutSeconds $RebootTimeoutSeconds -PollSeconds $PollSeconds -RebootBatchSize $resolvedRebootBatchSize -CredentialContext $CredentialContext -CredentialDecisionScript $CredentialDecisionScript -CredentialValidatedScript $CredentialValidatedScript -CredentialInteractive $CredentialInteractive)
@@ -1949,7 +1977,7 @@ try {
             # from, the saved keys carry a RevisionNumber that will not match a later round's
             # groups, and resume is typically run non-interactively with -SkipConfirmation,
             # where a round-two group selection prompt would simply hang.
-            $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerScope $viServerScope -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -WorkspaceScriptPath $workspaceScriptPath -RunGuardScriptPath $runGuardScriptPath -RebootRequestScriptPath $rebootRequestScriptPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive
+            $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerScope $viServerScope -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -WorkspaceScriptPath $workspaceScriptPath -RunGuardScriptPath $runGuardScriptPath -RebootRequestScriptPath $rebootRequestScriptPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $runOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive -PromptProvider $PromptProvider
             $scriptExitCode = $applyOutcome.ExitCode
 
             # Resume has no fresh discovery, so nothing here can establish that an approved
@@ -2174,7 +2202,7 @@ try {
         $completionStates = @(Get-VMPatchCompletionStates -DiscoveryRecords $discoveryRecords -UpdateGroups $updateGroups -DeselectedUpdateKeys $deselectedUpdateKeys)
         Merge-PatchRunStates -StateMap $finalStateMap -CompletionStates $completionStates
 
-        $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerScope $viServerScope -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -WorkspaceScriptPath $workspaceScriptPath -RunGuardScriptPath $runGuardScriptPath -RebootRequestScriptPath $rebootRequestScriptPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -DiscoveryRecords $discoveryRecords -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive
+        $applyOutcome = Invoke-ApplyAndOptionalReboot -PatchPlanRecords $patchPlanRecords -Managers $managers -GuestCredentialMap $guestCredentialMap -VIServers $resolvedVIServers -VIServerScope $viServerScope -VIServerCredentialMap $viserverCredentialMap -IgnoreVCenterCertificate:$IgnoreVCenterCertificate -GuestOpsLibPath $guestOpsLibPath -CurlPath $curlPath -AgentPath $AgentPath -IdentityHelperPath $identityHelperPath -WorkspaceScriptPath $workspaceScriptPath -RunGuardScriptPath $runGuardScriptPath -RebootRequestScriptPath $rebootRequestScriptPath -GuestWorkingDirectory $GuestWorkingDirectory -TimeoutSeconds ($TimeoutMinutes * 60) -RebootTimeoutSeconds ($RebootTimeoutMinutes * 60) -PollSeconds $PollSeconds -CycleOutputDirectory $roundOutputDirectory -ThrottleLimit $ThrottleLimit -RebootBatchSize $resolvedRebootBatchSize -DiscoveryRecords $discoveryRecords -CredentialContext $guestCredentialContext -CredentialDecisionScript $guestCredentialDecisionScript -CredentialValidatedScript $guestCredentialValidatedScript -CredentialInteractive $guestCredentialInteractive -PromptProvider $PromptProvider
         # Only a hard failure is sticky. Drift becomes an outstanding verification instead, which
         # a later round's discovery can resolve.
         if ([bool](Get-RuntimePropertyValue -InputObject $applyOutcome -Name 'HasHardFailure' -DefaultValue ($applyOutcome.ExitCode -ne 0))) {

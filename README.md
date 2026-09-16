@@ -202,9 +202,15 @@ Krok po kroku:
 7. **Apply** — instalacja przez WUA na gościach; powstaje raport `summary.md` i `summary.csv`.
 8. **Restart** — jeśli któraś maszyna zgłosi `rebootRequired` po apply albo już w discovery miała
    `pendingRebootBefore.isPending=true`, skrypt pokazuje listę i prosi o wpisanie **`REBOOT`**
-   (samo `-SkipConfirmation` tego promptu **nie** pomija). Restart idzie przez GuestOps.
+   (samo `-SkipConfirmation` tego promptu **nie** pomija). W trybie GUI to **osobne okno** z tą
+   samą listą maszyn i przyczyn, którą wypisuje konsola, oraz z polem na słowo `REBOOT` —
+   przycisk restartu jest **nieaktywny**, dopóki w polu nie ma dokładnie tego słowa (porównanie
+   z uwzględnieniem wielkości liter, tak jak w konsoli). Esc i zamknięcie okna **pomijają**
+   restart. Restart idzie przez GuestOps.
    Cele są dzielone na stałe paczki po `-RebootBatchSize` (gdy go nie podasz, skrypt zapyta
-   o rozmiar zaraz po `REBOOT`; Enter oznacza 1); kolejna paczka startuje dopiero po
+   o rozmiar zaraz po `REBOOT`; Enter oznacza 1 — w GUI to kolejne małe okno, bez Cancel, bo
+   restart jest już zatwierdzony; jego zamknięcie i każda wartość mniejsza niż 1 oznaczają
+   **jedną maszynę naraz**); kolejna paczka startuje dopiero po
    potwierdzeniu, że każda VM z poprzedniej paczki **z odczytaną wartością bazową** zgłosiła
    `LastBootUpTime` bezwzględnie nowszy od tej wartości — chyba że operator świadomie wymusił
    przejście przez `CONTINUE`.

@@ -973,3 +973,23 @@ function Get-PatchPlanDisplayLines {
 
     return @($lines)
 }
+
+function Get-RebootTargetDisplayLines {
+    param($RebootTargets)
+
+    # Shared by the console list and the GUI approval window, for the same reason the plan
+    # listing is: the restart the operator approves in a window has to be the one the console
+    # recorded, down to the flag that asked for it.
+    $lines = @()
+    foreach ($target in @($RebootTargets)) {
+        if ($null -eq $target) {
+            continue
+        }
+
+        $rebootReason = [string](Get-ModelPropertyValue -InputObject $target -Name 'rebootReason')
+        $reasonText = if ([string]::IsNullOrWhiteSpace($rebootReason)) { '' } else { (' ({0})' -f $rebootReason) }
+        $lines += ('- {0}{1}' -f (Get-ModelPropertyValue -InputObject $target -Name 'vmName'), $reasonText)
+    }
+
+    return @($lines)
+}

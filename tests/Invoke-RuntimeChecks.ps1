@@ -3104,6 +3104,55 @@ else {
     Assert-Equal -Actual $planApproved -Expected $true -Message 'an approved plan applies'
 }
 
+# --- Reboot checkpoint (scripts/Invoke-GuestOpsPatchValidation.ps1, AST-extracted) ---
+# The restart is the other prompt -SkipConfirmation must never answer, and the one whose
+# default has to be "leave them running". An empty target list settles itself without asking.
+$confirmRebootDefinition = @($orchestratorFunctions | Where-Object { $_.Name -eq 'Confirm-GuestReboot' })
+if ($confirmRebootDefinition.Count -eq 0) {
+    Add-Failure -Message 'Orchestrator function not found: Confirm-GuestReboot'
+}
+else {
+    . ([scriptblock]::Create($confirmRebootDefinition[0].Extent.Text))
+
+    $rebootTargetRecords = @(
+        [pscustomobject]@{ vmName = 'VM01'; rebootReason = 'installResult.rebootRequired' }
+    )
+
+    $script:rebootPromptCalls = 0
+    $script:rebootPromptArgs = $null
+    $rebootProvider = @{ ConfirmGuestReboot = { param($promptArgs) $script:rebootPromptCalls++; $script:rebootPromptArgs = $promptArgs; $false } }
+
+    Assert-Equal -Actual (Confirm-GuestReboot -RebootTargets @() -PromptProvider $rebootProvider) -Expected $false -Message 'no reboot targets means no reboot'
+    Assert-Equal -Actual $script:rebootPromptCalls -Expected 0 -Message 'an empty target list never asks the operator'
+
+    Assert-Equal -Actual (Confirm-GuestReboot -RebootTargets $rebootTargetRecords -PromptProvider $rebootProvider) -Expected $false -Message 'a declined checkpoint leaves the VM(s) running'
+    Assert-Equal -Actual $script:rebootPromptCalls -Expected 1 -Message 'the checkpoint asks exactly once'
+    Assert-Equal -Actual ([string](@($script:rebootPromptArgs.RebootTargets)[0].vmName)) -Expected 'VM01' -Message 'the reboot targets travel to the prompt'
+
+    Assert-Equal -Actual (Confirm-GuestReboot -RebootTargets $rebootTargetRecords -PromptProvider @{ ConfirmGuestReboot = { param($promptArgs) $true } }) -Expected $true -Message 'an approved checkpoint reboots'
+}
+
+# The batch size is blast radius, so an unusable answer must fail towards one VM at a time.
+# The console loop cannot return below 1; a window can be closed, and 0 read as one batch
+# would restart the whole fleet at once.
+$batchSizeDefinition = @($orchestratorFunctions | Where-Object { $_.Name -eq 'Read-RebootBatchSize' })
+if ($batchSizeDefinition.Count -eq 0) {
+    Add-Failure -Message 'Orchestrator function not found: Read-RebootBatchSize'
+}
+else {
+    . ([scriptblock]::Create($batchSizeDefinition[0].Extent.Text))
+
+    $script:batchPromptArgs = $null
+    $answeredBatch = Read-RebootBatchSize -TargetCount 21 -PromptProvider @{ RebootBatchSize = { param($promptArgs) $script:batchPromptArgs = $promptArgs; 4 } }
+    Assert-Equal -Actual $answeredBatch -Expected 4 -Message 'the provider answer becomes the batch size'
+    Assert-Equal -Actual ([int]$script:batchPromptArgs.TargetCount) -Expected 21 -Message 'the target count travels to the prompt'
+
+    foreach ($unusable in @(0, -3)) {
+        $clamped = Read-RebootBatchSize -TargetCount 21 -PromptProvider @{ RebootBatchSize = { param($promptArgs) $unusable } }
+        Assert-Equal -Actual $clamped -Expected 1 -Message ('a batch size of {0} falls back to one VM at a time' -f $unusable)
+    }
+}
+
 # Write-FinalReport counts six groups of VMs, and the reboot group is the one that can legally
 # be empty. An if-expression assigns its branch's pipeline output and an empty collection emits
 # nothing, so @() inside a branch assigned $null and the count threw under StrictMode. That state
@@ -3380,6 +3429,48 @@ else {
 
             function Show-PatchPlanDialog { param([string[]]$PlanLines, [string]$Summary = '') return $false }
             Assert-Equal -Actual (& $planBlock @{ PatchPlanRecords = @() }) -Expected $false -Message 'a refused plan dialog refuses the plan'
+        }
+
+        # The reboot checkpoint and its batch size. Both are asked from inside the apply
+        # phase, so a missing provider entry does not fail loudly - it waits on a console
+        # prompt behind the window the operator is looking at.
+        $rebootPair = @($providerPairs | Where-Object { [string]$_.Item1.Extent.Text -eq 'ConfirmGuestReboot' })
+        Assert-Equal -Actual $rebootPair.Count -Expected 1 -Message 'the GUI provider answers the reboot checkpoint in a window'
+        if ($rebootPair.Count -eq 1) {
+            $rebootBlock = $rebootPair[0].Item2.GetPureExpression().ScriptBlock.GetScriptBlock()
+
+            function Get-RebootTargetDisplayLines { param($RebootTargets) return @('- VM01 (installResult.rebootRequired)') }
+
+            $script:rebootDialogArgs = $null
+            function Show-GuestRebootDialog {
+                param([string[]]$TargetLines, [int]$TargetCount = 0)
+                $script:rebootDialogArgs = [pscustomobject]@{ Lines = @($TargetLines); Count = $TargetCount }
+                return $true
+            }
+
+            $rebootOutcome = & $rebootBlock @{ RebootTargets = @([pscustomobject]@{ vmName = 'VM01' }, [pscustomobject]@{ vmName = 'VM02' }) }
+            Assert-Equal -Actual $rebootOutcome -Expected $true -Message 'an approved reboot dialog returns approval'
+            Assert-Equal -Actual (@($script:rebootDialogArgs.Lines) -join '|') -Expected '- VM01 (installResult.rebootRequired)' -Message 'the dialog is given the model-rendered target lines'
+            Assert-Equal -Actual $script:rebootDialogArgs.Count -Expected 2 -Message 'the dialog is told how many machines it is about to restart'
+
+            function Show-GuestRebootDialog { param([string[]]$TargetLines, [int]$TargetCount = 0) return $false }
+            Assert-Equal -Actual (& $rebootBlock @{ RebootTargets = @() }) -Expected $false -Message 'a declined reboot dialog skips the reboot'
+        }
+
+        $batchPair = @($providerPairs | Where-Object { [string]$_.Item1.Extent.Text -eq 'RebootBatchSize' })
+        Assert-Equal -Actual $batchPair.Count -Expected 1 -Message 'the GUI provider answers the reboot batch size in a window'
+        if ($batchPair.Count -eq 1) {
+            $batchBlock = $batchPair[0].Item2.GetPureExpression().ScriptBlock.GetScriptBlock()
+
+            $script:batchDialogCount = 0
+            function Show-RebootBatchSizeDialog {
+                param([int]$TargetCount = 0)
+                $script:batchDialogCount = $TargetCount
+                return 3
+            }
+
+            Assert-Equal -Actual (& $batchBlock @{ TargetCount = 21 }) -Expected 3 -Message 'the batch provider returns the dialog answer'
+            Assert-Equal -Actual $script:batchDialogCount -Expected 21 -Message 'the provider hands the target count to the dialog'
         }
 
         # The four recovery hooks. Each one is a scriptblock whose parameters must line up

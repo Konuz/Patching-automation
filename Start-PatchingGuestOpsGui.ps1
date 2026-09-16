@@ -204,6 +204,15 @@ $launcherParams = @{
             param($Arguments)
             Show-RescanDialog
         }
+        ConfirmGuestReboot = {
+            param($Arguments)
+            $targets = @($Arguments.RebootTargets)
+            Show-GuestRebootDialog -TargetLines @(Get-RebootTargetDisplayLines -RebootTargets $targets) -TargetCount $targets.Count
+        }
+        RebootBatchSize = {
+            param($Arguments)
+            Show-RebootBatchSizeDialog -TargetCount ([int]$Arguments.TargetCount)
+        }
         PromptCredential = {
             param([string]$Message)
             $entered = Show-CredentialDialog -Title 'PatchingGuestOps credentials' -Message $Message

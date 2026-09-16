@@ -538,6 +538,21 @@ Assert-Equal -Actual (Get-PatchPlanSummaryLine -PatchPlanRecords $plan) -Expecte
 Assert-Equal -Actual (Get-PatchPlanSummaryLine -PatchPlanRecords $noSelectionPlan) -Expected '1 VM in plan: 0 to install (0 update install(s) in total), 1 with nothing selected, 0 skipped.' -Message 'a VM with nothing selected is not counted as an install'
 Assert-Equal -Actual (Get-PatchPlanSummaryLine -PatchPlanRecords @()) -Expected '0 VM in plan: 0 to install (0 update install(s) in total), 0 with nothing selected, 0 skipped.' -Message 'an empty plan renders a line rather than throwing'
 
+# The reboot target list, rendered once for the console checkpoint and the GUI approval
+# window. The flag that asked for the restart travels with the name, because that is what
+# tells an operator whether the machine is waiting on an install they recognise.
+$rebootLines = @(Get-RebootTargetDisplayLines -RebootTargets @(
+    [pscustomobject]@{ vmName = 'VM01'; rebootReason = 'installResult.rebootRequired' },
+    $null,
+    [pscustomobject]@{ vmName = 'VM02'; rebootReason = '' },
+    [pscustomobject]@{ vmName = 'VM03' }
+))
+Assert-Equal -Actual $rebootLines.Count -Expected 3 -Message 'a null reboot target is skipped rather than rendered as a blank machine'
+Assert-Equal -Actual $rebootLines[0] -Expected '- VM01 (installResult.rebootRequired)' -Message 'a reboot target names the flag that asked for the restart'
+Assert-Equal -Actual $rebootLines[1] -Expected '- VM02' -Message 'a blank reason loses the brackets, not the machine'
+Assert-Equal -Actual $rebootLines[2] -Expected '- VM03' -Message 'a target with no reason at all still lists its name'
+Assert-Equal -Actual (@(Get-RebootTargetDisplayLines -RebootTargets @()).Count) -Expected 0 -Message 'no reboot targets renders nothing rather than throwing'
+
 Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $true -AvailableUpdateCount 0 -HasErrors $false) -Expected 'UpToDate' -Message 'discovery status: successful with zero updates is up-to-date'
 Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $true -AvailableUpdateCount 3 -HasErrors $false) -Expected 'UpdatesFound' -Message 'discovery status: successful with updates is updates-found'
 Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $false -AvailableUpdateCount 0 -HasErrors $true) -Expected 'Failed' -Message 'discovery status: errors make discovery failed'
