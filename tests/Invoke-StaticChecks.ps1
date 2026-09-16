@@ -499,7 +499,6 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Discovery returned outcome'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '$agentRun.AgentResult.Completed'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?s)if\s*\(\$targetVMNames\.Count\s+-gt\s+1\).*?\breturn\b' -Reason 'multi-VM discovery must fall through to the final exit'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Role flags:'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Skipped: Failover Cluster detected. Please update manually one by one.'
     Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern '(?i)\$kbArticleIds\.Count\b' -Reason 'ConvertFrom-Json can collapse one KB article id to a scalar under StrictMode'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Confirm-GuestReboot'
@@ -611,6 +610,10 @@ if ($existingScripts.ContainsKey($modelPath)) {
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'New-PatchPlanRecords'
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'ConvertTo-PatchPlanRecords'
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'ConvertTo-PatchSummaryRows'
+    # The plan listing and its counts render here, not in either surface, so the console and
+    # the GUI approval window cannot describe one plan differently.
+    Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'Get-PatchPlanDisplayLines'
+    Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'Get-PatchPlanSummaryLine'
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'Get-VMPatchCompletionStates'
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'Get-NextRoundVMNames'
 }
