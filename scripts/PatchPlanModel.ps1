@@ -286,6 +286,55 @@ function Get-UpdateGroupDisplayTitle {
     return ('[{0}] {1}' -f $marker, $title)
 }
 
+# Which VMs report this update but will not be patched with it: applies-to minus patchable.
+# The ONLY thing New-UpdateGroupRecords removes from patchableVmNames is a confirmed Failover
+# Cluster membership, which is why the caller may name that as the reason. A second exclusion
+# rule added there has to be reflected here, or the reason stops being true.
+function Get-UpdateGroupExcludedVmNames {
+    param($UpdateGroup)
+
+    $patchableLookup = @{}
+    foreach ($patchableName in @(Get-ModelPropertyValue -InputObject $UpdateGroup -Name 'patchableVmNames' -DefaultValue @())) {
+        $trimmedPatchable = ([string]$patchableName).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($trimmedPatchable)) {
+            $patchableLookup[$trimmedPatchable] = $true
+        }
+    }
+
+    $excluded = @()
+    foreach ($appliesName in @(Get-ModelPropertyValue -InputObject $UpdateGroup -Name 'appliesToVmNames' -DefaultValue @())) {
+        $trimmedApplies = ([string]$appliesName).Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmedApplies) -or $patchableLookup.ContainsKey($trimmedApplies)) {
+            continue
+        }
+
+        $excluded += $trimmedApplies
+    }
+
+    return @($excluded)
+}
+
+# The per-group VM breakdown, built once and rendered by both surfaces. A count on its own says
+# that something was excluded; only the names say which machine the operator has to patch by
+# hand. Shared for the same reason Get-UpdateGroupDisplayTitle is: the console list and the GUI
+# dialog must not describe the same group differently.
+function Get-UpdateGroupVmDetailLines {
+    param($UpdateGroup)
+
+    $appliesTo = @(@(Get-ModelPropertyValue -InputObject $UpdateGroup -Name 'appliesToVmNames' -DefaultValue @()) | ForEach-Object { [string]$_ })
+    $patchable = @(@(Get-ModelPropertyValue -InputObject $UpdateGroup -Name 'patchableVmNames' -DefaultValue @()) | ForEach-Object { [string]$_ })
+    $excluded = @(Get-UpdateGroupExcludedVmNames -UpdateGroup $UpdateGroup)
+
+    $lines = @()
+    $lines += ('Applies to ({0}): {1}' -f $appliesTo.Count, $(if ($appliesTo.Count -eq 0) { 'none' } else { $appliesTo -join ', ' }))
+    $lines += ('Patchable ({0}): {1}' -f $patchable.Count, $(if ($patchable.Count -eq 0) { 'none' } else { $patchable -join ', ' }))
+    if ($excluded.Count -gt 0) {
+        $lines += ('Not patchable, Failover Cluster member - update these by hand ({0}): {1}' -f $excluded.Count, ($excluded -join ', '))
+    }
+
+    return @($lines)
+}
+
 function Get-RoleFlagText {
     param($RoleFlags)
 

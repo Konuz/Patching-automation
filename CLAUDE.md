@@ -834,6 +834,19 @@ The mapping, and why each half matters:
 - **A stopped `ClusSvc` decides nothing.** A node can be a cluster member with the service stopped
   for maintenance, which is exactly when someone might try to patch it.
 
+**Both operator surfaces name the machines behind the counts.** A group row says
+`applies to 3 VM, patchable 2`; `Get-UpdateGroupVmDetailLines` (over
+`Get-UpdateGroupExcludedVmNames`) renders the `Applies to` / `Patchable` names and, when they
+differ, `Not patchable, Failover Cluster member - update these by hand` with the excluded names.
+The console prints those lines under each group, the GUI dialog shows them in a pane under the
+list - shared for the same reason `Get-UpdateGroupDisplayTitle` is, so the two cannot describe
+one group differently. The helper names the cluster as the reason because a confirmed membership
+is the **only** rule in `New-UpdateGroupRecords` that removes a VM from `patchableVmNames`; a
+second exclusion added there has to reach the helper too, or the stated reason stops being true.
+A VM excluded for some other reason later in the run - `Unknown` membership, a skipped credential
+account, a refused run guard - is still counted as patchable here, because all three are settled
+after discovery has already grouped the updates.
+
 `Unknown` is `Failed`, deliberately **not** `Excluded`: an exclusion is a decision about a machine
 somebody understood, and this one is unresolved. It blocks apply (the agent throws, and re-checks
 on every apply whatever a saved plan recorded) and blocks reboot

@@ -372,6 +372,18 @@ Assert-Equal -Actual (@($cumulativeGroup.appliesToVmNames) -join ',') -Expected 
 Assert-Equal -Actual (@($cumulativeGroup.patchableVmNames) -join ',') -Expected 'VM01,VM02' -Message 'group lists patchable VM names'
 Assert-True -Condition $cumulativeGroup.selectedByDefault -Message 'cumulative group is selected by default'
 
+# The names behind the counts. Both operator surfaces render these lines, so the wording and the
+# membership are settled here rather than twice in two dialogs.
+Assert-Equal -Actual (@(Get-UpdateGroupExcludedVmNames -UpdateGroup $cumulativeGroup) -join ',') -Expected 'VM03' -Message 'excluded names are applies-to minus patchable'
+$cumulativeDetailLines = @(Get-UpdateGroupVmDetailLines -UpdateGroup $cumulativeGroup)
+Assert-Equal -Actual $cumulativeDetailLines.Count -Expected 3 -Message 'a group with an excluded VM renders three detail lines'
+Assert-Equal -Actual $cumulativeDetailLines[0] -Expected 'Applies to (3): VM01, VM02, VM03' -Message 'detail lines name every applicable VM'
+Assert-Equal -Actual $cumulativeDetailLines[1] -Expected 'Patchable (2): VM01, VM02' -Message 'detail lines name the patchable VMs'
+Assert-Equal -Actual $cumulativeDetailLines[2] -Expected 'Not patchable, Failover Cluster member - update these by hand (1): VM03' -Message 'detail lines name the excluded VM and why'
+
+$previewDetailLines = @(Get-UpdateGroupVmDetailLines -UpdateGroup (@($groups | Where-Object { $_.identityKey -eq '22222222-2222-2222-2222-222222222222|17' })[0]))
+Assert-Equal -Actual $previewDetailLines.Count -Expected 2 -Message 'a group with nothing excluded renders no exclusion line'
+
 $previewGroup = @($groups | Where-Object { $_.identityKey -eq '22222222-2222-2222-2222-222222222222|17' })[0]
 Assert-Equal -Actual $previewGroup.appliesToVmCount -Expected 1 -Message 'preview group applies to one VM'
 Assert-True -Condition (-not $previewGroup.selectedByDefault) -Message 'preview group is not selected by default'
@@ -464,6 +476,10 @@ $clusterOnlyGroups = @(New-UpdateGroupRecords -DiscoveryRecords $clusterOnlyDisc
 Assert-Equal -Actual $clusterOnlyGroups.Count -Expected 1 -Message 'cluster-only update still forms a group'
 Assert-Equal -Actual $clusterOnlyGroups[0].patchableVmCount -Expected 0 -Message 'cluster-only group has zero patchable VMs'
 Assert-True -Condition (-not $clusterOnlyGroups[0].selectedByDefault) -Message 'cluster-only group is not preselected'
+Assert-Equal -Actual (@(Get-UpdateGroupExcludedVmNames -UpdateGroup $clusterOnlyGroups[0]) -join ',') -Expected 'VM06' -Message 'every applicable VM is excluded when none is patchable'
+$clusterOnlyDetailLines = @(Get-UpdateGroupVmDetailLines -UpdateGroup $clusterOnlyGroups[0])
+Assert-Equal -Actual $clusterOnlyDetailLines[1] -Expected 'Patchable (0): none' -Message 'an empty patchable list reads as none rather than blank'
+Assert-Equal -Actual $clusterOnlyDetailLines[2] -Expected 'Not patchable, Failover Cluster member - update these by hand (1): VM06' -Message 'a cluster-only group names the machine to patch by hand'
 
 $discoveryFailurePlan = @(
     [pscustomobject]@{

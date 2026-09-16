@@ -560,7 +560,9 @@ function Show-UpdateGroups {
         $mark = if ($group.selectedByDefault) { 'x' } else { ' ' }
         $kbText = if ([string]::IsNullOrWhiteSpace([string]$group.kbText)) { 'No KB' } else { [string]$group.kbText }
         Write-Host ('[{0}] {1}. {2} - {3}' -f $mark, $index, $kbText, (Get-UpdateGroupDisplayTitle -UpdateGroup $group))
-        Write-Host ('    Applies to: {0} VM; Patchable: {1} VM' -f $group.appliesToVmCount, $group.patchableVmCount)
+        foreach ($detailLine in @(Get-UpdateGroupVmDetailLines -UpdateGroup $group)) {
+            Write-Host ('    {0}' -f $detailLine)
+        }
         $policyReason = [string](Get-RuntimePropertyValue -InputObject $group -Name 'policyReason')
         if ([string](Get-RuntimePropertyValue -InputObject $group -Name 'policyDecision') -eq 'NeedsReview' -and -not [string]::IsNullOrWhiteSpace($policyReason)) {
             Write-Host ('    Needs review: {0} Tick it to install, or leave it unticked to refuse it for this run.' -f $policyReason)

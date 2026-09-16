@@ -179,6 +179,15 @@ Krok po kroku:
    `UpdateID + RevisionNumber` (KB i tytuł są pokazywane dla człowieka). Wybierasz interaktywnie
    albo z góry przez `-SelectedUpdateKeys`. Domyślnie zaznaczone są aktualizacje krytyczne/ważne
    (patrz [polityka](#jak-wybierane-są-aktualizacje)).
+
+   Każda grupa pokazuje `applies to X VM, patchable Y` — na ilu maszynach poprawka jest dostępna
+   i na ilu z nich narzędzie ją zainstaluje. Pod spodem (w GUI: panel pod listą, w konsoli: linie
+   pod grupą) wypisane są **nazwy maszyn**: `Applies to`, `Patchable`, a gdy się różnią —
+   `Not patchable, Failover Cluster member - update these by hand` z listą maszyn do ręcznej
+   aktualizacji. Jedyne, co odejmuje maszynę od `patchable`, to **potwierdzone członkostwo
+   w klastrze**; maszyna z `clusterMembership = Unknown`, pominięta przy poświadczeniach albo
+   odrzucona przez run guard nadal liczy się tu jako `patchable`, bo te fakty ustalają się już
+   po discovery.
 5. **Plan per-VM** — narzędzie pokazuje, co trafi na którą maszynę. **Failover Cluster jest
    twardo pomijany** ("aktualizuj ręcznie, węzeł po węźle"). Plan zapisuje się do
    `patch-plan.json`.

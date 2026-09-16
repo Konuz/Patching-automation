@@ -223,7 +223,7 @@ function Show-UpdateGroupDialog {
     $list.Left = 12
     $list.Top = 12
     $list.Width = 860
-    $list.Height = 460
+    $list.Height = 330
     $list.CheckOnClick = $true
 
     foreach ($group in $groups) {
@@ -235,6 +235,32 @@ function Show-UpdateGroupDialog {
         if ($index -ge 0 -and $index -lt $list.Items.Count) {
             $list.SetItemChecked($index, $true)
         }
+    }
+
+    # The counts on each row say that something was excluded; only the names say which machine
+    # somebody has to patch by hand. A pane rather than more text on the row: a fleet's worth of
+    # FQDNs on one line is clipped by the list, and clipped is the same as not shown.
+    $details = New-Object System.Windows.Forms.TextBox
+    $details.Left = 12
+    $details.Top = 350
+    $details.Width = 860
+    $details.Height = 130
+    $details.Multiline = $true
+    $details.ReadOnly = $true
+    $details.WordWrap = $true
+    $details.ScrollBars = 'Vertical'
+
+    $showGroupDetails = {
+        $selectedIndex = $list.SelectedIndex
+        if ($selectedIndex -lt 0 -or $selectedIndex -ge $groups.Count) {
+            $details.Lines = @('Select a group to see which VMs report it, and which of those this tool will patch.')
+            return
+        }
+
+        $selectedGroup = $groups[$selectedIndex]
+        $selectedKbText = if ([string]::IsNullOrWhiteSpace([string]$selectedGroup.kbText)) { 'No KB' } else { [string]$selectedGroup.kbText }
+        $details.Lines = @(('{0} - {1}' -f $selectedKbText, (Get-UpdateGroupDisplayTitle -UpdateGroup $selectedGroup))) +
+            @(Get-UpdateGroupVmDetailLines -UpdateGroup $selectedGroup)
     }
 
     $install = New-Object System.Windows.Forms.Button
@@ -251,9 +277,14 @@ function Show-UpdateGroupDialog {
     $abort.Width = 100
     $abort.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
 
-    $form.Controls.AddRange(@($list, $install, $abort))
+    $form.Controls.AddRange(@($list, $details, $install, $abort))
     $form.AcceptButton = $install
     $form.CancelButton = $abort
+
+    # Ticking a box does not move the selection, so the pane follows the highlighted row. Filled
+    # once up front too: an empty pane on a dialog nobody has clicked yet reads as a broken one.
+    $list.Add_SelectedIndexChanged($showGroupDetails)
+    & $showGroupDetails
 
     # This window appears hours into a run, behind the console window. Without Activate()
     # the operator never sees it and concludes the run has hung.
