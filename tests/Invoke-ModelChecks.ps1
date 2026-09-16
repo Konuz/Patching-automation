@@ -553,6 +553,48 @@ Assert-Equal -Actual $rebootLines[1] -Expected '- VM02' -Message 'a blank reason
 Assert-Equal -Actual $rebootLines[2] -Expected '- VM03' -Message 'a target with no reason at all still lists its name'
 Assert-Equal -Actual (@(Get-RebootTargetDisplayLines -RebootTargets @()).Count) -Expected 0 -Message 'no reboot targets renders nothing rather than throwing'
 
+# The machine that is about to be restarted with half its updates missing must not read like
+# the twenty beside it that installed cleanly. This is the last screen before a production
+# restart, so the marker carries the counts and the packages, not just a word.
+$partialTarget = [pscustomobject]@{
+    vmName = 'VM01'
+    rebootReason = 'Reported after apply: pendingRebootAfter.componentBasedServicing'
+    applyOutcome = 'InstallSucceededWithErrors'
+    approvedUpdateCount = 4
+    installedUpdateCount = 2
+    failedUpdateKbs = @('KB5122774', 'KB5122882')
+}
+$partialLine = @(Get-RebootTargetDisplayLines -RebootTargets @($partialTarget))[0]
+Assert-True -Condition ($partialLine.Contains('[PARTIAL INSTALL: 2 of 4 update(s) installed; failed: KB5122774, KB5122882]')) -Message 'a partial install names its counts and its packages'
+Assert-True -Condition ($partialLine.Contains('Reported after apply')) -Message 'the marker is added to the reason, not instead of it'
+
+# Ahead of the reason: the reason line is long enough that a marker appended to it is one an
+# operator scrolls past.
+Assert-True -Condition ($partialLine.IndexOf('[PARTIAL') -lt $partialLine.IndexOf('Reported after apply')) -Message 'the marker precedes the reason'
+
+$cleanTarget = [pscustomobject]@{
+    vmName = 'VM02'
+    rebootReason = 'Reported after apply: installResult.rebootRequired'
+    applyOutcome = 'InstallSucceeded'
+    approvedUpdateCount = 4
+    installedUpdateCount = 4
+    failedUpdateKbs = @()
+}
+Assert-Equal -Actual (@(Get-RebootTargetDisplayLines -RebootTargets @($cleanTarget))[0]) -Expected '- VM02 (Reported after apply: installResult.rebootRequired)' -Message 'a clean install keeps an ordinary line'
+Assert-Equal -Actual (Get-RebootTargetInstallNote -RebootTarget $cleanTarget) -Expected '' -Message 'a clean install carries no marker'
+Assert-Equal -Actual (Get-RebootTargetInstallNote -RebootTarget $null) -Expected '' -Message 'a null target is not a partial install'
+
+# A target from a record written before these fields existed, or from the saved-plan path,
+# has none of them - it must read as an ordinary restart rather than throwing.
+Assert-Equal -Actual (Get-RebootTargetInstallNote -RebootTarget ([pscustomobject]@{ vmName = 'VM03' })) -Expected '' -Message 'a target with no install fields is not marked'
+
+# Drift is the other way a restart lands on a machine that did not get everything approved.
+Assert-Equal -Actual (Get-RebootTargetInstallNote -RebootTarget ([pscustomobject]@{ vmName = 'VM04'; applyOutcome = 'InstallSucceeded'; requiresVerification = $true })) -Expected '[NEEDS VERIFICATION: less was installed than approved]' -Message 'selection drift is marked at the checkpoint too'
+
+# The failure list alone is enough: an outcome this tool does not recognise must not silence
+# a package that demonstrably did not install.
+Assert-True -Condition ([string](Get-RebootTargetInstallNote -RebootTarget ([pscustomobject]@{ vmName = 'VM05'; applyOutcome = 'Failed'; approvedUpdateCount = 0; failedUpdateKbs = @('KB5000001') })).Contains('failed: KB5000001')) -Message 'named failures mark the target whatever the outcome says'
+
 Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $true -AvailableUpdateCount 0 -HasErrors $false) -Expected 'UpToDate' -Message 'discovery status: successful with zero updates is up-to-date'
 Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $true -AvailableUpdateCount 3 -HasErrors $false) -Expected 'UpdatesFound' -Message 'discovery status: successful with updates is updates-found'
 Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $false -AvailableUpdateCount 0 -HasErrors $true) -Expected 'Failed' -Message 'discovery status: errors make discovery failed'

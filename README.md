@@ -200,6 +200,15 @@ Krok po kroku:
    `-SkipConfirmation` jest rozstrzygane **przed** sięgnięciem po okno, więc przebieg
    nieinteraktywny nigdy go nie otwiera.
 7. **Apply** — instalacja przez WUA na gościach; powstaje raport `summary.md` i `summary.csv`.
+
+   **Instalacja częściowa.** Gdy WUA zwróci `ResultCode 3` (część poprawek weszła, część nie),
+   maszyna **nadal idzie do restartu** — bez niego to, co się zainstalowało, nie zostanie
+   sfinalizowane — a resztę łapie kolejna runda. Zmienia się to, że **widać ją na liście
+   restartu**: `- vm01 [PARTIAL INSTALL: 2 of 4 update(s) installed; failed: KB5122774,
+   KB5122882] (Reported after apply: …)`. Liczniki pochodzą z wyników **per aktualizacja**
+   zapisanych przez agenta; zbiorcze `installResult` mówi tylko, że coś zawiodło, nigdy ile ani
+   co. Te same liczby trafiają do `summary.md` (sekcja *VMs partially installed*). Dryf wyboru
+   dostaje własny znacznik `[NEEDS VERIFICATION: less was installed than approved]`.
 8. **Restart** — jeśli któraś maszyna zgłosi `rebootRequired` po apply albo już w discovery miała
    `pendingRebootBefore.isPending=true`, skrypt pokazuje listę i prosi o wpisanie **`REBOOT`**
    (samo `-SkipConfirmation` tego promptu **nie** pomija). W trybie GUI to **osobne okno** z tą

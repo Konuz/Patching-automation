@@ -671,6 +671,26 @@ is initiated in parallel, and the next batch is blocked until every VM with a ba
 strictly newer boot time. The boot-time helper runs inside the VM; no WinRM, PSRemoting,
 `Invoke-VMScript`, or `Copy-VMGuestFile` is used.
 
+**A partial install is still restarted, and is now the one line on the checkpoint that says
+so.** WUA `ResultCode 3` (`InstallSucceededWithErrors`) means some approved updates went in
+and some did not. The restart is still correct - without it, what did install is never
+finalised - and `Get-NextRoundTargetVMNames` already takes the VM into the next round, which
+picks up the remainder. What was missing was **visibility**: on a fleet of twenty the machine
+that installed two of four read exactly like the nineteen that installed everything, and the
+reboot checkpoint is the last screen before a production restart. So
+`New-ApplyResultFromCycle` counts the agent's **per-update** results into
+`approvedUpdateCount`, `installedUpdateCount` and `failedUpdateKbs` - the aggregate
+`installResult` says only that something failed, never how much or which package - and those
+travel onto the reboot target. `Get-RebootTargetInstallNote` (model, so the console list and
+the GUI window cannot disagree) prefixes the line with
+`[PARTIAL INSTALL: 2 of 4 update(s) installed; failed: KB…]`, ahead of the reason because the
+reason is long enough to be skimmed past. Selection drift gets the same treatment
+(`[NEEDS VERIFICATION: less was installed than approved]`): it is the other way a restart
+lands on a machine that did not get everything approved. The counts are computed **before**
+the failure branches, so a VM that ended badly still reports what it managed to install, and
+they reach `summary.md` as a count and a section naming the packages. A clean install carries
+no marker, and a target from a record written before these fields existed carries none either.
+
 The helper and its JSON output use **one stable path per guest** (`Read-BootTime-<vm>.ps1`,
 `boot-time-<vm>.json`), overwritten on every attempt — per-attempt names would leave hundreds of
 files per VM per run behind on production servers. Because the output path is reused,

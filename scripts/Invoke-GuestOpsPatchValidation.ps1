@@ -1481,7 +1481,23 @@ function Write-PatchingSummary {
         switch ($status) {
             'Installed' { $label = 'Installed'; $color = 'Green' }
             'InstalledRebootRequired' { $label = 'Installed (reboot required)'; $color = 'Yellow' }
-            'Partial' { $label = 'Partially installed (some updates failed - see artifacts)'; $color = 'DarkYellow' }
+            'Partial' {
+                # The counts, not just the word: 'some updates failed' reads the same whether
+                # one of twelve failed or eleven did, and the operator decides on that number.
+                $approved = [int](Get-ObjectPropertyValue -InputObject $result -Path @('approvedUpdateCount') -DefaultValue 0)
+                $installed = [int](Get-ObjectPropertyValue -InputObject $result -Path @('installedUpdateCount') -DefaultValue 0)
+                $failedKbs = @(@(Get-ObjectPropertyValue -InputObject $result -Path @('failedUpdateKbs') -DefaultValue @()) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+                $label = if ($approved -gt 0) {
+                    'Partially installed ({0} of {1} update(s) installed)' -f $installed, $approved
+                }
+                else {
+                    'Partially installed (some updates failed)'
+                }
+                if ($failedKbs.Count -gt 0) {
+                    $label = '{0} - failed: {1}' -f $label, (($failedKbs | Select-Object -Unique) -join ', ')
+                }
+                $color = 'DarkYellow'
+            }
             'Skipped' { $label = ([string]$result.reason); $color = 'DarkGray' }
             default {
                 $reasonText = ([string]$result.reason).Trim()
@@ -1518,6 +1534,10 @@ function Write-FinalReport {
         else { $RebootTargets }
     )
     $errors = @($ApplyResults | Where-Object { Test-IsApplyResultError -ApplyResult $_ })
+    # Counted separately from the errors they are also part of: "installed, but not all of it"
+    # is a different next step from "did not install", and the run that produced this report
+    # restarted these machines like any other.
+    $partial = @($ApplyResults | Where-Object { $_.action -eq 'Install' -and $_.outcome -eq 'InstallSucceededWithErrors' })
     $clusters = @($PatchPlanRecords | Where-Object { $_.reason -eq 'Skipped: Failover Cluster detected. Please update manually one by one.' })
 
     $lines = @()
@@ -1530,6 +1550,7 @@ function Write-FinalReport {
     $lines += ('- VMs skipped: {0}' -f $skipped.Count)
     $lines += ('- VMs requiring reboot: {0}' -f $rebootRequired.Count)
     $lines += ('- VMs with errors: {0}' -f $errors.Count)
+    $lines += ('- VMs partially installed: {0}' -f $partial.Count)
     $lines += ('- VMs rejected by Failover Cluster: {0}' -f $clusters.Count)
     $lines += ''
 
@@ -1551,6 +1572,23 @@ function Write-FinalReport {
         }
         $lines += ''
     }
+
+    # Rendered on its own rather than through the loop above: those sections print a reboot
+    # reason, and what matters here is which packages did not go in.
+    $lines += '## VMs partially installed'
+    if ($partial.Count -eq 0) {
+        $lines += '- none'
+    }
+    else {
+        foreach ($partialResult in $partial) {
+            $approved = [int](Get-ObjectPropertyValue -InputObject $partialResult -Path @('approvedUpdateCount') -DefaultValue 0)
+            $installed = [int](Get-ObjectPropertyValue -InputObject $partialResult -Path @('installedUpdateCount') -DefaultValue 0)
+            $failedKbs = @(@(Get-ObjectPropertyValue -InputObject $partialResult -Path @('failedUpdateKbs') -DefaultValue @()) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+            $failedText = if ($failedKbs.Count -eq 0) { 'not named by the agent' } else { (($failedKbs | Select-Object -Unique) -join ', ') }
+            $lines += ('- {0}: installed {1} of {2}; failed: {3}' -f $partialResult.vmName, $installed, $approved, $failedText)
+        }
+    }
+    $lines += ''
 
     $markdownPath = Join-Path $CycleOutputDirectory 'summary.md'
     Set-Content -LiteralPath $markdownPath -Value $lines -Encoding UTF8

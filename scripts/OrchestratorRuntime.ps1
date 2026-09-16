@@ -378,6 +378,12 @@ function New-ApplyResultRecord {
         [string[]]$MissingUpdateKeys = @(),
         [bool]$SelectionDrift = $false,
         [bool]$RequiresVerification = $false,
+        # How much of what was approved actually went in. The aggregate installResult says
+        # only that something failed, never how much or which package, so a partial install
+        # read exactly like a clean one everywhere an operator looks.
+        [int]$ApprovedUpdateCount = 0,
+        [int]$InstalledUpdateCount = 0,
+        [string[]]$FailedUpdateKbs = @(),
         # Null when the guest was not asked to check a seal, otherwise the guest's own answer to
         # "is this still the directory the bootstrap secured". Not merged into the error list
         # alone: a refused seal is a tampering signal, and it must be visible as a field rather
@@ -404,6 +410,9 @@ function New-ApplyResultRecord {
         missingUpdateKeys = @($MissingUpdateKeys)
         selectionDrift = $SelectionDrift
         requiresVerification = $RequiresVerification
+        approvedUpdateCount = $ApprovedUpdateCount
+        installedUpdateCount = $InstalledUpdateCount
+        failedUpdateKbs = @($FailedUpdateKbs)
         errors = @($Errors)
     }
 }
@@ -460,6 +469,40 @@ function New-ApplyResultFromCycle {
     # still on offer went in, the ones that had moved did not, and somebody has to look at the
     # difference. It must survive every branch below, including the failure branches.
     $missingUpdateKeys = @(@(Get-ObjectPropertyValue -InputObject $status -Path @('missingUpdateKeys') -DefaultValue @()) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    # Counted from the agent's own per-update results rather than the aggregate one, because
+    # WUA's ResultCode 3 says "something failed" and nothing else. Computed before the failure
+    # branches below so a VM that ended badly still reports what it managed to install.
+    $approvedUpdateCount = [int](Get-ObjectPropertyValue -InputObject $status -Path @('selectedUpdateCount') -DefaultValue 0)
+    $installedUpdateCount = 0
+    $failedUpdateKbs = @()
+    foreach ($updateRecord in @(Get-ObjectPropertyValue -InputObject $status -Path @('updates') -DefaultValue @())) {
+        if (-not [bool](Get-ObjectPropertyValue -InputObject $updateRecord -Path @('selected') -DefaultValue $false)) {
+            continue
+        }
+
+        if ([string](Get-ObjectPropertyValue -InputObject $updateRecord -Path @('installResult', 'result')) -eq 'Succeeded') {
+            $installedUpdateCount++
+            continue
+        }
+
+        # A selected update whose install never ran - a failed download, a cycle that died
+        # before it - did not go in either, so it is named here too. Wrapped in @() because
+        # ConvertFrom-Json collapses a single KB id to a scalar under StrictMode.
+        $kbIds = @(@(Get-ObjectPropertyValue -InputObject $updateRecord -Path @('kbArticleIds') -DefaultValue @()) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+        if ($kbIds.Count -gt 0) {
+            # The agent writes bare numbers; a KB prefix is what an operator searches for.
+            $kbLabels = @(@($kbIds) | ForEach-Object {
+                $kbId = ([string]$_).Trim()
+                if ($kbId.ToUpperInvariant().StartsWith('KB')) { $kbId } else { 'KB' + $kbId }
+            })
+            $failedUpdateKbs += ($kbLabels -join '/')
+        }
+        else {
+            # WUA does not always expose a KB id. The identity is still something to look up.
+            $updateId = [string](Get-ObjectPropertyValue -InputObject $updateRecord -Path @('updateId'))
+            $failedUpdateKbs += if ([string]::IsNullOrWhiteSpace($updateId)) { 'an update with no KB id' } else { $updateId }
+        }
+    }
     $selectionDrift = [bool](Get-ObjectPropertyValue -InputObject $status -Path @('selectionDrift') -DefaultValue $false) -or ($missingUpdateKeys.Count -gt 0)
     $requiresVerification = [bool](Get-ObjectPropertyValue -InputObject $status -Path @('requiresVerification') -DefaultValue $false) -or $selectionDrift
     if ($guestRunConflict) {
@@ -484,7 +527,7 @@ function New-ApplyResultFromCycle {
             -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired -RebootSignals $rebootSignals `
             -AgentCompletionConfirmed $false -AgentCompletionReason $agentCompletionReason `
             -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
-            -Errors $errors -GuestRunConflict $guestRunConflict -GuestRunConflictKind $guestRunConflictKind -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
+            -Errors $errors -GuestRunConflict $guestRunConflict -GuestRunConflictKind $guestRunConflictKind -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification -ApprovedUpdateCount $approvedUpdateCount -InstalledUpdateCount $installedUpdateCount -FailedUpdateKbs $failedUpdateKbs
     }
 
     if ($null -eq $agentResult -or -not $agentResult.Completed) {
@@ -504,7 +547,7 @@ function New-ApplyResultFromCycle {
                 -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired -RebootSignals $rebootSignals `
                 -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
                 -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
-                -Errors $errors -GuestRunConflict $guestRunConflict -GuestRunConflictKind $guestRunConflictKind -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
+                -Errors $errors -GuestRunConflict $guestRunConflict -GuestRunConflictKind $guestRunConflictKind -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification -ApprovedUpdateCount $approvedUpdateCount -InstalledUpdateCount $installedUpdateCount -FailedUpdateKbs $failedUpdateKbs
         }
     }
     # A partial install (WUA ResultCode 3) exits non-zero but is authoritative in
@@ -517,14 +560,14 @@ function New-ApplyResultFromCycle {
             -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired -RebootSignals $rebootSignals `
             -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
             -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
-            -Errors $errors -GuestRunConflict $guestRunConflict -GuestRunConflictKind $guestRunConflictKind -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
+            -Errors $errors -GuestRunConflict $guestRunConflict -GuestRunConflictKind $guestRunConflictKind -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification -ApprovedUpdateCount $approvedUpdateCount -InstalledUpdateCount $installedUpdateCount -FailedUpdateKbs $failedUpdateKbs
     }
 
     return New-ApplyResultRecord -VMName $VMName -Outcome $outcome -InstallResult $installResult `
         -RoleFlags (Get-ObjectPropertyValue -InputObject $status -Path @('roleFlags')) -RebootRequired $rebootRequired -RebootSignals $rebootSignals `
         -AgentCompletionConfirmed $agentCompletionConfirmed -AgentCompletionReason $agentCompletionReason `
         -CleanupStatus (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupStatus') -CleanupReason (Get-RuntimePropertyValue -InputObject $Cycle -Name 'CleanupReason') `
-        -Errors $errors -GuestRunConflict $guestRunConflict -GuestRunConflictKind $guestRunConflictKind -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification
+        -Errors $errors -GuestRunConflict $guestRunConflict -GuestRunConflictKind $guestRunConflictKind -WorkspaceSealVerified $workspaceSealVerified -MissingUpdateKeys $missingUpdateKeys -SelectionDrift $selectionDrift -RequiresVerification $requiresVerification -ApprovedUpdateCount $approvedUpdateCount -InstalledUpdateCount $installedUpdateCount -FailedUpdateKbs $failedUpdateKbs
 }
 
 function Add-OutstandingVerificationKeys {
@@ -863,10 +906,18 @@ function Select-RebootRequiredApplyResults {
             $signals += @(Get-RuntimePropertyValue -InputObject $result -Name 'rebootSignals' -DefaultValue @())
         }
 
+        # The install outcome travels with the target. This is the last screen before a
+        # production restart, and a machine whose install half failed looked exactly like the
+        # twenty beside it that did not - the operator had no reason to look closer.
         $targets += [pscustomobject]@{
             vmName = $vmName
             rebootRequired = $true
             rebootReason = Get-RebootTargetReason -RebootRequiredAfterApply $rebootRequiredAfterApply -PendingBeforeApply $pendingBeforeApply -Signals $signals
+            applyOutcome = [string](Get-RuntimePropertyValue -InputObject $result -Name 'outcome')
+            approvedUpdateCount = [int](Get-RuntimePropertyValue -InputObject $result -Name 'approvedUpdateCount' -DefaultValue 0)
+            installedUpdateCount = [int](Get-RuntimePropertyValue -InputObject $result -Name 'installedUpdateCount' -DefaultValue 0)
+            failedUpdateKbs = @(Get-RuntimePropertyValue -InputObject $result -Name 'failedUpdateKbs' -DefaultValue @())
+            requiresVerification = [bool](Get-RuntimePropertyValue -InputObject $result -Name 'requiresVerification' -DefaultValue $false)
         }
     }
 

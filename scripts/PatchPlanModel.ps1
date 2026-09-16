@@ -974,6 +974,46 @@ function Get-PatchPlanDisplayLines {
     return @($lines)
 }
 
+function Get-RebootTargetInstallNote {
+    param($RebootTarget)
+
+    # Empty for a clean install, so the ordinary machine keeps an ordinary line and the one
+    # that needs a second look is the only one carrying a marker.
+    if ($null -eq $RebootTarget) {
+        return ''
+    }
+
+    $failedKbs = @(@(Get-ModelPropertyValue -InputObject $RebootTarget -Name 'failedUpdateKbs' -DefaultValue @()) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    $outcome = [string](Get-ModelPropertyValue -InputObject $RebootTarget -Name 'applyOutcome')
+    $isPartial = ($outcome -eq 'InstallSucceededWithErrors') -or ($failedKbs.Count -gt 0)
+
+    if ($isPartial) {
+        $approved = [int](Get-ModelPropertyValue -InputObject $RebootTarget -Name 'approvedUpdateCount' -DefaultValue 0)
+        $installed = [int](Get-ModelPropertyValue -InputObject $RebootTarget -Name 'installedUpdateCount' -DefaultValue 0)
+        $note = if ($approved -gt 0) {
+            'PARTIAL INSTALL: {0} of {1} update(s) installed' -f $installed, $approved
+        }
+        else {
+            'PARTIAL INSTALL: some updates failed'
+        }
+
+        if ($failedKbs.Count -gt 0) {
+            $note = '{0}; failed: {1}' -f $note, (($failedKbs | Select-Object -Unique) -join ', ')
+        }
+
+        return ('[{0}]' -f $note)
+    }
+
+    # Drift is the other way a restart can land on a machine that did not get everything it
+    # was approved for: the package moved between the plan and the apply and was never
+    # substituted. Same question for the operator, so the same kind of marker.
+    if ([bool](Get-ModelPropertyValue -InputObject $RebootTarget -Name 'requiresVerification' -DefaultValue $false)) {
+        return '[NEEDS VERIFICATION: less was installed than approved]'
+    }
+
+    return ''
+}
+
 function Get-RebootTargetDisplayLines {
     param($RebootTargets)
 
@@ -988,7 +1028,12 @@ function Get-RebootTargetDisplayLines {
 
         $rebootReason = [string](Get-ModelPropertyValue -InputObject $target -Name 'rebootReason')
         $reasonText = if ([string]::IsNullOrWhiteSpace($rebootReason)) { '' } else { (' ({0})' -f $rebootReason) }
-        $lines += ('- {0}{1}' -f (Get-ModelPropertyValue -InputObject $target -Name 'vmName'), $reasonText)
+
+        # Ahead of the reason, not after it: the reason line is long enough to be skimmed past.
+        $note = [string](Get-RebootTargetInstallNote -RebootTarget $target)
+        $noteText = if ([string]::IsNullOrWhiteSpace($note)) { '' } else { (' {0}' -f $note) }
+
+        $lines += ('- {0}{1}{2}' -f (Get-ModelPropertyValue -InputObject $target -Name 'vmName'), $noteText, $reasonText)
     }
 
     return @($lines)

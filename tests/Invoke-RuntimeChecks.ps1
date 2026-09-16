@@ -358,6 +358,83 @@ $partialCycle = [pscustomobject]@{
 }
 Assert-Equal -Actual (New-ApplyResultFromCycle -VMName 'VM05' -Cycle $partialCycle).outcome -Expected 'InstallSucceededWithErrors' -Message 'a partial install keeps its outcome despite the non-zero exit'
 
+# How much of what was approved actually went in. WUA's aggregate ResultCode 3 says only that
+# something failed, so without these counts a machine that installed two of four looked
+# identical to one that installed all four - including on the reboot checkpoint, which is the
+# last screen before a production restart.
+$countedCycle = [pscustomobject]@{
+    RunId = 'cycle-counted'
+    Mode = 'Apply'
+    AgentCompletionConfirmed = $true
+    AgentCompletionReason = 'synthetic terminal status'
+    AgentResult = [pscustomobject]@{ Completed = $true; ExitCode = 3; EndTime = (Get-Date) }
+    Status = [pscustomobject]@{
+        runId = 'cycle-counted'
+        outcome = 'InstallSucceededWithErrors'
+        finishedAt = '2026-09-16T18:55:00.0000000Z'
+        installResult = $null
+        pendingRebootAfter = $null
+        selectedUpdateCount = 4
+        errors = @()
+        updates = @(
+            [pscustomobject]@{ selected = $true; kbArticleIds = '5126149'; installResult = [pscustomobject]@{ result = 'Succeeded' } },
+            [pscustomobject]@{ selected = $true; kbArticleIds = '5122774'; installResult = [pscustomobject]@{ result = 'Failed' } },
+            [pscustomobject]@{ selected = $true; kbArticleIds = 'KB5122882'; installResult = $null },
+            [pscustomobject]@{ selected = $true; kbArticleIds = @(); updateId = 'no-kb-id'; installResult = [pscustomobject]@{ result = 'Failed' } },
+            [pscustomobject]@{ selected = $false; kbArticleIds = '2267602'; installResult = $null }
+        )
+    }
+}
+$countedResult = New-ApplyResultFromCycle -VMName 'VM05b' -Cycle $countedCycle
+Assert-Equal -Actual $countedResult.approvedUpdateCount -Expected 4 -Message 'the approved count comes from the agent selection, not from the update list'
+Assert-Equal -Actual $countedResult.installedUpdateCount -Expected 1 -Message 'only an update whose own install says Succeeded is counted as installed'
+Assert-Equal -Actual (@($countedResult.failedUpdateKbs) -join ',') -Expected 'KB5122774,KB5122882,no-kb-id' -Message 'a KB prefix is added once, an existing one is kept, and a package with no KB id falls back to its identity'
+
+# A selected update whose install never ran did not go in either, so it is named rather than
+# quietly dropped; an update nobody selected is not this run's business at all.
+Assert-Equal -Actual (@($countedResult.failedUpdateKbs) -contains 'KB2267602') -Expected $false -Message 'an unselected update is never counted as a failure'
+
+# The counts have to survive the failure branches too: a VM that ended badly still installed
+# whatever it installed, and that is what somebody reconciling it needs to know.
+$countedFailureCycle = [pscustomobject]@{
+    RunId = 'cycle-counted-failure'
+    Mode = 'Apply'
+    AgentCompletionConfirmed = $false
+    AgentCompletionReason = 'synthetic'
+    AgentResult = [pscustomobject]@{ Completed = $true; ExitCode = 1; EndTime = (Get-Date) }
+    Status = [pscustomobject]@{
+        runId = 'cycle-counted-failure'
+        outcome = 'InstallFailed'
+        finishedAt = '2026-09-16T18:55:00.0000000Z'
+        installResult = $null
+        pendingRebootAfter = $null
+        selectedUpdateCount = 2
+        errors = @()
+        updates = @(
+            [pscustomobject]@{ selected = $true; kbArticleIds = '5126149'; installResult = [pscustomobject]@{ result = 'Succeeded' } },
+            [pscustomobject]@{ selected = $true; kbArticleIds = '5122774'; installResult = [pscustomobject]@{ result = 'Failed' } }
+        )
+    }
+}
+$countedFailure = New-ApplyResultFromCycle -VMName 'VM05c' -Cycle $countedFailureCycle
+Assert-Equal -Actual $countedFailure.outcome -Expected 'Failed' -Message 'an unconfirmed agent is still a failure'
+Assert-Equal -Actual $countedFailure.installedUpdateCount -Expected 1 -Message 'a failed VM still reports what it managed to install'
+Assert-Equal -Actual (@($countedFailure.failedUpdateKbs) -join ',') -Expected 'KB5122774' -Message 'a failed VM still names what did not go in'
+
+# A status with no update list at all - an older agent, a cycle that died early - reads as
+# zero rather than throwing under StrictMode.
+$countlessCycle = [pscustomobject]@{
+    RunId = 'cycle-countless'
+    Mode = 'Apply'
+    AgentCompletionConfirmed = $true
+    AgentCompletionReason = 'synthetic terminal status'
+    AgentResult = [pscustomobject]@{ Completed = $true; ExitCode = 0; EndTime = (Get-Date) }
+    Status = [pscustomobject]@{ runId = 'cycle-countless'; outcome = 'InstallSucceeded'; finishedAt = '2026-09-16T18:55:00.0000000Z'; installResult = $null; pendingRebootAfter = $null; errors = @() }
+}
+$countlessResult = New-ApplyResultFromCycle -VMName 'VM05d' -Cycle $countlessCycle
+Assert-Equal -Actual $countlessResult.approvedUpdateCount -Expected 0 -Message 'a status without a selection count reads as zero'
+Assert-Equal -Actual (@($countlessResult.failedUpdateKbs).Count) -Expected 0 -Message 'a status without an update list names no failures'
+
 $exitCodeOnlyCycle = [pscustomobject]@{
     AgentResult = [pscustomobject]@{ Completed = $true; ExitCode = 0; EndTime = (Get-Date) }
     Status = [pscustomobject]@{ runId = 'cycle-exit-only'; outcome = 'InstallSucceeded'; finishedAt = '2026-08-22T10:00:00.0000000Z'; installResult = $null; pendingRebootAfter = $null; errors = @() }
@@ -801,6 +878,22 @@ Assert-Contains -Text ([string]$signalTargets[1].rebootReason) -Needle 'Pending 
 
 # An apply result with no signal list must keep the bare phrasing rather than gaining a stray
 # separator, because a resumed -PatchPlanPath run has no discovery records to draw signals from.
+# The install outcome has to reach the reboot target, or the checkpoint cannot tell a machine
+# that installed everything from one that installed half. The target is what both the console
+# list and the GUI window render from.
+$partialApplyResult = New-ApplyResultRecord -VMName 'VM12' -Outcome 'InstallSucceededWithErrors' -RebootRequired $true -RebootSignals @('pendingRebootAfter.componentBasedServicing') `
+    -AgentCompletionConfirmed $true -ApprovedUpdateCount 4 -InstalledUpdateCount 2 -FailedUpdateKbs @('KB5122774', 'KB5122882')
+$partialRebootTarget = @(Select-RebootRequiredApplyResults -ApplyResults @($partialApplyResult))[0]
+Assert-Equal -Actual $partialRebootTarget.applyOutcome -Expected 'InstallSucceededWithErrors' -Message 'the apply outcome travels to the reboot target'
+Assert-Equal -Actual $partialRebootTarget.approvedUpdateCount -Expected 4 -Message 'the approved count travels to the reboot target'
+Assert-Equal -Actual $partialRebootTarget.installedUpdateCount -Expected 2 -Message 'the installed count travels to the reboot target'
+Assert-Equal -Actual (@($partialRebootTarget.failedUpdateKbs) -join ',') -Expected 'KB5122774,KB5122882' -Message 'the failed packages travel to the reboot target'
+
+# A partial install is still a reboot target: without the restart, what did install is never
+# finalised. The next round re-discovers the machine and picks up what is left.
+Assert-Equal -Actual (@(Select-RebootRequiredApplyResults -ApplyResults @($partialApplyResult)).Count) -Expected 1 -Message 'a partial install is still restarted'
+Assert-Equal -Actual (@(Get-NextRoundTargetVMNames -ApplyResults @($partialApplyResult)) -contains 'VM12') -Expected $true -Message 'a partial install is a target of the next round'
+
 $unnamedSignalTargets = @(Select-RebootRequiredApplyResults -ApplyResults @((New-ApplyResultRecord -VMName 'VM09' -Outcome 'InstallSucceeded' -RebootRequired $true -AgentCompletionConfirmed $true)))
 Assert-Equal -Actual ([string]$unnamedSignalTargets[0].rebootReason) -Expected 'Reported after apply' -Message 'a reboot target without signals keeps the bare reason'
 
@@ -3194,6 +3287,8 @@ function ConvertTo-PatchSummaryRows {
 
         $emptySummaryText = Get-Content -LiteralPath (Join-Path $finalReportDirectory 'summary.md') -Raw
         Assert-Contains -Text $emptySummaryText -Needle '- VMs requiring reboot: 0' -Message 'an empty reboot target list is counted as zero, not skipped'
+        Assert-Contains -Text $emptySummaryText -Needle '- VMs partially installed: 0' -Message 'a fleet with no partial installs still counts them'
+        Assert-Contains -Text $emptySummaryText -Needle '## VMs partially installed' -Message 'the partial-install section is always present'
 
         # $null means "work it out from the apply results" and must survive the same way.
         $nullRebootThrew = $false
@@ -3205,6 +3300,18 @@ function ConvertTo-PatchSummaryRows {
         & $finalReportProbe $quietPlanRecords $quietApplyResults $finalReportDirectory @([pscustomobject]@{ vmName = 'VM01'; rebootRequired = $true; rebootReason = 'Reported after apply' }) 6>$null | Out-Null
         $populatedSummaryText = Get-Content -LiteralPath (Join-Path $finalReportDirectory 'summary.md') -Raw
         Assert-Contains -Text $populatedSummaryText -Needle '- VMs requiring reboot: 1' -Message 'a populated reboot target list is still counted'
+
+        # The report is where somebody reconciles a machine days later, so a partial install
+        # has to name what did not go in - the aggregate outcome never did.
+        $partialApplyResults = @([pscustomobject]@{
+            vmName = 'VM02'; action = 'Install'; outcome = 'InstallSucceededWithErrors'; installResult = 'SucceededWithErrors'
+            reason = ''; rebootRequired = $true; errors = @()
+            approvedUpdateCount = 4; installedUpdateCount = 2; failedUpdateKbs = @('KB5122774', 'KB5122882')
+        })
+        & $finalReportProbe $quietPlanRecords $partialApplyResults $finalReportDirectory @() 6>$null | Out-Null
+        $partialSummaryText = Get-Content -LiteralPath (Join-Path $finalReportDirectory 'summary.md') -Raw
+        Assert-Contains -Text $partialSummaryText -Needle '- VMs partially installed: 1' -Message 'a partial install is counted in the report'
+        Assert-Contains -Text $partialSummaryText -Needle '- VM02: installed 2 of 4; failed: KB5122774, KB5122882' -Message 'the report names the packages that did not go in'
         Assert-Contains -Text $populatedSummaryText -Needle 'VM01 (Reported after apply)' -Message 'a populated reboot target list is still listed with its reason'
     }
     finally {
