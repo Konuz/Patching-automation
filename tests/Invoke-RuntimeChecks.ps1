@@ -3302,6 +3302,23 @@ function ConvertTo-PatchSummaryRows {
     return @(@($PatchPlanRecords) | ForEach-Object { [pscustomobject]@{ VMName = $_.vmName; Action = $_.action } })
 }
 
+function Get-RecordFailedKbs {
+    param($Record)
+    $property = $Record.PSObject.Properties['failedUpdateKbs']
+    if ($null -eq $property) { return @() }
+    return @(@($property.Value) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+}
+
+function Test-ApplyRecordHasInstallShortfall {
+    param($Record)
+    return (@(Get-RecordFailedKbs -Record $Record).Count -gt 0)
+}
+
+function Get-InstallShortfallText {
+    param($Record)
+    return ('{0} of {1} update(s) installed; failed: {2}' -f [int]$Record.installedUpdateCount, [int]$Record.approvedUpdateCount, ((@(Get-RecordFailedKbs -Record $Record) | Select-Object -Unique) -join ', '))
+}
+
 '@ + $finalReportDefinition[0].Extent.Text + [Environment]::NewLine + 'Write-FinalReport -PatchPlanRecords $PlanRecords -ApplyResults $ApplyResults -CycleOutputDirectory $OutputDirectory -RebootTargets $RebootTargets')
 
         $quietPlanRecords = @([pscustomobject]@{ vmName = 'VM01'; action = 'NoSelectedUpdates'; reason = 'No selected updates apply.' })
@@ -3338,7 +3355,19 @@ function ConvertTo-PatchSummaryRows {
         & $finalReportProbe $quietPlanRecords $partialApplyResults $finalReportDirectory @() 6>$null | Out-Null
         $partialSummaryText = Get-Content -LiteralPath (Join-Path $finalReportDirectory 'summary.md') -Raw
         Assert-Contains -Text $partialSummaryText -Needle '- VMs partially installed: 1' -Message 'a partial install is counted in the report'
-        Assert-Contains -Text $partialSummaryText -Needle '- VM02: installed 2 of 4; failed: KB5122774, KB5122882' -Message 'the report names the packages that did not go in'
+        Assert-Contains -Text $partialSummaryText -Needle '- VM02: 2 of 4 update(s) installed; failed: KB5122774, KB5122882' -Message 'the report names the packages that did not go in'
+
+        # A retry pass can install everything the first pass left NotStarted. The outcome still
+        # carries the first pass's verdict, so the section must not print 'installed 4 of 4'
+        # under a heading that says something is missing.
+        $recoveredApplyResults = @([pscustomobject]@{
+            vmName = 'VM03'; action = 'Install'; outcome = 'InstallSucceededWithErrors'; installResult = 'SucceededWithErrors'
+            reason = ''; rebootRequired = $true; errors = @()
+            approvedUpdateCount = 4; installedUpdateCount = 4; failedUpdateKbs = @()
+        })
+        & $finalReportProbe $quietPlanRecords $recoveredApplyResults $finalReportDirectory @() 6>$null | Out-Null
+        $recoveredSummaryText = Get-Content -LiteralPath (Join-Path $finalReportDirectory 'summary.md') -Raw
+        Assert-Contains -Text $recoveredSummaryText -Needle '- VM03: everything approved installed' -Message 'an install that reported an error with nothing missing says so instead of counting a shortfall'
         Assert-Contains -Text $populatedSummaryText -Needle 'VM01 (Reported after apply)' -Message 'a populated reboot target list is still listed with its reason'
     }
     finally {

@@ -91,7 +91,7 @@ Execution flows through layered runtime scripts plus the offline planning model 
 3. **`scripts/Invoke-GuestOpsPatchValidation.ps1`** (orchestrator, runs on the stepping stone) — resolves one or many VM targets, connects to one or more semicolon-separated vCenters, runs discovery cycles over GuestOps, builds grouped update records, resolves selection from explicit `-SelectedUpdateKeys` or interactive grouped selection, writes a per-VM patch plan, asks for final confirmation, then applies selected groups. vCenter credentials are resolved into `VIServerCredentialMap`: explicit `-VIServerCredential` applies to every vCenter, otherwise prompts are grouped by FQDN domain and failed vCenter logins retry only that vCenter so the operator can enter local credentials. Discovery and apply run **in this process** as one fleet (see "In-process fleet" below), so a run holds a single vCenter session throughout; `Connect-VIServersWithCredentialMap` also reuses a session that is already connected, which is what makes `-KeepConnected` worth setting. Apply-result, fleet, round-decision and reboot-action semantics live in `scripts/OrchestratorRuntime.ps1` and are covered by `tests/Invoke-RuntimeChecks.ps1`; that helper also writes `reboot-actions.json`, `rounds.json` and the summaries. Keep PowerCLI/GuestOps calls and interactive prompts (`Read-Host`) outside it — its only side effects are local artifact writes. `-PatchPlanPath` resumes from a saved `patch-plan.json`: it skips discovery and group selection, shows the saved plan, asks for confirmation unless `-SkipConfirmation` is set (`Confirm-PatchPlan` settles that switch **before** it consults the prompt provider, so a non-interactive run never opens an approval window nobody is there to answer), runs apply against the selected updates in the plan, and stays **single-round** (there is no discovery to judge the starting state from, and the saved keys carry a `RevisionNumber` that will not match a later round's groups). After apply, the normal discovery-driven path evaluates reboot targets from both per-VM apply `rebootRequired` and the run's discovery `pendingRebootBefore.isPending`; the `-PatchPlanPath` resume path has no discovery records, so it only uses apply `rebootRequired`. If any VM requires reboot, it shows a separate VM list and requires the operator to type `REBOOT`; `-SkipConfirmation` never skips this reboot prompt, nor the follow-up prompt for `-RebootBatchSize`. Confirmed reboot is initiated inside the guest through GuestOps by running `guest/Request-GuestReboot.ps1`, which takes the guest run guard and then invokes `shutdown.exe /r /t 0 /c "PatchingGuestOps reboot after updates"` while holding it, limited by `-RebootBatchSize`.
 4. **`scripts/PatchPlanModel.ps1`** (offline model) — pure planning/reporting logic for update identity validation, default group selection, Failover Cluster skips, per-VM patch plans, summaries, and PlanOnly exit semantics. Keep it free of PowerCLI, GuestOps calls, `Read-Host`, and top-level runtime flow.
 5. **`scripts/GuestOpsLib.ps1`** (GuestOps helpers) — shared PowerCLI/GuestOps file transfer and process-run helpers. The guest agent cycle is split into `Start-VMAgentCycle` (upload + `StartProgramInGuest`), `Test-VMAgentCycleComplete` (one `ListProcessesInGuest`) and `Complete-VMAgentCycle` (download + parse). Those three are the whole cycle; the single-shot `Invoke-VMAgentCycle`/`Invoke-GuestAgentRun` that preceded them are gone, along with the needles that were keeping them alive after their last caller disappeared.
-6. **`guest/Run-LocalPatch.ps1`** (agent, runs *inside* the guest) — WUA COM only: `Microsoft.Update.Session` → searcher → downloader → installer. Writes `status.json` + `agent.log` to a unique cycle directory (`C:\ProgramData\PatchingGuestOps\<runId>`). **Never reboots** — it only reports `pendingReboot`. `Test-PendingReboot` gates `isPending` on the two servicing flags only — `Component Based Servicing\RebootPending` and `WindowsUpdate\Auto Update\RebootRequired` — because those are what Windows Update sets when a patch it installed still needs a restart. `PendingFileRenameOperations` is detected, filtered to non-blank entries (it is a REG_MULTI_SZ of source/destination pairs and a queued delete has an empty destination), and reported as `advisoryReasons`, but it never gates the prompt on its own: any installer can queue a rename, and it was observed as the only flag set on a fully patched guest with zero applicable updates, offering a reboot no update had asked for. `pendingReasons` names the gating flags that fired; the orchestrator carries them into the reboot target's `rebootReason` so the prompt says which flag it is acting on.
+6. **`guest/Run-LocalPatch.ps1`** (agent, runs *inside* the guest) — WUA COM only: `Microsoft.Update.Session` → searcher → downloader → installer. Writes `status.json` + `agent.log` to a unique cycle directory (`C:\ProgramData\PatchingGuestOps\<runId>`). **Never reboots** — it only reports `pendingReboot`. `Test-PendingReboot` gates `isPending` on the two servicing flags only — `Component Based Servicing\RebootPending` and `WindowsUpdate\Auto Update\RebootRequired` — because those are what Windows Update sets when a patch it installed still needs a restart. `PendingFileRenameOperations` is detected, filtered to non-blank entries (it is a REG_MULTI_SZ of source/destination pairs and a queued delete has an empty destination), and reported as `advisoryReasons`, but it never gates the prompt on its own: any installer can queue a rename, and it was observed as the only flag set on a fully patched guest with zero applicable updates, offering a reboot no update had asked for. `pendingReasons` names the gating flags that fired; the orchestrator carries them into the reboot target's `rebootReason` so the prompt says which flag it is acting on. The install itself is a bounded loop rather than a single `Install()` - see "One aborted package must not take the ones queued behind it".
 7. **`guest/GuestWorkspace.ps1`** (guard, runs *inside* the guest, **never uploaded** by the bootstrap) — creates the tool directory with a protected DACL and verifies owner, access rules, reparse points and the parent before anything is written to it, then seals it with a one-time token every later guest-side step re-verifies. Executed through `powershell.exe -Command` with an in-memory GZip payload; uploaded beside the agent and the boot-time helper only so *they* can re-check the seal. See "Securing the guest directory before the first upload".
 8. **`guest/GuestRunGuard.ps1`** (guard, runs *inside* the guest) — the one-run-per-guest lock and its coordination record; see "One run per guest".
 9. **`guest/Request-GuestReboot.ps1`** (runs *inside* the guest, **never uploaded**) — takes the run guard and invokes `shutdown.exe` while holding it.
@@ -704,6 +704,21 @@ the failure branches, so a VM that ended badly still reports what it managed to 
 they reach `summary.md` as a count and a section naming the packages. A clean install carries
 no marker, and a target from a record written before these fields existed carries none either.
 
+**The counts decide whether anything is missing, not the outcome.** Since the agent retries
+whatever WUA left NotStarted, "the install reported an error" and "something approved is
+missing" are no longer the same fact: a package recovered by a later pass leaves the first
+pass's verdict (`InstallSucceededWithErrors`) on the record with nothing at all missing, and
+`[PARTIAL INSTALL: 4 of 4 update(s) installed]` is a line nobody can act on. So
+`Test-ApplyRecordHasInstallShortfall` answers the question once - named failures, or fewer
+installed than approved - and `Get-InstallShortfallText` renders the numbers once. Both live
+in the model, because the reboot checkpoint, the console summary line and `summary.md` all ask
+it and must not answer differently. A record with **no counts** (written before they existed)
+falls back to its outcome, which is the reading it always had. Where the counts say nothing is
+missing but the outcome still reports a failure - a rejected EULA, or a package that failed one
+pass while the ones behind it were recovered in the next - the checkpoint says
+`[INSTALL REPORTED ERRORS: nothing approved is missing, see agent.log]` instead, and the run
+still exits 1.
+
 The helper and its JSON output use **one stable path per guest** (`Read-BootTime-<vm>.ps1`,
 `boot-time-<vm>.json`), overwritten on every attempt — per-attempt names would leave hundreds of
 files per VM per run behind on production servers. Because the output path is reused,
@@ -759,6 +774,43 @@ baseline/observed boot times, validation status, wait/timeout data, operator dec
 latest error. `summary.md` separates confirmed, unverified/forced, timeout, initiation-error,
 skipped, and not-started-after-abort restarts. A confirmed boot-time gate proves OS reboot and
 GuestOps/VMware Tools availability only; application readiness remains out of scope.
+
+### One aborted package must not take the ones queued behind it
+
+WUA works an update collection in order and stops working it when a package aborts: everything
+behind it comes back `NotStarted` with HRESULT zero, never attempted. A fleet run installed a
+.NET update, hit an aborted SQL cumulative update, and never even tried the OS cumulative
+update standing behind it - in 72 seconds, then reported the same "reboot required" as the
+machines that had installed everything.
+
+So the agent's install is a **bounded pass loop**, not a single `Install()`. Each pass hands
+WUA a fresh collection; whatever comes back `NotStarted` (result code 0, and only that - a
+success or a real failure is that package's own final answer) is offered again in the next
+pass. `$installPassLimit` is 3, and the loop also stops early when a pass moved nothing (it
+will not move anything next time either) or when a pass asked for a restart (the guest has to
+come back first; the next round picks up the rest).
+
+It is deliberately **not** one `Install()` per update: WUA resolves install order and
+dependencies within a collection, and taking that away would trade this failure for packages
+refused as not-yet-applicable.
+
+Three things about the result are load-bearing:
+
+- **The first pass is the aggregate.** `status.installResult` keeps its verdict on the batch as
+  approved - a package that failed there did fail, and a later pass recovering the ones queued
+  behind it does not unmake that. It is built as its **own** object, so merging into it cannot
+  rewrite what the first pass actually reported.
+- **`rebootRequired` is the one field merged across passes.** The reboot phase reads exactly
+  that field, so a restart first asked for by a retry pass would otherwise be dropped where it
+  matters most.
+- **A later pass that failed downgrades the outcome.** The first pass's verdict cannot express
+  it, and it must not hide behind a first pass that succeeded - so it is folded in alongside
+  the existing EULA/per-update error check.
+
+`status.json` gains `installPasses`: one record per pass with `pass`, `attemptedCount` and that
+pass's own `installResult`. An ordinary install is one pass and one record. Offline coverage is
+in `tests/Invoke-SafetyRegressionChecks.ps1`, which drives the fixture's WUA installer through a
+scripted sequence of per-pass results and asserts on which package ended up in which pass.
 
 ### The contract between orchestrator and agent
 

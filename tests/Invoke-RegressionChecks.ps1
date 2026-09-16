@@ -85,10 +85,13 @@ $agentAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path
 $classification = $agentAst.Find({ param($n)
     $n -is [System.Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -eq '[int]$installResult.ResultCode -eq 2'
 }, $true)
-foreach ($errorStage in @('Selection', 'PerUpdate', 'None')) {
-    $status = [ordered]@{ outcome = ''; errors = @(); updates = @() }
+foreach ($errorStage in @('Selection', 'PerUpdate', 'RetryPass', 'None')) {
+    $status = [ordered]@{ outcome = ''; errors = @(); updates = @(); installPasses = @() }
     if ($errorStage -eq 'Selection') { $status.errors = @([pscustomobject]@{ stage = 'AcceptEulaOrSelect'; message = 'EULA failed for one selected update' }) }
     if ($errorStage -eq 'PerUpdate') { $status.updates = @([pscustomobject]@{ errors = @([pscustomobject]@{ stage = 'ReadInstallResult'; message = 'Result unavailable' }) }) }
+    # A retry pass that failed on its own: the first pass succeeded, so its verdict cannot
+    # express that, and it must not disappear behind that success.
+    $failedRetryPassCount = $(if ($errorStage -eq 'RetryPass') { 1 } else { 0 })
     $installResult = [pscustomobject]@{ ResultCode = 2 }
     $scriptExitCode = 99
     . ([scriptblock]::Create($classification.Extent.Text))

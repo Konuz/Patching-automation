@@ -225,6 +225,12 @@ function Invoke-AgentFixture {
         # invocation), the directory still carrying this cycle's seal, or a seal the guest
         # refused because the directory is no longer the one that was secured.
         [ValidateSet('None', 'Ok', 'Refused')][string]$WorkspaceSeal = 'Ok',
+        # What WUA returns from each Install() call, in order; the last entry answers every pass
+        # after it. Each entry is @{ ResultCode = <int>; RebootRequired = <bool>; Updates = @{
+        # '<identityKey>' = <per-update code> } }, keyed by identity rather than by position
+        # because a retry pass receives a shorter collection and what these tests are about is
+        # which package ended up in which pass. Unlisted updates answer Succeeded.
+        $InstallPasses = $null,
         [bool]$ClusterMembershipUnknown = $false)
     # Only external effects are mocked: local probes, artifact I/O, and WUA COM.
     function Write-AgentLog { param($Message) }
@@ -305,16 +311,42 @@ function Invoke-AgentFixture {
     $operationResult | Add-Member ScriptMethod GetUpdateResult { param($Index) [pscustomobject]@{ ResultCode = 2; RebootRequired = $false } }
     $downloader = [pscustomobject]@{ ClientApplicationID = ''; Updates = $null; Value = $operationResult; Called = $false }
     $downloader | Add-Member ScriptMethod Download { $this.Called = $true; $this.Value }
-    $installer = [pscustomobject]@{ ClientApplicationID = ''; Updates = $null; AllowSourcePrompts = $true; Called = $false; Value = $operationResult }
-    $installer | Add-Member ScriptMethod Install { $this.Called = $true; $this.Value }
+    # Wrapped as a whole, not per branch: an if-expression assigns its branch's pipeline
+    # output, so a one-entry spec list would arrive here as a bare hashtable.
+    $effectiveInstallPasses = @(
+        if ($null -eq $InstallPasses) { @{ ResultCode = 2; RebootRequired = $PendingReboot; Updates = @{} } }
+        else { @($InstallPasses) }
+    )
+    $installer = [pscustomobject]@{ ClientApplicationID = ''; Updates = $null; AllowSourcePrompts = $true; Called = $false; PassSpecs = $effectiveInstallPasses; PassIndex = 0; PassKeys = @() }
+    $installer | Add-Member ScriptMethod Install {
+        $this.Called = $true
+        $spec = $this.PassSpecs[[Math]::Min($this.PassIndex, $this.PassSpecs.Count - 1)]
+        $this.PassIndex++
+        $passKeys = @($this.Updates.AddedKeys)
+        $this.PassKeys += , $passKeys
+        $perUpdate = @{}
+        foreach ($passKey in $passKeys) {
+            $perUpdate[$passKey] = $(if ($spec.Updates.ContainsKey($passKey)) { [int]$spec.Updates[$passKey] } else { 2 })
+        }
+        $passResult = [pscustomobject]@{ ResultCode = [int]$spec.ResultCode; RebootRequired = [bool]$spec.RebootRequired; PassKeys = $passKeys; PerUpdate = $perUpdate }
+        $passResult | Add-Member ScriptMethod GetUpdateResult { param($Index) [pscustomobject]@{ ResultCode = [int]$this.PerUpdate[$this.PassKeys[$Index]]; RebootRequired = $false } }
+        return $passResult
+    }
     $session = [pscustomobject]@{ ClientApplicationID = ''; Searcher = $searcher; Downloader = $downloader; Installer = $installer }
     $session | Add-Member ScriptMethod CreateUpdateSearcher { $this.Searcher }
     $session | Add-Member ScriptMethod CreateUpdateDownloader { $this.Downloader }
     $session | Add-Member ScriptMethod CreateUpdateInstaller { $this.Installer }
     # Records WHICH updates were added, not just how many: the whole point of the drift tests is
-    # the exact collection handed to Download and Install.
-    $collection = [pscustomobject]@{ Count = 0; AddedKeys = @() }
-    $collection | Add-Member ScriptMethod Add { param($Value) $this.AddedKeys += [string]$Value.IdentityKeyText; $this.Count++; return ($this.Count - 1) }
+    # the exact collection handed to Download and Install. A fresh collection per request rather
+    # than one shared object, because the agent builds a separate collection for each install
+    # pass - a shared one would have a retry pass append to the selection it was built from.
+    $script:updateCollections = @()
+    function New-FixtureUpdateCollection {
+        $created = [pscustomobject]@{ Count = 0; AddedKeys = @(); Items = @() }
+        $created | Add-Member ScriptMethod Add { param($Value) $this.AddedKeys += [string]$Value.IdentityKeyText; $this.Items += $Value; $this.Count++; return ($this.Count - 1) }
+        $created | Add-Member ScriptMethod Item { param($Index) $this.Items[$Index] }
+        return $created
+    }
     function New-Object {
         param([Parameter(Position = 0)][string]$TypeName, [string]$ComObject)
         if (-not $PSBoundParameters.ContainsKey('ComObject')) {
@@ -322,7 +354,7 @@ function Invoke-AgentFixture {
         }
         switch ($ComObject) {
             'Microsoft.Update.Session' { $session }
-            'Microsoft.Update.UpdateColl' { $collection }
+            'Microsoft.Update.UpdateColl' { $createdCollection = New-FixtureUpdateCollection; $script:updateCollections += $createdCollection; $createdCollection }
             default { throw "Unexpected object request: $ComObject" }
         }
     }
@@ -344,7 +376,10 @@ function Invoke-AgentFixture {
         Status = $payload; ExitCode = $scriptExitCode; InstallCalled = $installer.Called; DownloadCalled = $downloader.Called
         State = $states[0].state; Cycle = $cycle; ApplyResult = $applyResult
         GuardCompletions = @($script:guardCompletions); GuardReleases = $script:guardReleases
-        InstalledKeys = @($collection.AddedKeys)
+        InstalledKeys = @(if ($script:updateCollections.Count -eq 0) { @() } else { @($script:updateCollections[0].AddedKeys) })
+        InstallPasses = @(Get-ObjectPropertyValue -InputObject $payload -Path @('installPasses') -DefaultValue @())
+        InstallPassKeys = @($installer.PassKeys)
+        InstallCallCount = [int]$installer.PassIndex
         DownloaderKeys = @(if ($null -eq $downloader.Updates) { @() } else { @($downloader.Updates.AddedKeys) })
         InstallerKeys = @(if ($null -eq $installer.Updates) { @() } else { @($installer.Updates.AddedKeys) })
     }
@@ -486,6 +521,123 @@ $eulaFailure = Invoke-AgentFixture -SearchUpdateIdentities @($identityA1, $ident
 Assert-Equal (@($eulaFailure.InstallerKeys) -join ',') $keyA1 'a refused EULA drops only its own update'
 Assert-Equal (@($eulaFailure.Status.errors).Count -gt 0) $true 'a refused EULA is a real error, not drift'
 Assert-Equal ([bool]$eulaFailure.Status.selectionDrift) $false 'a refused EULA is not selection drift'
+
+# --- one aborted package must not take the ones queued behind it -------------------------------
+# WUA works a collection in order and stops when a package aborts: everything behind it comes back
+# NotStarted with HRESULT zero, never attempted. A fleet run installed a .NET update, hit an
+# aborted SQL CU, and never even tried the OS cumulative update standing behind it - in 72 seconds,
+# reporting the same 'reboot required' as the machines that had installed everything. So whatever
+# WUA leaves NotStarted is offered again in its own pass. These assertions are on which package
+# ended up in which pass, because that is the whole mechanism.
+
+$keyC1 = 'cccccccc-3333-3333-3333-333333333333|1'
+$keyD1 = 'dddddddd-4444-4444-4444-444444444444|1'
+$identityC1 = [pscustomobject]@{ UpdateID = 'cccccccc-3333-3333-3333-333333333333'; RevisionNumber = 1 }
+$identityD1 = [pscustomobject]@{ UpdateID = 'dddddddd-4444-4444-4444-444444444444'; RevisionNumber = 1 }
+
+function Get-FixtureUpdateInstallCode {
+    param($Fixture, [string]$Key)
+
+    # -1 means the agent recorded no install result for this update at all, which is a different
+    # fact from WUA answering NotStarted (0) and must not be allowed to look like it.
+    $records = @(@($Fixture.Status.updates) | Where-Object { [string]$_.identityKey -eq $Key })
+    if ($records.Count -eq 0 -or $null -eq $records[0].installResult) {
+        return -1
+    }
+
+    return [int]$records[0].installResult.resultCode
+}
+
+$abortedBatch = Invoke-AgentFixture -SearchUpdateIdentities @($identityA1, $identityB1, $identityC1, $identityD1) `
+    -SelectedKeys @($keyA1, $keyB1, $keyC1, $keyD1) `
+    -InstallPasses @(
+        @{ ResultCode = 3; RebootRequired = $false; Updates = @{ $keyA1 = 2; $keyB1 = 5; $keyC1 = 0; $keyD1 = 0 } },
+        @{ ResultCode = 2; RebootRequired = $false; Updates = @{} }
+    )
+Assert-Equal $abortedBatch.InstallCallCount 2 'the updates WUA left NotStarted are offered again'
+Assert-Equal ((@($abortedBatch.InstallPassKeys[0]) | Sort-Object) -join ',') ((@($keyA1, $keyB1, $keyC1, $keyD1) | Sort-Object) -join ',') 'the first pass is still the whole approved batch'
+Assert-Equal ((@($abortedBatch.InstallPassKeys[1]) | Sort-Object) -join ',') ((@($keyC1, $keyD1) | Sort-Object) -join ',') 'the retry pass holds exactly the updates that were never attempted'
+Assert-Equal (@($abortedBatch.InstallPassKeys[1]) -contains $keyB1) $false 'a package that actually failed is never retried'
+Assert-Equal (@($abortedBatch.InstallPassKeys[1]) -contains $keyA1) $false 'a package that succeeded is never reinstalled'
+Assert-Equal (Get-FixtureUpdateInstallCode -Fixture $abortedBatch -Key $keyC1) 2 'an update recovered by the retry pass records its own success'
+Assert-Equal (Get-FixtureUpdateInstallCode -Fixture $abortedBatch -Key $keyB1) 5 'the aborted package keeps its own failure'
+Assert-Equal (@($abortedBatch.InstallPasses).Count) 2 'every pass is recorded in status.json'
+Assert-Equal ([int]$abortedBatch.InstallPasses[0].attemptedCount) 4 'the first pass records how many updates it was given'
+Assert-Equal ([int]$abortedBatch.InstallPasses[1].attemptedCount) 2 'the retry pass records how many updates it was given'
+Assert-Equal ([string]$abortedBatch.InstallPasses[0].installResult.result) 'SucceededWithErrors' 'each pass records what WUA said about it'
+Assert-Equal ([string]$abortedBatch.InstallPasses[1].installResult.result) 'Succeeded' 'the retry pass records its own verdict'
+Assert-Equal ([string]$abortedBatch.Status.installResult.result) 'SucceededWithErrors' 'the aggregate stays the first pass verdict on the approved batch'
+Assert-Equal $abortedBatch.Status.outcome 'InstallSucceededWithErrors' 'a package that failed still fails the run'
+Assert-Equal $abortedBatch.ExitCode 1 'a package that failed still exits non-zero'
+Assert-Equal ([int]$abortedBatch.ApplyResult.approvedUpdateCount) 4 'the apply result counts what was approved'
+Assert-Equal ([int]$abortedBatch.ApplyResult.installedUpdateCount) 3 'the retry pass is reflected in what the apply result says went in'
+Assert-Equal ((@($abortedBatch.ApplyResult.failedUpdateKbs)) -join ',') 'bbbbbbbb-2222-2222-2222-222222222222' 'only the package that actually failed is named'
+
+# An ordinary install is one pass and nothing more: the retry exists for the batch WUA stopped
+# working, not as a second install on every guest in the fleet.
+$singlePass = Invoke-AgentFixture -SearchUpdateIdentities @($identityA1, $identityB1) -SelectedKeys @($keyA1, $keyB1)
+Assert-Equal $singlePass.InstallCallCount 1 'a clean install is installed once'
+Assert-Equal (@($singlePass.InstallPasses).Count) 1 'a clean install records one pass'
+Assert-Equal $singlePass.Status.outcome 'InstallSucceeded' 'a clean install is still a clean install'
+
+# A pass that moved nothing will not move anything next time either. Without this the loop would
+# spend the whole budget re-offering a batch WUA is refusing outright.
+$noProgress = Invoke-AgentFixture -SearchUpdateIdentities @($identityA1, $identityB1) -SelectedKeys @($keyA1, $keyB1) `
+    -InstallPasses @(@{ ResultCode = 4; RebootRequired = $false; Updates = @{ $keyA1 = 0; $keyB1 = 0 } })
+Assert-Equal $noProgress.InstallCallCount 1 'a pass that installed nothing is not repeated'
+Assert-Equal $noProgress.Status.outcome 'InstallFailed' 'a batch WUA never started is a failed install'
+
+# A pass that asked for a restart must not be followed by more installing in the same session:
+# the guest has to come back first, and the next round picks up what is left.
+$rebootMidBatch = Invoke-AgentFixture -SearchUpdateIdentities @($identityA1, $identityB1, $identityC1) -SelectedKeys @($keyA1, $keyB1, $keyC1) `
+    -InstallPasses @(
+        @{ ResultCode = 3; RebootRequired = $true; Updates = @{ $keyA1 = 2; $keyB1 = 0; $keyC1 = 0 } },
+        @{ ResultCode = 2; RebootRequired = $false; Updates = @{} }
+    )
+Assert-Equal $rebootMidBatch.InstallCallCount 1 'a pass that requires a restart ends the loop'
+Assert-Equal ([bool]$rebootMidBatch.ApplyResult.rebootRequired) $true 'the restart that pass asked for still reaches the reboot phase'
+
+# The loop is bounded whether or not it is converging: three passes, then the next round.
+$slowConvergence = Invoke-AgentFixture -SearchUpdateIdentities @($identityA1, $identityB1, $identityC1, $identityD1) `
+    -SelectedKeys @($keyA1, $keyB1, $keyC1, $keyD1) `
+    -InstallPasses @(
+        @{ ResultCode = 3; RebootRequired = $false; Updates = @{ $keyB1 = 0; $keyC1 = 0; $keyD1 = 0 } },
+        @{ ResultCode = 3; RebootRequired = $false; Updates = @{ $keyC1 = 0; $keyD1 = 0 } },
+        @{ ResultCode = 3; RebootRequired = $false; Updates = @{ $keyD1 = 0 } },
+        @{ ResultCode = 2; RebootRequired = $false; Updates = @{} }
+    )
+Assert-Equal $slowConvergence.InstallCallCount 3 'the install pass limit bounds the loop'
+Assert-Equal (Get-FixtureUpdateInstallCode -Fixture $slowConvergence -Key $keyD1) 0 'an update still NotStarted at the limit keeps that answer for the next round'
+Assert-Equal ([int]$slowConvergence.ApplyResult.installedUpdateCount) 3 'what the passes did install is still counted'
+
+# The regression this could have introduced: the aggregate describes the first pass, and the
+# reboot phase reads exactly that field. A restart first asked for by a retry pass would have
+# been dropped where it matters most.
+$lateReboot = Invoke-AgentFixture -SearchUpdateIdentities @($identityA1, $identityB1) -SelectedKeys @($keyA1, $keyB1) `
+    -InstallPasses @(
+        @{ ResultCode = 2; RebootRequired = $false; Updates = @{ $keyB1 = 0 } },
+        @{ ResultCode = 2; RebootRequired = $true; Updates = @{} }
+    )
+Assert-Equal ([bool]$lateReboot.Status.installResult.rebootRequired) $true 'a restart asked for only by a retry pass still reaches the aggregate'
+Assert-Equal ([bool]$lateReboot.InstallPasses[0].installResult.rebootRequired) $false 'merging into the aggregate leaves the first pass own record alone'
+Assert-Equal ([bool]$lateReboot.InstallPasses[1].installResult.rebootRequired) $true 'the pass that asked for the restart is the one that records it'
+Assert-Equal ([bool]$lateReboot.ApplyResult.rebootRequired) $true 'a restart asked for only by a retry pass still reaches the reboot phase'
+Assert-Equal $lateReboot.Status.outcome 'InstallSucceeded' 'a recovered batch is a successful install'
+Assert-Equal $lateReboot.ExitCode 0 'a recovered batch exits zero'
+Assert-Equal ([int]$lateReboot.ApplyResult.installedUpdateCount) 2 'a recovered batch reports everything approved as installed'
+
+# A retry pass failing on its own is not something the first pass verdict can express, and it
+# must not hide behind a first pass that succeeded.
+$failedRetry = Invoke-AgentFixture -SearchUpdateIdentities @($identityA1, $identityB1) -SelectedKeys @($keyA1, $keyB1) `
+    -InstallPasses @(
+        @{ ResultCode = 2; RebootRequired = $false; Updates = @{ $keyB1 = 0 } },
+        @{ ResultCode = 4; RebootRequired = $false; Updates = @{ $keyB1 = 4 } }
+    )
+Assert-Equal $failedRetry.Status.outcome 'InstallSucceededWithErrors' 'a retry pass that failed downgrades the outcome'
+Assert-Equal $failedRetry.ExitCode 1 'a retry pass that failed makes the run exit non-zero'
+Assert-Equal ([int]$failedRetry.ApplyResult.installedUpdateCount) 1 'only what installed is counted'
+Assert-Equal (Test-ApplyRecordHasInstallShortfall -Record $failedRetry.ApplyResult) $true 'a package that is still missing is a shortfall'
+Assert-Equal (Test-ApplyRecordHasInstallShortfall -Record $lateReboot.ApplyResult) $false 'a recovered batch is not a shortfall'
 
 # --- a restarting guest is retried once inside the phase, nothing else is ------------------------
 # The real Invoke-GuestAgentFleet, with vSphere and the poll loop stubbed out. What is under test is

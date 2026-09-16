@@ -596,6 +596,34 @@ Assert-Equal -Actual (Get-RebootTargetInstallNote -RebootTarget ([pscustomobject
 $namedFailureNote = [string](Get-RebootTargetInstallNote -RebootTarget ([pscustomobject]@{ vmName = 'VM05'; applyOutcome = 'Failed'; approvedUpdateCount = 0; failedUpdateKbs = @('KB5000001') }))
 Assert-True -Condition ($namedFailureNote.Contains('failed: KB5000001')) -Message 'named failures mark the target whatever the outcome says'
 
+# The agent retries whatever WUA left NotStarted, so 'the install reported an error' and
+# 'something approved is missing' stopped being the same fact: a package recovered by a retry
+# pass leaves the first pass's verdict on the record with nothing at all missing. The counts
+# decide, and '[PARTIAL INSTALL: 4 of 4 update(s) installed]' is a line nobody can act on.
+$recoveredTarget = [pscustomobject]@{
+    vmName = 'VM06'
+    rebootReason = 'Reported after apply: installResult.rebootRequired'
+    applyOutcome = 'InstallSucceededWithErrors'
+    approvedUpdateCount = 4
+    installedUpdateCount = 4
+    failedUpdateKbs = @()
+}
+Assert-Equal -Actual (Test-ApplyRecordHasInstallShortfall -Record $recoveredTarget) -Expected $false -Message 'everything approved installed is not a shortfall, whatever the outcome says'
+Assert-Equal -Actual (Get-RebootTargetInstallNote -RebootTarget $recoveredTarget) -Expected '[INSTALL REPORTED ERRORS: nothing approved is missing, see agent.log]' -Message 'an install that reported an error with nothing missing says so instead of counting a shortfall'
+
+# The reverse holds too: the counts outrank a successful-looking outcome.
+Assert-Equal -Actual (Test-ApplyRecordHasInstallShortfall -Record ([pscustomobject]@{ applyOutcome = 'InstallSucceeded'; approvedUpdateCount = 4; installedUpdateCount = 3; failedUpdateKbs = @() })) -Expected $true -Message 'fewer installed than approved is a shortfall whatever the outcome says'
+Assert-Equal -Actual (Test-ApplyRecordHasInstallShortfall -Record $null) -Expected $false -Message 'a null record is not a shortfall'
+
+# No counts at all is the absence of an answer, not proof of a clean install: a record written
+# before they existed keeps its old reading, which came from the outcome. An apply result names
+# that field 'outcome' and a reboot target names it 'applyOutcome'; both are read.
+Assert-Equal -Actual (Test-ApplyRecordHasInstallShortfall -Record ([pscustomobject]@{ outcome = 'InstallSucceededWithErrors' })) -Expected $true -Message 'a record with no counts falls back to its own outcome'
+Assert-Equal -Actual (Test-ApplyRecordHasInstallShortfall -Record ([pscustomobject]@{ outcome = 'InstallSucceeded' })) -Expected $false -Message 'a successful record with no counts is not a shortfall'
+
+Assert-Equal -Actual (Get-InstallShortfallText -Record ([pscustomobject]@{ approvedUpdateCount = 4; installedUpdateCount = 2; failedUpdateKbs = @('KB5122774', 'KB5122774', 'KB5122882') })) -Expected '2 of 4 update(s) installed; failed: KB5122774, KB5122882' -Message 'the shortfall text carries the counts and names each package once'
+Assert-Equal -Actual (Get-InstallShortfallText -Record ([pscustomobject]@{ approvedUpdateCount = 0; installedUpdateCount = 0; failedUpdateKbs = @() })) -Expected 'some updates failed' -Message 'a record with no counts keeps the wording it had'
+
 Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $true -AvailableUpdateCount 0 -HasErrors $false) -Expected 'UpToDate' -Message 'discovery status: successful with zero updates is up-to-date'
 Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $true -AvailableUpdateCount 3 -HasErrors $false) -Expected 'UpdatesFound' -Message 'discovery status: successful with updates is updates-found'
 Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $false -AvailableUpdateCount 0 -HasErrors $true) -Expected 'Failed' -Message 'discovery status: errors make discovery failed'

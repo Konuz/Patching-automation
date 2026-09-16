@@ -1484,17 +1484,14 @@ function Write-PatchingSummary {
             'Partial' {
                 # The counts, not just the word: 'some updates failed' reads the same whether
                 # one of twelve failed or eleven did, and the operator decides on that number.
-                $approved = [int](Get-ObjectPropertyValue -InputObject $result -Path @('approvedUpdateCount') -DefaultValue 0)
-                $installed = [int](Get-ObjectPropertyValue -InputObject $result -Path @('installedUpdateCount') -DefaultValue 0)
-                $failedKbs = @(@(Get-ObjectPropertyValue -InputObject $result -Path @('failedUpdateKbs') -DefaultValue @()) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
-                $label = if ($approved -gt 0) {
-                    'Partially installed ({0} of {1} update(s) installed)' -f $installed, $approved
+                # A retry pass can also recover everything the first pass left NotStarted - the
+                # install reported an error, nothing approved is missing, and calling that
+                # 'partially installed' sends somebody looking for a package that did go in.
+                $label = if (Test-ApplyRecordHasInstallShortfall -Record $result) {
+                    'Partially installed ({0})' -f (Get-InstallShortfallText -Record $result)
                 }
                 else {
-                    'Partially installed (some updates failed)'
-                }
-                if ($failedKbs.Count -gt 0) {
-                    $label = '{0} - failed: {1}' -f $label, (($failedKbs | Select-Object -Unique) -join ', ')
+                    'Installed, install reported errors (nothing approved is missing)'
                 }
                 $color = 'DarkYellow'
             }
@@ -1581,11 +1578,12 @@ function Write-FinalReport {
     }
     else {
         foreach ($partialResult in $partial) {
-            $approved = [int](Get-ObjectPropertyValue -InputObject $partialResult -Path @('approvedUpdateCount') -DefaultValue 0)
-            $installed = [int](Get-ObjectPropertyValue -InputObject $partialResult -Path @('installedUpdateCount') -DefaultValue 0)
-            $failedKbs = @(@(Get-ObjectPropertyValue -InputObject $partialResult -Path @('failedUpdateKbs') -DefaultValue @()) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
-            $failedText = if ($failedKbs.Count -eq 0) { 'not named by the agent' } else { (($failedKbs | Select-Object -Unique) -join ', ') }
-            $lines += ('- {0}: installed {1} of {2}; failed: {3}' -f $partialResult.vmName, $installed, $approved, $failedText)
+            if (Test-ApplyRecordHasInstallShortfall -Record $partialResult) {
+                $lines += ('- {0}: {1}' -f $partialResult.vmName, (Get-InstallShortfallText -Record $partialResult))
+            }
+            else {
+                $lines += ('- {0}: everything approved installed; the install still reported an error - see agent.log' -f $partialResult.vmName)
+            }
         }
     }
     $lines += ''

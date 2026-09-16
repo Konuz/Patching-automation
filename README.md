@@ -209,6 +209,28 @@ Krok po kroku:
    zapisanych przez agenta; zbiorcze `installResult` mówi tylko, że coś zawiodło, nigdy ile ani
    co. Te same liczby trafiają do `summary.md` (sekcja *VMs partially installed*). Dryf wyboru
    dostaje własny znacznik `[NEEDS VERIFICATION: less was installed than approved]`.
+
+   **Jedna przerwana paczka nie może zabrać tych, które stoją za nią w kolejce.** WUA
+   przetwarza kolekcję po kolei i przestaje ją przetwarzać, gdy któraś paczka zostanie zerwana:
+   wszystko za nią wraca jako `NotStarted` z HRESULT zero — nigdy nawet nie spróbowano. Tak
+   właśnie jeden przebieg zainstalował aktualizację .NET, trafił na zerwany CU SQL-a i nie tknął
+   cumulative update systemu, który stał za nim — w 72 sekundy, po czym zgłosił dokładnie ten sam
+   „restart wymagany" co maszyny, które zainstalowały wszystko. Dlatego instalacja jest
+   **ograniczoną pętlą przebiegów**, a nie pojedynczym `Install()`: to, co WUA zostawiło jako
+   `NotStarted`, dostaje własny przebieg (limit 3). Pętla kończy się wcześniej, gdy przebieg
+   niczego nie ruszył albo gdy poprosił o restart — wtedy resztę bierze kolejna runda. Świadomie
+   **nie** jest to jeden `Install()` na aktualizację: WUA rozstrzyga kolejność i zależności
+   wewnątrz kolekcji. Wynik zbiorczy zostaje wynikiem **pierwszego** przebiegu (paczka, która
+   zawiodła, zawiodła), z jednym wyjątkiem: `rebootRequired` jest sumowane po wszystkich
+   przebiegach, bo faza restartu czyta dokładnie to pole. Każdy przebieg trafia do `status.json`
+   jako `installPasses`.
+
+   **O brakach decydują liczniki, nie wynik zbiorczy.** Odkąd agent ponawia to, co zostało
+   `NotStarted`, „instalacja zgłosiła błąd" i „brakuje czegoś z zatwierdzonych" to już nie ten sam
+   fakt. Jeśli liczniki mówią, że weszło wszystko, a wynik i tak zgłasza błąd (odrzucona EULA albo
+   paczka, która zawiodła w jednym przebiegu, podczas gdy stojące za nią odzyskał następny), lista
+   restartu pokazuje `[INSTALL REPORTED ERRORS: nothing approved is missing, see agent.log]`
+   zamiast znacznika częściowej instalacji — a przebieg i tak kończy się kodem 1.
 8. **Restart** — jeśli któraś maszyna zgłosi `rebootRequired` po apply albo już w discovery miała
    `pendingRebootBefore.isPending=true`, skrypt pokazuje listę i prosi o wpisanie **`REBOOT`**
    (samo `-SkipConfirmation` tego promptu **nie** pomija). W trybie GUI to **osobne okno** z tą

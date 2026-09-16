@@ -557,6 +557,10 @@ $status = [ordered]@{
     searchResult = $null
     downloadResult = $null
     installResult = $null
+    # One record per install pass. Empty for a run that never reached the installer, one
+    # entry for the ordinary case, more when WUA left updates NotStarted and they were
+    # offered again. installResult stays the first pass's verdict on the approved batch.
+    installPasses = @()
     pendingReboot = $null
     pendingRebootBefore = $null
     pendingRebootAfter = $null
@@ -828,30 +832,123 @@ try {
                 $installer = $updateSession.CreateUpdateInstaller()
                 $installer.ClientApplicationID = 'PatchingGuestOpsPhase0b'
                 $installer.AllowSourcePrompts = $false
-                $installer.Updates = $selectedUpdates
-                $installResult = $installer.Install()
-                $status.installResult = New-OperationResult -Result $installResult
 
-                for ($selectedIndex = 0; $selectedIndex -lt $selectedUpdates.Count; $selectedIndex++) {
-                    $searchIndex = $selectedSearchIndexes[$selectedIndex]
-                    try {
-                        $perUpdateInstall = $installResult.GetUpdateResult($selectedIndex)
-                        $status.updates[$searchIndex].installResult = New-OperationResult -Result $perUpdateInstall
+                # One Install() call for the whole batch means one package that aborts can
+                # leave every package behind it untouched: WUA stops working the collection and
+                # reports the rest as NotStarted, HRESULT zero, never attempted. That is how a
+                # run installed a .NET update, hit an aborted SQL CU, and never even tried the
+                # OS cumulative update standing behind it. So whatever WUA leaves NotStarted is
+                # offered again in its own pass.
+                #
+                # Deliberately not one Install() per update: WUA resolves install order and
+                # dependencies within a collection, and taking that away would trade this
+                # failure for packages refused as not-yet-applicable.
+                $installPassLimit = 3
+                $pendingSelectedIndexes = @(0..($selectedUpdates.Count - 1))
+                $installResult = $null
+                $installPass = 0
+
+                while ($pendingSelectedIndexes.Count -gt 0 -and $installPass -lt $installPassLimit) {
+                    $installPass++
+                    $passSelectedIndexes = @($pendingSelectedIndexes)
+
+                    $passUpdates = New-Object -ComObject Microsoft.Update.UpdateColl
+                    foreach ($passSelectedIndex in $passSelectedIndexes) {
+                        [void]$passUpdates.Add($selectedUpdates.Item($passSelectedIndex))
                     }
-                    catch {
-                        $status.updates[$searchIndex].errors += [ordered]@{
-                            stage = 'ReadInstallResult'
-                            message = $_.Exception.Message
+
+                    if ($installPass -gt 1) {
+                        Write-AgentLog -Message ('Install pass {0}: {1} update(s) were left NotStarted by the previous pass and are being offered again.' -f $installPass, $passUpdates.Count)
+                    }
+
+                    $installer.Updates = $passUpdates
+                    $passResult = $installer.Install()
+                    $passOperationResult = New-OperationResult -Result $passResult
+
+                    # The first pass is the aggregate result: a package that failed did fail,
+                    # and a later pass recovering the ones queued behind it does not unmake
+                    # that. rebootRequired is the one field merged across passes, below - so
+                    # the aggregate is built as its OWN object, or merging into it would
+                    # rewrite the first pass's record of what it actually asked for.
+                    if ($installPass -eq 1) {
+                        $installResult = $passResult
+                        $status.installResult = New-OperationResult -Result $passResult
+                    }
+
+                    # Every pass is recorded besides the aggregate, so the whole sequence stays
+                    # readable: which updates each pass was given, and what WUA said about it.
+                    $status.installPasses += [ordered]@{
+                        pass = $installPass
+                        attemptedCount = [int]$passUpdates.Count
+                        installResult = $passOperationResult
+                    }
+
+                    $stillPending = @()
+                    for ($passIndex = 0; $passIndex -lt $passSelectedIndexes.Count; $passIndex++) {
+                        $selectedIndex = $passSelectedIndexes[$passIndex]
+                        $searchIndex = $selectedSearchIndexes[$selectedIndex]
+                        try {
+                            $perUpdateInstall = $passResult.GetUpdateResult($passIndex)
+                            $perUpdateOperationResult = New-OperationResult -Result $perUpdateInstall
+                            $status.updates[$searchIndex].installResult = $perUpdateOperationResult
+                            # orc_NotStarted: WUA never got to this one. Anything else - success
+                            # or a real failure - is this package's own answer and is final.
+                            if ([int]$perUpdateOperationResult.resultCode -eq 0) {
+                                $stillPending += $selectedIndex
+                            }
+                        }
+                        catch {
+                            $status.updates[$searchIndex].errors += [ordered]@{
+                                stage = 'ReadInstallResult'
+                                message = $_.Exception.Message
+                            }
                         }
                     }
+
+                    Save-Status -Status $status
+
+                    # A pass that moved nothing will not move anything next time either, and a
+                    # pass that asked for a restart must not be followed by more installing in
+                    # the same session - the guest has to come back first.
+                    if ($stillPending.Count -eq 0 -or $stillPending.Count -eq $passSelectedIndexes.Count) {
+                        if ($stillPending.Count -gt 0) {
+                            Write-AgentLog -Message ('Install pass {0} left {1} update(s) NotStarted and made no progress; not retrying.' -f $installPass, $stillPending.Count)
+                        }
+                        break
+                    }
+
+                    if ([bool]$passOperationResult.rebootRequired) {
+                        Write-AgentLog -Message ('Install pass {0} requires a restart; {1} update(s) stay NotStarted for the next round.' -f $installPass, $stillPending.Count)
+                        break
+                    }
+
+                    $pendingSelectedIndexes = @($stillPending)
                 }
+
+                # A restart asked for by any pass is a restart this guest needs. The aggregate
+                # otherwise describes the first pass alone, and the reboot phase reads exactly
+                # this field: a requirement that first appeared in a retry pass would be
+                # dropped where it matters most.
+                foreach ($installPassRecord in @($status.installPasses)) {
+                    if ($null -eq $status.installResult -or $null -eq $installPassRecord.installResult) {
+                        continue
+                    }
+
+                    if ([bool]$installPassRecord.installResult.rebootRequired) {
+                        $status.installResult.rebootRequired = $true
+                    }
+                }
+
+                # A later pass failing on its own is not something the first pass's verdict can
+                # express, and it must not hide behind a first pass that succeeded.
+                $failedRetryPassCount = @(@($status.installPasses) | Where-Object { [int]$_.pass -gt 1 -and $null -ne $_.installResult -and [int]$_.installResult.resultCode -ne 2 }).Count
 
                 if ([int]$installResult.ResultCode -eq 2) {
                     $status.outcome = 'InstallSucceeded'
                     $scriptExitCode = 0
                     # WUA reports on the collection it received, which excludes updates
                     # whose EULA/selection failed. Those failures still belong to this run.
-                    if (@($status.errors).Count -gt 0 -or @($status.updates | Where-Object { @($_.errors).Count -gt 0 }).Count -gt 0) {
+                    if (@($status.errors).Count -gt 0 -or @($status.updates | Where-Object { @($_.errors).Count -gt 0 }).Count -gt 0 -or $failedRetryPassCount -gt 0) {
                         $status.outcome = 'InstallSucceededWithErrors'
                         $scriptExitCode = 1
                     }

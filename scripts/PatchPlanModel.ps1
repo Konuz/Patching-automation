@@ -974,6 +974,61 @@ function Get-PatchPlanDisplayLines {
     return @($lines)
 }
 
+function Test-ApplyRecordHasInstallShortfall {
+    param($Record)
+
+    # Whether anything approved is actually missing, which stopped being the same question as
+    # "did the install report an error" when the agent gained a retry pass: a package WUA left
+    # NotStarted and installed on the second pass leaves the first pass's verdict on the
+    # record while nothing at all is missing. The counts are the fact; the outcome only says
+    # something went wrong somewhere. Shared by the reboot checkpoint, the console summary and
+    # summary.md, because 'partially installed: 4 of 4 installed' is a line nobody can act on
+    # and all three would otherwise print it.
+    if ($null -eq $Record) {
+        return $false
+    }
+
+    $failedKbs = @(@(Get-ModelPropertyValue -InputObject $Record -Name 'failedUpdateKbs' -DefaultValue @()) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($failedKbs.Count -gt 0) {
+        return $true
+    }
+
+    # Zero approved is not proof of a clean install, it is the absence of counts - a record
+    # written before they existed, or one whose agent never reported a selection. Those keep
+    # their old reading, which comes from the outcome.
+    $approved = [int](Get-ModelPropertyValue -InputObject $Record -Name 'approvedUpdateCount' -DefaultValue 0)
+    if ($approved -le 0) {
+        return ([string](Get-ModelPropertyValue -InputObject $Record -Name 'applyOutcome' -DefaultValue ([string](Get-ModelPropertyValue -InputObject $Record -Name 'outcome'))) -eq 'InstallSucceededWithErrors')
+    }
+
+    $installed = [int](Get-ModelPropertyValue -InputObject $Record -Name 'installedUpdateCount' -DefaultValue 0)
+    return ($installed -lt $approved)
+}
+
+function Get-InstallShortfallText {
+    param($Record)
+
+    # 'some updates failed' reads the same whether one of twelve failed or eleven did, and the
+    # operator decides on that number. Rendered here so the checkpoint marker, the console
+    # summary line and summary.md cannot count the same install differently.
+    $approved = [int](Get-ModelPropertyValue -InputObject $Record -Name 'approvedUpdateCount' -DefaultValue 0)
+    $installed = [int](Get-ModelPropertyValue -InputObject $Record -Name 'installedUpdateCount' -DefaultValue 0)
+    $failedKbs = @(@(Get-ModelPropertyValue -InputObject $Record -Name 'failedUpdateKbs' -DefaultValue @()) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+
+    $text = if ($approved -gt 0) {
+        '{0} of {1} update(s) installed' -f $installed, $approved
+    }
+    else {
+        'some updates failed'
+    }
+
+    if ($failedKbs.Count -gt 0) {
+        $text = '{0}; failed: {1}' -f $text, (($failedKbs | Select-Object -Unique) -join ', ')
+    }
+
+    return $text
+}
+
 function Get-RebootTargetInstallNote {
     param($RebootTarget)
 
@@ -983,25 +1038,18 @@ function Get-RebootTargetInstallNote {
         return ''
     }
 
-    $failedKbs = @(@(Get-ModelPropertyValue -InputObject $RebootTarget -Name 'failedUpdateKbs' -DefaultValue @()) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if (Test-ApplyRecordHasInstallShortfall -Record $RebootTarget) {
+        return ('[PARTIAL INSTALL: {0}]' -f (Get-InstallShortfallText -Record $RebootTarget))
+    }
+
+    # Everything approved went in and the install still reported a failure. Two ways to get
+    # here: an update refused before it was ever offered (a rejected EULA), and a package that
+    # failed one pass while the ones queued behind it were recovered in the next. Nothing is
+    # missing from this restart, so it is not a partial install - but the agent log has
+    # something in it, and the operator should not have to find that out afterwards.
     $outcome = [string](Get-ModelPropertyValue -InputObject $RebootTarget -Name 'applyOutcome')
-    $isPartial = ($outcome -eq 'InstallSucceededWithErrors') -or ($failedKbs.Count -gt 0)
-
-    if ($isPartial) {
-        $approved = [int](Get-ModelPropertyValue -InputObject $RebootTarget -Name 'approvedUpdateCount' -DefaultValue 0)
-        $installed = [int](Get-ModelPropertyValue -InputObject $RebootTarget -Name 'installedUpdateCount' -DefaultValue 0)
-        $note = if ($approved -gt 0) {
-            'PARTIAL INSTALL: {0} of {1} update(s) installed' -f $installed, $approved
-        }
-        else {
-            'PARTIAL INSTALL: some updates failed'
-        }
-
-        if ($failedKbs.Count -gt 0) {
-            $note = '{0}; failed: {1}' -f $note, (($failedKbs | Select-Object -Unique) -join ', ')
-        }
-
-        return ('[{0}]' -f $note)
+    if ($outcome -eq 'InstallSucceededWithErrors') {
+        return '[INSTALL REPORTED ERRORS: nothing approved is missing, see agent.log]'
     }
 
     # Drift is the other way a restart can land on a machine that did not get everything it
