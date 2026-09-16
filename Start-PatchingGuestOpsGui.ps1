@@ -34,7 +34,7 @@ foreach ($warning in (@($settingsResult.Warnings) + @($credentialResult.Warnings
     Write-Warning $warning
 }
 
-$answer = Show-LauncherDialog -Settings $settingsResult.Settings
+$answer = Show-LauncherDialog -Settings $settingsResult.Settings -DefaultOutputDirectory (Join-Path $root 'out')
 if ($answer.Cancelled) {
     Write-Host 'Cancelled.'
     exit 1
@@ -118,6 +118,19 @@ $settingsToSave.RebootBatchSize = if ([int]::TryParse($answer.RebootBatchSize, [
 $parsedRounds = 0
 $settingsToSave.MaxPatchRounds = if ([int]::TryParse($answer.MaxPatchRounds, [ref]$parsedRounds) -and $parsedRounds -ge 1) { $parsedRounds } else { 3 }
 
+$settingsToSave.ShowAdvanced = [bool]$answer.ShowAdvanced
+$settingsToSave.GuestWorkingDirectory = [string]$answer.GuestWorkingDirectory
+
+# 35791394 is the launcher's own upper bound - the largest value that still fits Int32 once
+# converted to seconds. Clamping to it here keeps a typo in a text box from reaching parameter
+# binding, where it would surface as a raw validation error after the window has closed.
+$parsedApplyTimeout = 0
+$settingsToSave.TimeoutMinutes = if ([int]::TryParse($answer.TimeoutMinutes, [ref]$parsedApplyTimeout) -and $parsedApplyTimeout -ge 1 -and $parsedApplyTimeout -le 35791394) { $parsedApplyTimeout } else { 180 }
+$parsedDiscoveryTimeout = 0
+$settingsToSave.DiscoveryTimeoutMinutes = if ([int]::TryParse($answer.DiscoveryTimeoutMinutes, [ref]$parsedDiscoveryTimeout) -and $parsedDiscoveryTimeout -ge 1 -and $parsedDiscoveryTimeout -le 35791394) { $parsedDiscoveryTimeout } else { 30 }
+$parsedRebootTimeout = 0
+$settingsToSave.RebootTimeoutMinutes = if ([int]::TryParse($answer.RebootTimeoutMinutes, [ref]$parsedRebootTimeout) -and $parsedRebootTimeout -ge 1 -and $parsedRebootTimeout -le 35791394) { $parsedRebootTimeout } else { 30 }
+
 # Save BEFORE launching: the local gates take tens of seconds and can end the run with a
 # non-zero code, which would discard everything the operator just typed.
 try {
@@ -159,6 +172,8 @@ $launcherParams = @{
     VIServer = (@($guiVIServers) -join ';')
     VMNames = @($guiVMNames)
     MaxPatchRounds = $settingsToSave.MaxPatchRounds
+    TimeoutMinutes = $settingsToSave.TimeoutMinutes
+    DiscoveryTimeoutMinutes = $settingsToSave.DiscoveryTimeoutMinutes
     RebootTimeoutMinutes = $settingsToSave.RebootTimeoutMinutes
     PollSeconds = $settingsToSave.PollSeconds
     StoredVIServerCredentials = (Expand-CredentialStoreMap -Scope 'vcenter' -TargetNames $guiVIServers -Store $store)
@@ -233,10 +248,22 @@ if (-not [string]::IsNullOrWhiteSpace($settingsToSave.LocalOutputDirectory)) {
     $launcherParams.LocalOutputDirectory = $settingsToSave.LocalOutputDirectory
 }
 
+if (-not [string]::IsNullOrWhiteSpace($settingsToSave.GuestWorkingDirectory)) {
+    $launcherParams.GuestWorkingDirectory = $settingsToSave.GuestWorkingDirectory
+}
+
+# Per-run decisions, never read back from the settings file: the answer object is the only
+# source for them, so a later launch cannot start with a resume or a skipped gate already armed.
+if (-not [string]::IsNullOrWhiteSpace($answer.PatchPlanPath)) {
+    $launcherParams.PatchPlanPath = $answer.PatchPlanPath
+}
+
 if ($settingsToSave.IgnoreVCenterCertificate) { $launcherParams.IgnoreVCenterCertificate = $true }
 if ($settingsToSave.IgnoreESXiCertificate) { $launcherParams.IgnoreESXiCertificate = $true }
 if ($settingsToSave.KeepConnected) { $launcherParams.KeepConnected = $true }
 if ($answer.SearchOnly) { $launcherParams.SearchOnly = $true }
+if ($answer.PlanOnly) { $launcherParams.PlanOnly = $true }
+if ($answer.SkipStaticChecks) { $launcherParams.SkipStaticChecks = $true }
 
 # Call operator, not dot-source: Start-PatchingGuestOps.ps1 ends with exit $LASTEXITCODE,
 # which under dot-source would kill this process along with its windows.

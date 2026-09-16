@@ -310,7 +310,8 @@ co zapisano w planie. Automatycznego łatania klastrów nadal nie ma.
 `-DiscoveryTimeoutMinutes` (domyślnie 30), bo wyszukiwanie WUA trwa minuty; wcześniej ten sam limit
 180 minut oznaczał, że jeden gość, który przestał odpowiadać w trakcie wyszukiwania, blokował całą
 fazę na trzy godziny. Oba parametry przyjmują `1..35791394` minut (największa wartość, która po
-przeliczeniu na sekundy nadal mieści się w Int32). GUI korzysta z domyślnych wartości.
+przeliczeniu na sekundy nadal mieści się w Int32). GUI pokazuje oba w sekcji **Advanced** —
+domyślne wartości zostają, ale można je zmienić przed startem.
 
 **To nie jest twarda gwarancja czasu ściennego.** Pojedyncze wywołanie SOAP nie da się przerwać w
 trakcie, a budżet jest sprawdzany między krokami GuestOps. Faktyczna granica to „budżet agenta plus
@@ -709,6 +710,34 @@ Gdy korzystasz z launchera GUI (`Start-PatchingGuestOpsGui.ps1`), w profilu uży
 `%LOCALAPPDATA%\PatchingGuestOps\`
 
 - **`settings.json`** — zapamiętane domyślne parametry formularza (ostatnio używane vCenter, limity, katalog wyjściowy, flagi). Lista maszyn VM celowo **nie** jest w nim zapisywana.
+
+  **Sekcja `Advanced` w głównym oknie.** Pole wyboru *Show advanced settings* rozwija blok z
+  parametrami, których zwykły przebieg nie rusza. **Wartości domyślne zostają** — blok jedynie
+  pozwala je zmienić:
+
+  | Pole | Parametr | Domyślnie | Zapisywane |
+  |---|---|---|---|
+  | Apply timeout (min) | `-TimeoutMinutes` | 180 | tak |
+  | Discovery timeout (min) | `-DiscoveryTimeoutMinutes` | 30 | tak |
+  | Reboot timeout (min) | `-RebootTimeoutMinutes` | 30 | tak |
+  | Guest working directory | `-GuestWorkingDirectory` | `C:\ProgramData\PatchingGuestOps` | tak |
+  | Resume from saved plan | `-PatchPlanPath` | puste | **nie** |
+  | Plan only | `-PlanOnly` | odznaczone | **nie** |
+  | Skip the local checks | `-SkipStaticChecks` | odznaczone | **nie** |
+
+  Stan samego pola *Show advanced settings* też jest zapamiętywany, więc okno otwiera się tak, jak
+  zostało zamknięte. Trzy ostatnie pozycje to **decyzje o jednym przebiegu, nie preferencje**:
+  gdyby trafiły do pliku, kolejne uruchomienie startowałoby ze wznowieniem planu albo z pominiętą
+  bramką, czego nikt by się nie spodziewał. Z tego samego powodu nie jest zapisywane `SearchOnly`.
+
+  **Wznowienie z zapisanego planu.** Przycisk *Browse...* otwiera katalog wyjściowy tego przebiegu
+  (a gdy nie ustawiono własnego — `.\out`). Celowo **nie ma** opcji „ostatni plan”: jeden przebieg
+  zapisuje plan na każdą rundę (`out\<przebieg>\round-NN\patch-plan.json`), więc żaden z nich nie
+  jest tym jedynym ostatnim. Pole VM pozostaje wymagane także przy wznowieniu — orkiestrator
+  rozwiązuje listę maszyn, zanim sięgnie po zapisany plan. Wznowienie połączone z *Search only*
+  albo wskazujące na nieistniejący plik jest odrzucane **w oknie**, a nie kilka minut później, po
+  bramkach lokalnych, gdy operator zdążył już odejść od ekranu.
+
 - **`credentials.json`** — zaszyfrowane poświadczenia vCenter i gości (szyfrowanie DPAPI per-klucz, powiązane z kontem zalogowanego użytkownika Windows). Poświadczenia trafiają tu **tylko** wtedy, gdy w oknie dialogowym **sam zaznaczysz** *Remember on this machine* — pole jest domyślnie odznaczone.
 
   **Zakres ochrony DPAPI.** Szyfrowanie wiąże plik z **kontem Windows** na **tej maszynie**: odczytać

@@ -2825,6 +2825,10 @@ try {
     $defaults = Read-GuiSettings -Path $settingsPath
     Assert-Equal -Actual $defaults.Warnings.Count -Expected 0 -Message 'a missing settings file is not a warning, it is a first run'
     Assert-Equal -Actual $defaults.Settings.MaxPatchRounds -Expected 3 -Message 'missing settings file yields documented defaults'
+    Assert-Equal -Actual $defaults.Settings.TimeoutMinutes -Expected 180 -Message 'the apply budget defaults to the orchestrator value'
+    Assert-Equal -Actual $defaults.Settings.DiscoveryTimeoutMinutes -Expected 30 -Message 'the discovery budget defaults to the orchestrator value'
+    Assert-Equal -Actual $defaults.Settings.GuestWorkingDirectory -Expected '' -Message 'a blank guest working directory means "use the tool default"'
+    Assert-Equal -Actual $defaults.Settings.ShowAdvanced -Expected $false -Message 'the advanced block starts collapsed'
     Assert-Equal -Actual (@($defaults.Settings.VIServers).Count) -Expected 0 -Message 'no vCenters are assumed on a first run'
 
     Write-GuiSettings -Path $settingsPath -Settings ([pscustomobject]@{
@@ -2839,12 +2843,24 @@ try {
         KeepConnected = $false
     })
 
+    # Deliberately built without the fields added after the first release: a caller from before
+    # them is still a valid caller, and under StrictMode the writer reaching for a property it
+    # does not carry would lose the whole save rather than one value.
+    $legacyWrite = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+    Assert-Equal -Actual $legacyWrite.TimeoutMinutes -Expected 180 -Message 'a caller without the newer fields still writes their defaults'
+    Assert-Equal -Actual $legacyWrite.ShowAdvanced -Expected $false -Message 'a caller without ShowAdvanced writes it as collapsed'
+
     # Assert this while the file still holds what Write-GuiSettings produced. The
     # out-of-range case below overwrites it by hand, and asserting there would check the
     # test's own JSON rather than the writer's.
     $writtenText = Get-Content -LiteralPath $settingsPath -Raw
     Assert-NotContains -Text $writtenText -Needle 'SkipStaticChecks' -Message 'SkipStaticChecks is never persisted'
     Assert-NotContains -Text $writtenText -Needle 'VMNames' -Message 'the VM list is never persisted'
+    # A resume path and a dry run are decisions about one run. Persisting either would arm it
+    # again on the next launch, which is the one thing an operator would not be looking for.
+    Assert-NotContains -Text $writtenText -Needle 'PatchPlanPath' -Message 'a resume plan path is never persisted'
+    Assert-NotContains -Text $writtenText -Needle 'PlanOnly' -Message 'PlanOnly is never persisted'
+    Assert-NotContains -Text $writtenText -Needle 'SearchOnly' -Message 'SearchOnly is never persisted'
 
     $loaded = Read-GuiSettings -Path $settingsPath
     Assert-Equal -Actual (@($loaded.Settings.VIServers) -join ';') -Expected 'vc1.corp.local;vc2.corp.local' -Message 'vCenter list round-trips'
@@ -2854,6 +2870,48 @@ try {
     Assert-Equal -Actual $loaded.Settings.MaxPatchRounds -Expected 4 -Message 'MaxPatchRounds round-trips'
     Assert-Equal -Actual $loaded.Settings.RebootTimeoutMinutes -Expected 45 -Message 'RebootTimeoutMinutes round-trips'
     Assert-Equal -Actual $loaded.Settings.PollSeconds -Expected 20 -Message 'PollSeconds round-trips'
+
+    Write-GuiSettings -Path $settingsPath -Settings ([pscustomobject]@{
+        VIServers = @('vc1.corp.local')
+        ThrottleLimit = $null
+        RebootBatchSize = $null
+        MaxPatchRounds = 3
+        TimeoutMinutes = 240
+        DiscoveryTimeoutMinutes = 45
+        RebootTimeoutMinutes = 20
+        PollSeconds = 15
+        GuestWorkingDirectory = 'D:\tools\PatchingGuestOps'
+        ShowAdvanced = $true
+        LocalOutputDirectory = 'D:\out'
+        IgnoreVCenterCertificate = $false
+        IgnoreESXiCertificate = $false
+        KeepConnected = $false
+    })
+    $advanced = Read-GuiSettings -Path $settingsPath
+    Assert-Equal -Actual $advanced.Settings.TimeoutMinutes -Expected 240 -Message 'the apply budget round-trips'
+    Assert-Equal -Actual $advanced.Settings.DiscoveryTimeoutMinutes -Expected 45 -Message 'the discovery budget round-trips'
+    Assert-Equal -Actual $advanced.Settings.GuestWorkingDirectory -Expected 'D:\tools\PatchingGuestOps' -Message 'the guest working directory round-trips'
+    Assert-Equal -Actual $advanced.Settings.ShowAdvanced -Expected $true -Message 'the advanced block stays open across launches'
+    Assert-Equal -Actual $advanced.Warnings.Count -Expected 0 -Message 'the advanced fields produce no warnings when valid'
+
+    Set-Content -LiteralPath $settingsPath -Value '{ "TimeoutMinutes": 0, "DiscoveryTimeoutMinutes": "soon" }' -Encoding UTF8
+    $badBudgets = Read-GuiSettings -Path $settingsPath
+    Assert-Equal -Actual $badBudgets.Settings.TimeoutMinutes -Expected 180 -Message 'a below-range apply budget falls back to its default'
+    Assert-Equal -Actual $badBudgets.Settings.DiscoveryTimeoutMinutes -Expected 30 -Message 'an unparsable discovery budget falls back to its default'
+    Assert-Equal -Actual ($badBudgets.Warnings.Count -ge 2) -Expected $true -Message 'each invalid budget warns rather than being silently replaced'
+
+    Write-GuiSettings -Path $settingsPath -Settings ([pscustomobject]@{
+        VIServers = @('vc1.corp.local')
+        ThrottleLimit = 5
+        RebootBatchSize = 2
+        MaxPatchRounds = 4
+        RebootTimeoutMinutes = 45
+        PollSeconds = 20
+        LocalOutputDirectory = 'D:\out'
+        IgnoreVCenterCertificate = $true
+        KeepConnected = $false
+    })
+    $loaded = Read-GuiSettings -Path $settingsPath
     Assert-Equal -Actual $loaded.Settings.LocalOutputDirectory -Expected 'D:\out' -Message 'the output directory round-trips'
     Assert-Equal -Actual $loaded.Settings.KeepConnected -Expected $false -Message 'KeepConnected round-trips independently of IgnoreVCenterCertificate'
     Assert-Equal -Actual $loaded.Warnings.Count -Expected 0 -Message 'a clean file produces no warnings'

@@ -106,8 +106,12 @@ function New-DefaultGuiSettings {
         ThrottleLimit = $null
         RebootBatchSize = $null
         MaxPatchRounds = 3
+        TimeoutMinutes = 180
+        DiscoveryTimeoutMinutes = 30
         RebootTimeoutMinutes = 30
         PollSeconds = 15
+        GuestWorkingDirectory = ''
+        ShowAdvanced = $false
         LocalOutputDirectory = ''
         IgnoreVCenterCertificate = $false
         IgnoreESXiCertificate = $false
@@ -160,6 +164,8 @@ function Read-GuiSettings {
     $settings.ThrottleLimit = Get-ValidatedRangeValue -Raw (Get-ObjectPropertyValue -InputObject $raw -Path @('ThrottleLimit')) -Default $null -Name 'ThrottleLimit' -Warnings $warnings
     $settings.RebootBatchSize = Get-ValidatedRangeValue -Raw (Get-ObjectPropertyValue -InputObject $raw -Path @('RebootBatchSize')) -Default $null -Name 'RebootBatchSize' -Warnings $warnings
     $settings.MaxPatchRounds = Get-ValidatedRangeValue -Raw (Get-ObjectPropertyValue -InputObject $raw -Path @('MaxPatchRounds')) -Default 3 -Name 'MaxPatchRounds' -Warnings $warnings
+    $settings.TimeoutMinutes = Get-ValidatedRangeValue -Raw (Get-ObjectPropertyValue -InputObject $raw -Path @('TimeoutMinutes')) -Default 180 -Name 'TimeoutMinutes' -Warnings $warnings
+    $settings.DiscoveryTimeoutMinutes = Get-ValidatedRangeValue -Raw (Get-ObjectPropertyValue -InputObject $raw -Path @('DiscoveryTimeoutMinutes')) -Default 30 -Name 'DiscoveryTimeoutMinutes' -Warnings $warnings
     $settings.RebootTimeoutMinutes = Get-ValidatedRangeValue -Raw (Get-ObjectPropertyValue -InputObject $raw -Path @('RebootTimeoutMinutes')) -Default 30 -Name 'RebootTimeoutMinutes' -Warnings $warnings
     $settings.PollSeconds = Get-ValidatedRangeValue -Raw (Get-ObjectPropertyValue -InputObject $raw -Path @('PollSeconds')) -Default 15 -Name 'PollSeconds' -Warnings $warnings
 
@@ -168,6 +174,12 @@ function Read-GuiSettings {
         $settings.LocalOutputDirectory = [string]$outputDirectory
     }
 
+    $guestWorkingDirectory = Get-ObjectPropertyValue -InputObject $raw -Path @('GuestWorkingDirectory')
+    if (-not [string]::IsNullOrWhiteSpace([string]$guestWorkingDirectory)) {
+        $settings.GuestWorkingDirectory = [string]$guestWorkingDirectory
+    }
+
+    $settings.ShowAdvanced = [bool](Get-ObjectPropertyValue -InputObject $raw -Path @('ShowAdvanced'))
     $settings.IgnoreVCenterCertificate = [bool](Get-ObjectPropertyValue -InputObject $raw -Path @('IgnoreVCenterCertificate'))
     $ignoreESXi = Get-ObjectPropertyValue -InputObject $raw -Path @('IgnoreESXiCertificate')
     $settings.IgnoreESXiCertificate = ($ignoreESXi -is [bool]) -and ($ignoreESXi -eq $true)
@@ -188,14 +200,23 @@ function Write-GuiSettings {
     }
 
     # The VM list is never persisted (it differs every run), and neither is SkipStaticChecks:
-    # a sticky "skip the gates" is how gates stop protecting anything.
+    # a sticky "skip the gates" is how gates stop protecting anything. SearchOnly, PlanOnly and
+    # the resume plan path are the same kind of fact - a mode chosen for one run, not a
+    # preference - so a later launch never starts with one of them already armed.
+    # The fields added after the first release are read defensively: a caller built before they
+    # existed is still a valid caller, and under StrictMode reaching for a property it does not
+    # carry is a terminating error that would lose the whole save.
     $payload = [pscustomobject]@{
         VIServers = @($Settings.VIServers)
         ThrottleLimit = $Settings.ThrottleLimit
         RebootBatchSize = $Settings.RebootBatchSize
         MaxPatchRounds = $Settings.MaxPatchRounds
+        TimeoutMinutes = (Get-ObjectPropertyValue -InputObject $Settings -Path @('TimeoutMinutes') -DefaultValue 180)
+        DiscoveryTimeoutMinutes = (Get-ObjectPropertyValue -InputObject $Settings -Path @('DiscoveryTimeoutMinutes') -DefaultValue 30)
         RebootTimeoutMinutes = $Settings.RebootTimeoutMinutes
         PollSeconds = $Settings.PollSeconds
+        GuestWorkingDirectory = [string](Get-ObjectPropertyValue -InputObject $Settings -Path @('GuestWorkingDirectory') -DefaultValue '')
+        ShowAdvanced = [bool](Get-ObjectPropertyValue -InputObject $Settings -Path @('ShowAdvanced') -DefaultValue $false)
         LocalOutputDirectory = [string]$Settings.LocalOutputDirectory
         IgnoreVCenterCertificate = [bool]$Settings.IgnoreVCenterCertificate
         IgnoreESXiCertificate = [bool](Get-ObjectPropertyValue -InputObject $Settings -Path @('IgnoreESXiCertificate') -DefaultValue $false)

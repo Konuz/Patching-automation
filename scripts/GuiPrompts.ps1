@@ -454,7 +454,12 @@ function Show-RescanDialog {
 }
 
 function Show-LauncherDialog {
-    param($Settings)
+    param(
+        $Settings,
+        # Where this tool writes runs when the operator sets no output directory. Used only to
+        # open the resume browser where the plans actually are.
+        [string]$DefaultOutputDirectory = ''
+    )
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'PatchingGuestOps'
@@ -513,10 +518,80 @@ function Show-LauncherDialog {
     $searchOnly.Top = 305
     $searchOnly.Width = 300
 
+    # Everything below stays out of the way until it is asked for: these are the knobs a run
+    # normally does not touch, and two of them (Plan only, Skip local checks) change what the
+    # run does rather than how it is tuned.
+    $advancedToggle = New-Object System.Windows.Forms.CheckBox
+    $advancedToggle.Text = 'Show advanced settings'
+    $advancedToggle.Left = 220
+    $advancedToggle.Top = 330
+    $advancedToggle.Width = 300
+    $advancedToggle.Checked = [bool](Get-ObjectPropertyValue -InputObject $Settings -Path @('ShowAdvanced') -DefaultValue $false)
+
+    $advancedGroup = New-Object System.Windows.Forms.GroupBox
+    $advancedGroup.Text = 'Advanced'
+    $advancedGroup.Left = 12
+    $advancedGroup.Top = 355
+    $advancedGroup.Width = 660
+    # Room for the last row plus the group's own bottom border; a child clipped by the frame
+    # is a control the operator cannot reach.
+    $advancedGroup.Height = 205
+
+    $applyTimeoutBox = New-GuiTextBox -Text ([string](Get-ObjectPropertyValue -InputObject $Settings -Path @('TimeoutMinutes') -DefaultValue 180)) -Top 22 -Width 80
+    $discoveryTimeoutBox = New-GuiTextBox -Text ([string](Get-ObjectPropertyValue -InputObject $Settings -Path @('DiscoveryTimeoutMinutes') -DefaultValue 30)) -Top 50 -Width 80
+    $rebootTimeoutBox = New-GuiTextBox -Text ([string]$Settings.RebootTimeoutMinutes) -Top 78 -Width 80
+    $guestDirBox = New-GuiTextBox -Text ([string](Get-ObjectPropertyValue -InputObject $Settings -Path @('GuestWorkingDirectory') -DefaultValue '')) -Top 106
+    $planBox = New-GuiTextBox -Text '' -Top 134 -Width 300
+
+    $planBrowse = New-Object System.Windows.Forms.Button
+    $planBrowse.Text = 'Browse...'
+    $planBrowse.Left = 530
+    $planBrowse.Top = 131
+    $planBrowse.Width = 90
+    $planBrowse.Add_Click({
+        $dialog = New-Object System.Windows.Forms.OpenFileDialog
+        $dialog.Filter = 'Patch plan (patch-plan.json)|patch-plan.json|JSON files (*.json)|*.json|All files (*.*)|*.*'
+        # A plan lives at <output>\<run>\round-NN\patch-plan.json, so there is no single "last
+        # plan" to offer: one run writes one per round. Open where this run would write them -
+        # the operator's own output directory when they set one - and let them pick.
+        $planStart = ([string]$outputBox.Text).Trim()
+        if ([string]::IsNullOrWhiteSpace($planStart)) {
+            $planStart = $DefaultOutputDirectory
+        }
+        if (-not [string]::IsNullOrWhiteSpace($planStart) -and (Test-Path -LiteralPath $planStart -PathType Container)) {
+            $dialog.InitialDirectory = $planStart
+        }
+        if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $planBox.Text = $dialog.FileName
+        }
+        $dialog.Dispose()
+    })
+
+    $planOnly = New-Object System.Windows.Forms.CheckBox
+    $planOnly.Text = 'Plan only (write the plan, install nothing)'
+    $planOnly.Left = 12
+    $planOnly.Top = 165
+    $planOnly.Width = 270
+
+    $skipChecks = New-Object System.Windows.Forms.CheckBox
+    $skipChecks.Text = 'Skip the local checks before this run (never saved)'
+    $skipChecks.Left = 290
+    $skipChecks.Top = 165
+    $skipChecks.Width = 360
+
+    $advancedGroup.Controls.AddRange(@(
+        (New-GuiLabel -Text 'Apply timeout (min)' -Top 22), $applyTimeoutBox,
+        (New-GuiLabel -Text 'Discovery timeout (min)' -Top 50), $discoveryTimeoutBox,
+        (New-GuiLabel -Text 'Reboot timeout (min)' -Top 78), $rebootTimeoutBox,
+        (New-GuiLabel -Text 'Guest working directory' -Top 106), $guestDirBox,
+        (New-GuiLabel -Text 'Resume from saved plan' -Top 134), $planBox, $planBrowse,
+        $planOnly, $skipChecks
+    ))
+
     $notice = New-Object System.Windows.Forms.Label
     $notice.Text = 'The run starts with local checks; they take roughly 20-40 seconds before anything touches vCenter.'
     $notice.Left = 12
-    $notice.Top = 340
+    $notice.Top = 355
     $notice.Width = 640
 
     $start = New-Object System.Windows.Forms.Button
@@ -537,9 +612,31 @@ function Show-LauncherDialog {
     # window closes, in Resolve-VMTargetNames and Resolve-VIServerNames - the operator
     # would be staring at nothing.
     $start.Add_Click({
+        # The VM field is required even for a resume: the orchestrator resolves its targets
+        # before it reads the saved plan, and an empty list throws there.
         if ([string]::IsNullOrWhiteSpace($viServerBox.Text) -or [string]::IsNullOrWhiteSpace($vmBox.Text)) {
             [void][System.Windows.Forms.MessageBox]::Show('vCenter and VM fields are both required.', 'PatchingGuestOps', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
             $form.DialogResult = [System.Windows.Forms.DialogResult]::None
+            return
+        }
+
+        $enteredPlanPath = ([string]$planBox.Text).Trim()
+        if ([string]::IsNullOrWhiteSpace($enteredPlanPath)) {
+            return
+        }
+
+        # Both of these are refused by the launcher anyway - but there, minutes later, after the
+        # local checks have run and the operator has walked away from the screen.
+        if ($searchOnly.Checked) {
+            [void][System.Windows.Forms.MessageBox]::Show('Search only cannot be combined with a saved plan. Use Plan only to inspect it.', 'PatchingGuestOps', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+            $form.DialogResult = [System.Windows.Forms.DialogResult]::None
+            return
+        }
+
+        if (-not (Test-Path -LiteralPath $enteredPlanPath -PathType Leaf)) {
+            [void][System.Windows.Forms.MessageBox]::Show(('Saved plan not found: {0}' -f $enteredPlanPath), 'PatchingGuestOps', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+            $form.DialogResult = [System.Windows.Forms.DialogResult]::None
+            return
         }
     })
 
@@ -550,10 +647,27 @@ function Show-LauncherDialog {
         (New-GuiLabel -Text 'Reboot batch size' -Top 125), $batchBox,
         (New-GuiLabel -Text 'Max patch rounds' -Top 160), $roundsBox,
         (New-GuiLabel -Text 'Output directory (blank = .\out)' -Top 195), $outputBox,
-        $ignoreCert, $ignoreESXiCert, $keepConnected, $searchOnly, $notice, $start, $quit
+        $ignoreCert, $ignoreESXiCert, $keepConnected, $searchOnly,
+        $advancedToggle, $advancedGroup, $notice, $start, $quit
     ))
     $form.AcceptButton = $start
     $form.CancelButton = $quit
+
+    # The advanced block is laid out in the flow rather than overlaid on it, so the notice, the
+    # buttons and the window itself move with it. Applied once up front too: the checkbox
+    # remembers its last state, and a window that opened expanded must not paint the group over
+    # its own buttons.
+    $applyAdvancedLayout = {
+        $advancedGroup.Visible = [bool]$advancedToggle.Checked
+        $noticeTop = if ($advancedToggle.Checked) { $advancedGroup.Top + $advancedGroup.Height + 10 } else { $advancedGroup.Top }
+        $notice.Top = $noticeTop
+        $start.Top = $noticeTop + 35
+        $quit.Top = $noticeTop + 35
+        $form.Height = $start.Top + 90
+    }
+
+    $advancedToggle.Add_CheckedChanged($applyAdvancedLayout)
+    & $applyAdvancedLayout
 
     $form.Add_Shown({ $form.Activate() })
     $result = $form.ShowDialog()
@@ -570,6 +684,14 @@ function Show-LauncherDialog {
         IgnoreESXiCertificate = $ignoreESXiCert.Checked
         KeepConnected = $keepConnected.Checked
         SearchOnly = $searchOnly.Checked
+        ShowAdvanced = $advancedToggle.Checked
+        TimeoutMinutes = $applyTimeoutBox.Text
+        DiscoveryTimeoutMinutes = $discoveryTimeoutBox.Text
+        RebootTimeoutMinutes = $rebootTimeoutBox.Text
+        GuestWorkingDirectory = ([string]$guestDirBox.Text).Trim()
+        PatchPlanPath = ([string]$planBox.Text).Trim()
+        PlanOnly = $planOnly.Checked
+        SkipStaticChecks = $skipChecks.Checked
     }
 
     $form.Dispose()
