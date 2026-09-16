@@ -480,6 +480,27 @@ A skipped account becomes `Failed` with a reason, is filtered out of discovery, 
 the next round, and makes the run exit 1. `-SkipConfirmation` and a missing prompt provider never
 open a dialog; the result is an explicit failure instead.
 
+**An account can also be refused before the run starts.** The GUI fills credential gaps in a
+dialog, and for a guest account that dialog offers **Skip these VMs** - never for a vCenter, where
+skipping would fail every VM behind it with a reason naming a password rather than the missing
+session, and leave the run nowhere to look those VMs up. Skip and Cancel stay different answers:
+Cancel still ends the run before it touches anything (so Esc and the window's close button keep
+that meaning), Skip starts the run without those VMs. The names travel to the orchestrator as
+`-SkippedGuestCredentialTargets` and `New-GuestCredentialContext` seeds them into
+`SkippedAccountKeys`, so they resolve as `Skipped` and not as "no credential is available": a gap
+somebody still has to fill and an answer are different facts, and only the skip is read *before*
+the resolver reaches for a credential, which is what keeps those VMs from costing a vCenter call
+each. It is recorded **per VM, not per account**, which is where it differs from the recovery
+path's `SkipAccount`: that one refuses the credential and takes the whole account with it, while
+this one only says nobody supplied one for these machines - and the prompt that produced it
+covers exactly the members no stored entry already covers, so skipping it must not take a peer
+whose own credential is sitting in the store. The VMs stay in the target list and are reported -
+a machine nobody patched must not vanish from the summary - and the run still exits 1. Skipping every account
+leaves nothing to run, so the GUI says so and stops instead of spending a vCenter login on it.
+`Test-CredentialDialogSkipIsGated` and `Test-CredentialDialogSkipIsScoped` hold both halves of
+the vCenter rule in the static gate, since exercising a WinForms dialog needs an STA host and a
+desktop the gates cannot assume.
+
 The GUI keeps the working credential map separate from the map destined for disk, because they
 genuinely diverge: a replacement entered with Remember unticked serves the run while
 `credentials.json` keeps the password already there. An explicit refusal outranks the startup

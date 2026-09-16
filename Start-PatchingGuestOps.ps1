@@ -39,7 +39,11 @@ param(
     [switch]$SkipStaticChecks,
     [hashtable]$PromptProvider,
     [hashtable]$StoredVIServerCredentials,
-    [hashtable]$StoredGuestCredentials
+    [hashtable]$StoredGuestCredentials,
+
+    # Guest accounts the operator skipped at the GUI credential prompt. Their VMs stay in the
+    # target list and are reported as skipped, rather than being dropped from the run.
+    [string[]]$SkippedGuestCredentialTargets = @()
 )
 
 Set-StrictMode -Version 2.0
@@ -186,7 +190,7 @@ $orchestratorParams = @{
 # "every target at once" inside the orchestrator, which it works out from the resolved VM
 # list; splatting the launcher's own default would always look like an explicit choice and
 # pin concurrency at 3. RebootBatchSize left unbound means "prompt before rebooting".
-foreach ($passThroughName in @('ThrottleLimit', 'RebootBatchSize', 'MaxPatchRounds', 'PromptProvider', 'StoredVIServerCredentials', 'StoredGuestCredentials')) {
+foreach ($passThroughName in @('ThrottleLimit', 'RebootBatchSize', 'MaxPatchRounds', 'PromptProvider', 'StoredVIServerCredentials', 'StoredGuestCredentials', 'SkippedGuestCredentialTargets')) {
     if ($PSBoundParameters.ContainsKey($passThroughName)) {
         $orchestratorParams[$passThroughName] = $PSBoundParameters[$passThroughName]
     }

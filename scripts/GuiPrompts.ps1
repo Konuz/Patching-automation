@@ -30,7 +30,11 @@ function Show-CredentialDialog {
     param(
         [string]$Title,
         [string]$Message,
-        [string]$UserName = ''
+        [string]$UserName = '',
+        # Offered for a guest account only. A vCenter cannot be skipped: every VM behind it
+        # would fail with a reason that names a password rather than the missing session, and
+        # the run would have nowhere to look those VMs up at all.
+        [switch]$AllowSkip
     )
 
     $form = New-Object System.Windows.Forms.Form
@@ -72,7 +76,19 @@ function Show-CredentialDialog {
     $cancel.Top = 145
     $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
 
-    $form.Controls.AddRange(@($prompt, (New-GuiLabel -Text 'User name' -Top 55), $userBox, (New-GuiLabel -Text 'Password' -Top 90), $passwordBox, $remember, $ok, $cancel))
+    # Skip and Cancel are deliberately different answers, so Esc and the window's close button
+    # keep meaning Cancel. Skip leaves these VMs unpatched and lets the rest of the run start;
+    # Cancel still ends the run before it touches anything.
+    $skip = New-Object System.Windows.Forms.Button
+    $skip.Text = 'Skip these VMs'
+    $skip.Left = 12
+    $skip.Top = 145
+    $skip.Width = 140
+    $skip.DialogResult = [System.Windows.Forms.DialogResult]::Ignore
+    $skip.Visible = [bool]$AllowSkip
+    $skip.Enabled = [bool]$AllowSkip
+
+    $form.Controls.AddRange(@($prompt, (New-GuiLabel -Text 'User name' -Top 55), $userBox, (New-GuiLabel -Text 'Password' -Top 90), $passwordBox, $remember, $skip, $ok, $cancel))
     $form.AcceptButton = $ok
     $form.CancelButton = $cancel
 
@@ -87,15 +103,24 @@ function Show-CredentialDialog {
     # empty SecureString succeeds, but ConvertFrom-SecureString then throws inside
     # Write-CredentialStore's loop - and because the throw lands mid-loop, the ENTIRE save
     # is lost, not just this one key. Get-Credential cannot produce this; a text box can.
+    # Before the field validation below: a skip is an answer, not an incomplete entry, and
+    # half-typed boxes must not turn it back into a cancel.
+    if ($result -eq [System.Windows.Forms.DialogResult]::Ignore) {
+        return [pscustomobject]@{ Credential = $null; Remember = $false; Skipped = $true }
+    }
+
     if ($result -ne [System.Windows.Forms.DialogResult]::OK -or
         [string]::IsNullOrWhiteSpace($enteredUser) -or
         [string]::IsNullOrEmpty($enteredPassword)) {
         return $null
     }
 
+    # Skipped is on both shapes, not only the skip one: under StrictMode a caller testing it on
+    # a result that does not carry it is a terminating error.
     return [pscustomobject]@{
         Credential = (New-Object System.Management.Automation.PSCredential($enteredUser, (ConvertTo-SecureString $enteredPassword -AsPlainText -Force)))
         Remember = $shouldRemember
+        Skipped = $false
     }
 }
 

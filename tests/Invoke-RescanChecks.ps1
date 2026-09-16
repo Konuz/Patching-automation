@@ -37,6 +37,7 @@ function Invoke-RescanScenario {
     $retryVIServerLogin = $false
     $GuestCredential = $null
     $StoredGuestCredentials = $null
+    $SkippedGuestCredentialTargets = @()
     $guestCredentialDecisionScript = $null
     $guestCredentialValidatedScript = $null
     $guestCredentialInteractive = $true

@@ -123,7 +123,7 @@ $roundLoop = $ast.Find({ param($n) $n -is [System.Management.Automation.Language
     $guestCredentialContext = $null; $guestCredentialDecisionScript = $null
     $guestCredentialValidatedScript = $null; $guestCredentialInteractive = $false
     $runOutputDirectory = Join-Path $repoRoot 'out'; $MaxPatchRounds = 3; $SearchOnly = $false; $PlanOnly = $false
-    $hasExplicitSelectedUpdateKeys = $false; $SkipConfirmation = $false; $PromptProvider = $null
+    $hasExplicitSelectedUpdateKeys = $false; $SkipConfirmation = $false; $PromptProvider = $null; $SkippedGuestCredentialTargets = @()
     $managers = $null; $guestCredentialMap = @{}; $resolvedVIServers = @('vc.regression.invalid'); $viServerScope = @('vc.regression.invalid'); $viserverCredentialMap = @{}
     $IgnoreVCenterCertificate = $false; $guestOpsLibPath = ''; $curlPath = ''; $AgentPath = ''; $identityHelperPath = ''; $workspaceScriptPath = ''; $runGuardScriptPath = ''; $rebootRequestScriptPath = ''
     $GuestWorkingDirectory = ''; $TimeoutMinutes = 1; $DiscoveryTimeoutMinutes = 1; $RebootTimeoutMinutes = 1; $PollSeconds = 1; $ThrottleLimit = 1
@@ -162,7 +162,7 @@ foreach ($planOnlyCase in @($false, $true)) {
         $guestCredentialContext = $null; $guestCredentialDecisionScript = $null
         $guestCredentialValidatedScript = $null; $guestCredentialInteractive = $false
         $runOutputDirectory = $planRoot; $MaxPatchRounds = 1; $SearchOnly = $false; $PlanOnly = $planOnlyCase
-        $hasExplicitSelectedUpdateKeys = $false; $SkipConfirmation = $true; $PromptProvider = $null
+        $hasExplicitSelectedUpdateKeys = $false; $SkipConfirmation = $true; $PromptProvider = $null; $SkippedGuestCredentialTargets = @()
         $managers = $null; $guestCredentialMap = @{}; $resolvedVIServers = @('vc.regression.invalid'); $viServerScope = @('vc.regression.invalid'); $viserverCredentialMap = @{}
         $IgnoreVCenterCertificate = $false; $guestOpsLibPath = ''; $curlPath = ''; $AgentPath = ''; $identityHelperPath = ''; $workspaceScriptPath = ''; $runGuardScriptPath = ''; $rebootRequestScriptPath = ''
         $GuestWorkingDirectory = ''; $TimeoutMinutes = 1; $DiscoveryTimeoutMinutes = 1; $RebootTimeoutMinutes = 1; $PollSeconds = 1; $ThrottleLimit = 1

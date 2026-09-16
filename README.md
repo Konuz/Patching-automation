@@ -441,6 +441,24 @@ Choose RETRY, SKIP, or ABORT (Enter aborts):
 Pusty Enter to **przerwanie**, nie zgoda na ponowienie — wciśnięcie Enter „na odczepnego" nigdy
 nie spowoduje próby z tym samym hasłem.
 
+### Pominięcie maszyn przy podawaniu poświadczeń (GUI)
+
+Gdy w magazynie brakuje poświadczeń, GUI pyta o nie **przed startem przebiegu**. Okno dla konta
+gościa ma trzy przyciski:
+
+- **OK** — dane wchodzą do przebiegu (i, jeśli zaznaczysz „Remember", do magazynu).
+- **Skip these VMs** — maszyny tego konta **nie są łatane**, a przebieg rusza z resztą listy.
+  Są raportowane jako pominięte, nie znikają z `summary.md`, i nie kosztują żadnego zapytania
+  do vCenter. Pominięcie dotyczy **tych maszyn**, a nie całego konta: okno pyta tylko o te, dla
+  których w magazynie nic nie ma, więc maszyna z tej samej domeny mająca własny zapisany wpis
+  pracuje dalej normalnie.
+- **Cancel** (także Esc i zamknięcie okna) — przebieg kończy się, zanim czegokolwiek dotknie.
+  To celowo **inna** odpowiedź niż Skip.
+
+Okno dla vCenter przycisku Skip **nie ma**: pominięcie serwera oznaczałoby, że każda maszyna za
+nim i tak przepada, z komunikatem o haśle zamiast o brakującej sesji. Pominięcie wszystkich kont
+kończy pracę od razu — nie ma czego łatać.
+
 ### Kod wyjścia
 
 Pominięcie konta to jawna porażka, nie cichy sukces. `VM01` kończy przebieg w stanie `Failed`

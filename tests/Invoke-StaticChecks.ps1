@@ -1110,6 +1110,88 @@ function Test-CredentialDialogDefaultsToNotRemember {
     return 'ok'
 }
 
+
+# The credential dialog is shared by the vCenter and the guest prompt, and only the guest one
+# may offer Skip: skipping a vCenter would fail every VM behind it with a reason that names a
+# password rather than the missing session, and the run would have nowhere to look them up.
+# Exercising a WinForms dialog needs an STA host and a desktop the gates cannot assume, so the
+# gating is pinned here. Returns 'ok', or what the skip control is gated on instead.
+function Test-CredentialDialogSkipIsGated {
+    param($Ast)
+
+    $definition = @($Ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Show-CredentialDialog'
+            }, $true))
+
+    if ($definition.Count -eq 0) {
+        return 'Show-CredentialDialog was not found'
+    }
+
+    $paramBlock = $definition[0].Body.ParamBlock
+    $parameterNames = if ($null -eq $paramBlock) { @() } else { @($paramBlock.Parameters | ForEach-Object { [string]$_.Name.VariablePath.UserPath }) }
+    if ($parameterNames -notcontains 'AllowSkip') {
+        return 'Show-CredentialDialog does not declare AllowSkip'
+    }
+
+    $visibility = @($definition[0].FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.AssignmentStatementAst]
+            }, $true) | Where-Object {
+            return (([string]$_.Left.Extent.Text) -match '(?i)^\$[a-z0-9_]*skip[a-z0-9_]*\.(Visible|Enabled)$')
+        })
+
+    if ($visibility.Count -eq 0) {
+        return 'the skip control is never gated'
+    }
+
+    foreach ($assignment in $visibility) {
+        if (([string]$assignment.Right.Extent.Text) -notmatch '(?i)\$AllowSkip') {
+            return ('line {0}: {1}' -f $assignment.Extent.StartLineNumber, ([string]$assignment.Extent.Text).Trim())
+        }
+    }
+
+    return 'ok'
+}
+
+# The other half of the same rule, on the caller: the GUI must decide per scope, so a literal
+# $true passed to -AllowSkip would offer Skip on the vCenter prompt too.
+function Test-CredentialDialogSkipIsScoped {
+    param($Ast)
+
+    foreach ($command in @($Ast.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst]
+                }, $true))) {
+        if (([string]$command.GetCommandName()) -ine 'Show-CredentialDialog') {
+            continue
+        }
+
+        $elements = @($command.CommandElements)
+        for ($i = 0; $i -lt $elements.Count; $i++) {
+            $element = $elements[$i]
+            if ($element -isnot [System.Management.Automation.Language.CommandParameterAst] -or
+                ([string]$element.ParameterName) -ine 'AllowSkip') {
+                continue
+            }
+
+            # -AllowSkip:(expr) carries its argument; -AllowSkip expr leaves it in the next
+            # element; a bare -AllowSkip is the switch on, which is the literal this forbids.
+            $argument = $element.Argument
+            if ($null -eq $argument -and ($i + 1) -lt $elements.Count) {
+                $argument = $elements[$i + 1]
+            }
+
+            $argumentText = if ($null -eq $argument) { '(none)' } else { ([string]$argument.Extent.Text).Trim() }
+            if ($argumentText -eq '(none)' -or $argumentText -imatch '^\$true$') {
+                return ('line {0}: -AllowSkip {1}' -f $command.Extent.StartLineNumber, $argumentText)
+            }
+        }
+    }
+
+    return 'ok'
+}
+
 # Every apply-result branch has to come from one constructor. Four hand-written literals drifted
 # apart before New-ApplyResultRecord existed: a property one branch happens not to set is a
 # terminating error under StrictMode for whoever reads apply-results.json back, and a field
@@ -1278,6 +1360,18 @@ if ($existingScripts.ContainsKey($guiPromptsPath)) {
     if ($rememberVerdict -ne 'ok') {
         $failures += ('{0}: the credential dialog must not offer to save a new password by default ({1})' -f $guiPromptsPath, $rememberVerdict)
     }
+
+    $skipGateVerdict = Test-CredentialDialogSkipIsGated -Ast (Get-ScriptAst -RelativePath $guiPromptsPath -Path $existingScripts[$guiPromptsPath])
+    if ($skipGateVerdict -ne 'ok') {
+        $failures += ('{0}: the credential dialog may offer Skip only when the caller allows it ({1})' -f $guiPromptsPath, $skipGateVerdict)
+    }
+}
+
+if ($existingScripts.ContainsKey($guiLauncherPath)) {
+    $skipScopeVerdict = Test-CredentialDialogSkipIsScoped -Ast (Get-ScriptAst -RelativePath $guiLauncherPath -Path $existingScripts[$guiLauncherPath])
+    if ($skipScopeVerdict -ne 'ok') {
+        $failures += ('{0}: only a guest credential prompt may offer Skip; a vCenter cannot be skipped ({1})' -f $guiLauncherPath, $skipScopeVerdict)
+    }
 }
 
 if ($existingScripts.ContainsKey($guestOpsLibPath)) {
@@ -1363,6 +1457,63 @@ if (-not [string]::IsNullOrWhiteSpace($PatchPlanPath)) {
 function Get-Something { return 1 }
 '@
 Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $resumeSource -Rule $resumeRule) -Expected $false -Message 'a return inside an unrelated function does not trip the script-tail rule'
+
+
+# Both halves of the credential-dialog skip rule, probed against synthetic sources. The rule
+# itself is the one the gate calls: a probe carrying its own copy would go on reporting that a
+# weakened rule works.
+$skipGateRule = {
+    param($Ast)
+    return ((Test-CredentialDialogSkipIsGated -Ast $Ast) -eq 'ok')
+}
+
+$skipGatedSource = @'
+function Show-CredentialDialog {
+    param([string]$Message, [switch]$AllowSkip)
+    $skip = New-Object System.Windows.Forms.Button
+    $skip.Visible = [bool]$AllowSkip
+    $skip.Enabled = [bool]$AllowSkip
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $skipGatedSource -Rule $skipGateRule) -Expected $true -Message 'a skip control gated on AllowSkip satisfies the credential dialog rule'
+
+$skipAlwaysVisibleSource = @'
+function Show-CredentialDialog {
+    param([string]$Message, [switch]$AllowSkip)
+    $skip = New-Object System.Windows.Forms.Button
+    $skip.Visible = $true
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $skipAlwaysVisibleSource -Rule $skipGateRule) -Expected $false -Message 'a skip control shown unconditionally trips the credential dialog rule'
+
+$skipNoParameterSource = @'
+function Show-CredentialDialog {
+    param([string]$Message)
+    $skip = New-Object System.Windows.Forms.Button
+    $skip.Visible = $false
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $skipNoParameterSource -Rule $skipGateRule) -Expected $false -Message 'a dialog without AllowSkip trips the credential dialog rule'
+
+$skipScopeRule = {
+    param($Ast)
+    return ((Test-CredentialDialogSkipIsScoped -Ast $Ast) -eq 'ok')
+}
+
+$skipScopedCallSource = @'
+$entered = Show-CredentialDialog -Title 'T' -Message $message -AllowSkip:($missing.Scope -eq 'guest')
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $skipScopedCallSource -Rule $skipScopeRule) -Expected $true -Message 'a per-scope AllowSkip argument satisfies the caller rule'
+
+$skipLiteralCallSource = @'
+$entered = Show-CredentialDialog -Title 'T' -Message $message -AllowSkip:$true
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $skipLiteralCallSource -Rule $skipScopeRule) -Expected $false -Message 'a literal AllowSkip trips the caller rule'
+
+$skipBareSwitchSource = @'
+$entered = Show-CredentialDialog -Title 'T' -Message $message -AllowSkip
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $skipBareSwitchSource -Rule $skipScopeRule) -Expected $false -Message 'a bare AllowSkip switch trips the caller rule'
 
 $resumeCommentSource = @'
 if (-not [string]::IsNullOrWhiteSpace($PatchPlanPath)) {

@@ -71,7 +71,12 @@ param(
     # variable as $viserverCredentialMap below (PowerShell variable names are
     # case-insensitive) and the supplied map would be silently overwritten.
     [hashtable]$StoredVIServerCredentials,
-    [hashtable]$StoredGuestCredentials
+    [hashtable]$StoredGuestCredentials,
+
+    # Guest accounts refused before the run started. Seeded into the credential context as
+    # skips, so those VMs resolve as Skipped instead of "no credential is available" - the
+    # resolver reads the skip before any lookup, so they cost no vCenter or ESXi call.
+    [string[]]$SkippedGuestCredentialTargets = @()
 )
 
 Set-StrictMode -Version 2.0
@@ -1936,7 +1941,7 @@ try {
             else {
                 $guestCredentialMap = Resolve-GuestCredentialMap -TargetNames @(@($patchPlanRecords) | ForEach-Object { [string]$_.vmName }) -OverrideCredential $GuestCredential -CredentialPromptScript $credentialPromptScript
             }
-            $guestCredentialContext = New-GuestCredentialContext -TargetNames @(@($patchPlanRecords) | ForEach-Object { [string]$_.vmName }) -CredentialMap $guestCredentialMap
+            $guestCredentialContext = New-GuestCredentialContext -TargetNames @(@($patchPlanRecords) | ForEach-Object { [string]$_.vmName }) -CredentialMap $guestCredentialMap -SkippedTargetNames $SkippedGuestCredentialTargets
             # Resume stays a single round. There is no discovery to judge the starting state
             # from, the saved keys carry a RevisionNumber that will not match a later round's
             # groups, and resume is typically run non-interactively with -SkipConfirmation,
@@ -1965,7 +1970,7 @@ try {
     else {
         $guestCredentialMap = Resolve-GuestCredentialMap -TargetNames $targetVMNames -OverrideCredential $GuestCredential -CredentialPromptScript $credentialPromptScript
     }
-    $guestCredentialContext = New-GuestCredentialContext -TargetNames $targetVMNames -CredentialMap $guestCredentialMap
+    $guestCredentialContext = New-GuestCredentialContext -TargetNames $targetVMNames -CredentialMap $guestCredentialMap -SkippedTargetNames $SkippedGuestCredentialTargets
 
     # Connections, corrected credentials and credential refusal decisions belong to the session.
     # Everything from the output directory through the summary belongs to one fresh scan cycle.

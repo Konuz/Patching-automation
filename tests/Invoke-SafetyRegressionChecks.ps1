@@ -1016,6 +1016,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $MaxPatchRounds = 2
         $SearchOnly = $false
         $PlanOnly = $false
+        $SkippedGuestCredentialTargets = @()
         $hasExplicitSelectedUpdateKeys = $false
         $SkipConfirmation = $true
         $PromptProvider = $null
@@ -1233,6 +1234,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         $MaxPatchRounds = 2
         $SearchOnly = $false
         $PlanOnly = $false
+        $SkippedGuestCredentialTargets = @()
         $hasExplicitSelectedUpdateKeys = $false
         $SkipConfirmation = $true
         $PromptProvider = $null
@@ -2124,6 +2126,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         $MaxPatchRounds = 1
         $SearchOnly = $false
         $PlanOnly = $false
+        $SkippedGuestCredentialTargets = @()
         $hasExplicitSelectedUpdateKeys = $NonInteractive
         $SelectedUpdateKeys = if ($NonInteractive) { @('66666666-6666-6666-6666-666666666666|1-not-selected') } else { @() }
         $SkipConfirmation = $NonInteractive
@@ -2299,6 +2302,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         $MaxPatchRounds = 2
         $SearchOnly = $false
         $PlanOnly = $false
+        $SkippedGuestCredentialTargets = @()
         $hasExplicitSelectedUpdateKeys = $false
         $SelectedUpdateKeys = @()
         $SkipConfirmation = $false

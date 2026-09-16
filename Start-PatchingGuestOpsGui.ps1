@@ -68,14 +68,26 @@ $missingKeys = @()
 $missingKeys += @(Get-MissingCredentialStoreKeys -Scope 'vcenter' -TargetNames $guiVIServers -Store $store)
 $missingKeys += @(Get-MissingCredentialStoreKeys -Scope 'guest' -TargetNames $guiVMNames -Store $store)
 
+# VMs the operator chose not to patch this run. They stay in the target list and are reported
+# as skipped rather than quietly dropped: a machine nobody patched must not vanish from the
+# summary, and the exit code has to say that less was done than was asked for.
+$skippedGuestTargets = @()
+
 foreach ($missing in $missingKeys) {
     $scopeLabel = if ($missing.Scope -eq 'vcenter') { 'vCenter' } else { 'guest' }
     $message = ('{0} credentials for {1} ({2})' -f $scopeLabel, $missing.Label, (@($missing.Members) -join ', '))
-    $entered = Show-CredentialDialog -Title 'PatchingGuestOps credentials' -Message $message
+    # Only a guest account can be skipped - see Show-CredentialDialog for why a vCenter cannot.
+    $entered = Show-CredentialDialog -Title 'PatchingGuestOps credentials' -Message $message -AllowSkip:($missing.Scope -eq 'guest')
 
     if ($null -eq $entered) {
         Write-Warning ('No credentials supplied for {0}; aborting before the run starts.' -f $missing.StoreKey)
         exit 1
+    }
+
+    if ([bool]$entered.Skipped) {
+        $skippedGuestTargets += @($missing.Members)
+        Write-Warning ('Skipping {0} for this run; these VM(s) are not patched: {1}' -f $missing.Label, (@($missing.Members) -join ', '))
+        continue
     }
 
     $store[$missing.StoreKey] = $entered.Credential
@@ -83,6 +95,13 @@ foreach ($missing in $missingKeys) {
     if ($entered.Remember) {
         $rememberedKeys += $missing.StoreKey
     }
+}
+
+# Skipping every account leaves nothing to run. Starting anyway would spend a vCenter login and
+# a full set of local checks to report what is already known here.
+if (@(@($guiVMNames) | Where-Object { @($skippedGuestTargets) -notcontains $_ }).Count -eq 0) {
+    Write-Warning 'Every VM was skipped at the credential prompt; there is nothing to patch.'
+    exit 1
 }
 
 $settingsToSave = $settingsResult.Settings
@@ -144,6 +163,7 @@ $launcherParams = @{
     PollSeconds = $settingsToSave.PollSeconds
     StoredVIServerCredentials = (Expand-CredentialStoreMap -Scope 'vcenter' -TargetNames $guiVIServers -Store $store)
     StoredGuestCredentials = (Expand-CredentialStoreMap -Scope 'guest' -TargetNames $guiVMNames -Store $store)
+    SkippedGuestCredentialTargets = @($skippedGuestTargets)
     PromptProvider = @{
         SelectUpdateGroups = {
             param($Arguments)

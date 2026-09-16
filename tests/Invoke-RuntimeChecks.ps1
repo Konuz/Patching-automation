@@ -2052,6 +2052,41 @@ if ($credentialRecoveryAvailable) {
     Assert-Equal -Actual $sharedSkipState.ValidationCalls -Expected 1 -Message 'a skipped shared account performs no later validation'
     Assert-Equal -Actual $sharedSkipState.DecisionCalls -Expected 1 -Message 'a skipped shared account performs no later decision callback'
 
+    # A VM the operator refused at the startup credential prompt, before anything ran. It has to
+    # arrive as a skip rather than as a missing credential: "no credential is available" is a gap
+    # somebody still has to fill, a skip is an answer, and only the skip is read before the
+    # resolver reaches for a credential - which is what keeps those VMs from costing a vCenter
+    # call each. Per VM, not per account: that prompt covers only the members no stored entry
+    # already covers, so VM02 below shares the domain account and keeps its own credential.
+    $preSkipContext = New-GuestCredentialContext -TargetNames @('VM01.example.test', 'VM02.example.test', 'standalone') `
+        -CredentialMap @{ 'VM02.example.test' = $oldGuestCredential; 'standalone' = $oldGuestCredential } `
+        -SkippedTargetNames @('vm01.EXAMPLE.test', '   ', '')
+    Assert-Equal -Actual $preSkipContext.SkippedTargetNames.ContainsKey('VM01.example.test') -Expected $true -Message 'a skipped target is recorded, matched without regard to case'
+    Assert-Equal -Actual $preSkipContext.SkippedTargetNames.Count -Expected 1 -Message 'blank entries record nothing'
+    Assert-Equal -Actual $preSkipContext.SkippedAccountKeys.Count -Expected 0 -Message 'a prompt skip is not an account refusal'
+
+    $script:preSkipValidationCalls = 0
+    $preSkipped = Resolve-GuestCredentialForTarget -VMName 'VM01.example.test' -Context $preSkipContext -Interactive -ValidateScript {
+        $script:preSkipValidationCalls++
+        throw 'a VM skipped before the run must not be validated'
+    } -DecisionScript { throw 'a VM skipped before the run must not prompt' }
+    Assert-Equal -Actual $preSkipped.Status -Expected 'Skipped' -Message 'a VM skipped at the credential prompt resolves as skipped, not as a missing credential'
+
+    $preSkipPeer = Resolve-GuestCredentialForTarget -VMName 'VM02.example.test' -Context $preSkipContext -Interactive -ValidateScript {
+        param($VMName, $Credential)
+        $script:preSkipValidationCalls++
+        [pscustomobject]@{ Status = 'Valid'; ErrorKind = $null; Error = $null }
+    } -DecisionScript { throw 'a peer that was not skipped must not prompt' }
+    Assert-Equal -Actual $preSkipPeer.Status -Expected 'Ready' -Message 'a peer on the same account keeps the credential it already had'
+
+    $preSkipOther = Resolve-GuestCredentialForTarget -VMName 'standalone' -Context $preSkipContext -Interactive -ValidateScript {
+        param($VMName, $Credential)
+        $script:preSkipValidationCalls++
+        [pscustomobject]@{ Status = 'Valid'; ErrorKind = $null; Error = $null }
+    } -DecisionScript { throw 'a VM on another account must not prompt' }
+    Assert-Equal -Actual $preSkipOther.Status -Expected 'Ready' -Message 'a VM on another account is unaffected by the skip'
+    Assert-Equal -Actual $script:preSkipValidationCalls -Expected 2 -Message 'only the skipped VM was kept away from validation'
+
     $script:nonInteractiveDecisionCalls = 0
     $nonInteractive = Resolve-GuestCredentialForTarget -VMName 'VM-noninteractive' -Context (New-GuestCredentialContext -TargetNames @('VM-noninteractive') -CredentialMap @{ 'VM-noninteractive' = $oldGuestCredential }) -ValidateScript {
         param($VMName, $Credential)

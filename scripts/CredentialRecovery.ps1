@@ -2,17 +2,39 @@ function New-GuestCredentialContext {
     [CmdletBinding()]
     param(
         [string[]]$TargetNames,
-        [hashtable]$CredentialMap
+        [hashtable]$CredentialMap,
+
+        # VMs the operator refused before the run started. Recorded as a skip rather than left
+        # as a missing credential, because the two are different facts: "no credential is
+        # available" is a gap somebody still has to fill, a skip is an answer. The resolver
+        # reads it before it looks for a credential, so those VMs cost no vCenter call.
+        [string[]]$SkippedTargetNames
     )
 
     if ($null -eq $CredentialMap) {
         $CredentialMap = @{}
     }
 
+    # Kept per VM, NOT per account, which is where the two kinds of skip differ. SkipAccount
+    # during recovery means the credential itself is refused, so it takes the whole account
+    # with it. This one only means "nobody supplied one for these machines", and the prompt
+    # that produced it covers exactly the members no stored entry already covers - so skipping
+    # it must not take a peer whose own credential is sitting in the store.
+    $skippedTargets = @{}
+    foreach ($skippedName in @($SkippedTargetNames)) {
+        $trimmedName = ([string]$skippedName).Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmedName)) {
+            continue
+        }
+
+        $skippedTargets[$trimmedName] = $true
+    }
+
     return @{
         Groups = @(Get-GuestCredentialGroups -TargetNames $TargetNames)
         CredentialMap = $CredentialMap
         SkippedAccountKeys = @{}
+        SkippedTargetNames = $skippedTargets
         ValidatedTargets = @{}
         Aborted = $false
     }
@@ -177,6 +199,14 @@ function Resolve-GuestCredentialForTarget {
 
     if ($Context.SkippedAccountKeys.ContainsKey($accountKey)) {
         return New-GuestCredentialResolution -Status Skipped -AccountKey $accountKey -Reason ('Account {0} is skipped for this run.' -f $accountKey)
+    }
+
+    # Before the credential lookup, so a VM the operator skipped at the startup prompt never
+    # reaches vCenter and is never reported as a gap somebody forgot to fill. ContainsKey
+    # rather than a property read: a context built before this field existed is still a valid
+    # context, and under StrictMode reaching for a key it does not carry is a terminating error.
+    if ($Context.ContainsKey('SkippedTargetNames') -and $Context.SkippedTargetNames.ContainsKey($VMName)) {
+        return New-GuestCredentialResolution -Status Skipped -AccountKey $accountKey -Reason ('{0} was skipped at the credential prompt for this run.' -f $VMName)
     }
 
     $credential = Get-GuestCredentialForGroup -Context $Context -Group $group
