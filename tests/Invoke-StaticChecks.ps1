@@ -287,9 +287,18 @@ if ($existingScripts.ContainsKey($agentPath)) {
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'failoverCluster'
     Assert-TextDoesNotMatch -RelativePath $agentPath -Text $agentText -Pattern '(?i)\$[a-z_][a-z0-9_]*\.HResult\b' -Reason 'WUA COM HResult can be absent under StrictMode'
     # Same class as the HResult rule, and it cost seven guests their discovery: PowerShell cannot
-    # always adapt the collection WUA returns, so reading Count off one directly is a
-    # PropertyNotFoundException under StrictMode rather than a number.
-    Assert-TextDoesNotMatch -RelativePath $agentPath -Text $agentText -Pattern '(?i)\$(searchResult\.Updates|searchWarnings|Collection)\.Count\b' -Reason 'WUA collections must be counted through Get-ComCollectionCount'
+    # always adapt the collection WUA returns, so reading Count off one at a call site is a
+    # PropertyNotFoundException under StrictMode rather than a number. Call sites go through the
+    # helper; the helper itself is the one place that reads the member.
+    Assert-TextDoesNotMatch -RelativePath $agentPath -Text $agentText -Pattern '(?i)\$(searchResult\.Updates|searchWarnings)\.Count\b' -Reason 'WUA collections must be counted through Get-ComCollectionCount'
+    # And the helper must keep reading it DIRECTLY. Going through PSObject.Properties looks more
+    # defensive and is strictly worse: PowerShell adapts a COM object through IDispatch, and with
+    # no usable type library the member bag is empty while $obj.Count still resolves by name, so
+    # introspection answers "cannot be counted" for collections that count perfectly well. That
+    # turned a fix for seven guests into a failure on every guest in the fleet, and no offline
+    # double can reproduce it - a PSCustomObject's bag and its direct access always agree.
+    Assert-TextMatches -RelativePath $agentPath -Text $agentText -Pattern '(?s)function\s+Get-ComCollectionCount\b(?:(?!\bfunction\b).)*?\$Collection\.Count' -Reason 'the COM count helper must read the member directly'
+    Assert-TextDoesNotMatch -RelativePath $agentPath -Text $agentText -Pattern '(?s)function\s+Get-ComCollectionCount\b(?:(?!\bfunction\b).)*?Get-OptionalPropertyValue' -Reason 'the COM count helper must not introspect the property bag'
 }
 
 if ($existingScripts.ContainsKey($workspaceHelperPath)) {

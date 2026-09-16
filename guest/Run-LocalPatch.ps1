@@ -132,20 +132,26 @@ function Get-ComCollectionCount {
     param($Collection)
 
     # WUA hands back collections PowerShell cannot always adapt. On some guests the object is a
-    # bare __ComObject with no members exposed, so under StrictMode reading Count off it is a
-    # PropertyNotFoundException rather than a number - which is how a whole VM's discovery was
-    # lost over a warnings list that decides nothing. Every COM count goes through here.
+    # bare __ComObject, so under StrictMode reading Count off it is a PropertyNotFoundException
+    # rather than a number - which is how a whole VM's discovery was lost over a warnings list
+    # that decides nothing. The try/catch is the whole mechanism here.
+    #
+    # It reads the member DIRECTLY and must keep doing so. Going through
+    # PSObject.Properties looks more defensive and is strictly worse: PowerShell adapts a COM
+    # object through IDispatch, and where there is no usable type library the member bag comes
+    # back EMPTY while $obj.Count still resolves by name. Introspecting the bag therefore
+    # answers "cannot be counted" for collections that count perfectly well - which turned a
+    # fix for seven guests into a failure on every guest in the fleet.
     #
     # $null means "this collection cannot be counted", which is deliberately a different fact
     # from zero: the caller decides whether that is fatal (the update collection) or merely
     # means there is no display metadata to harvest (warnings, KB ids, categories).
-    $count = Get-OptionalPropertyValue -InputObject $Collection -Name 'Count'
-    if ($null -eq $count) {
+    if ($null -eq $Collection) {
         return $null
     }
 
     try {
-        return [int]$count
+        return [int]$Collection.Count
     }
     catch {
         return $null
@@ -735,7 +741,7 @@ try {
 
     # The update collection is the one count that decides something, so an unreadable one does
     # fail the cycle - but by name, and after the result above is already on the record.
-    $availableUpdateCount = Get-ComCollectionCount -Collection (Get-OptionalPropertyValue -InputObject $searchResult -Name 'Updates')
+    $availableUpdateCount = Get-ComCollectionCount -Collection $searchResult.Updates
     if ($null -eq $availableUpdateCount) {
         throw 'WUA returned a search result whose update collection could not be read. Download and installation are blocked.'
     }
