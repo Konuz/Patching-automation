@@ -156,6 +156,10 @@ $launcherParams = @{
                 New-UpdateSelectionResult -Keys (Get-SelectedIdentityKeys -UpdateGroups $groups -CheckedIndexes $dialogResult.CheckedIndexes)
             }
         }
+        ConfirmRescan = {
+            param($Arguments)
+            Show-RescanDialog
+        }
         PromptCredential = {
             param([string]$Message)
             $entered = Show-CredentialDialog -Title 'PatchingGuestOps credentials' -Message $Message

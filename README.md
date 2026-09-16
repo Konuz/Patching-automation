@@ -60,7 +60,7 @@ Potrzebne poświadczenia (skrypt o nie zapyta, jeśli ich nie podasz):
 ## Szybki start
 
 Dostępne są dwa punkty wejścia:
-- **`Start-PatchingGuestOpsGui.ps1`** — tryb graficzny (okna dialogowe WinForms do wprowadzenia parametrów, wyboru maszyn, bezpiecznego wprowadzania i zapamiętywania poświadczeń DPAPI oraz wyboru grup poprawek).
+- **`Start-PatchingGuestOpsGui.ps1`** — tryb graficzny (okna dialogowe WinForms do wprowadzenia parametrów, wyboru maszyn, bezpiecznego wprowadzania i zapamiętywania poświadczeń DPAPI, wyboru grup poprawek oraz pytania o świeży reskan).
 - **`Start-PatchingGuestOps.ps1`** — tradycyjny launcher konsolowy do uruchomień w terminalu lub automatyzacji skryptowej.
 
 ```powershell
@@ -214,15 +214,19 @@ Krok po kroku:
 9. **Kolejna runda** — po potwierdzonym restarcie przebieg wraca do discovery i sprawdza, czy
    maszyny są już aktualne. „Zielona" znaczy: nie została żadna grupa, którą polityka domyślna by
    wybrała (sterowniki, preview i optional nie blokują), pomniejszona o grupy, które sam odznaczyłeś.
-   Jeśli coś zostało, skrypt pyta `CONTINUE`/`FINISH` i przy `CONTINUE` patchuje te maszyny
-   ponownie. Limit rund to `-MaxPatchRounds` (domyślnie 3 rundy instalacji plus końcowe discovery
-   weryfikacyjne). Artefakty każdej rundy trafiają do `out\<run>\round-NN\`, a `out\<run>\summary.md`
+   Jeśli coś zostało, skrypt pyta `CONTINUE`/`FINISH`. `CONTINUE` to kolejna runda **tylko dla
+   wypisanych maszyn**, czyli tych, które nie są jeszcze zielone: skanuje je ponownie i instaluje
+   to, co pozostało, a grupy odznaczone w tym cyklu pozostają odznaczone. Limit rund to
+   `-MaxPatchRounds` (domyślnie 3 rundy instalacji plus końcowe discovery weryfikacyjne).
+   Artefakty każdej rundy trafiają do `out\<run>\round-NN\`, a `out\<run>\summary.md`
    zbiera stan końcowy. Kolejna runda **nie** startuje, jeśli którakolwiek restartowana maszyna nie
    potwierdziła nowszego czasu startu.
 
-10. **Ponowny skan** — po zapisaniu podsumowania skrypt pyta
-    `Rescan the same VM(s)? [Y/N]`. `Y` rozpoczyna nowy cykl dla całej pierwotnej
-    listy VM, z nowym wyborem aktualizacji, wyzerowanymi wynikami i licznikiem rund oraz
+10. **Świeży pełny reskan** — po zapisaniu podsumowania skrypt pyta
+    `Start a fresh full rescan of every VM? [Y/N]`; w trybie GUI to osobne okno, a nie pytanie
+    w konsoli. To **nie** jest kontynuacja poprzedniego cyklu: `Y` rozpoczyna nowy cykl dla całej
+    pierwotnej listy VM — również maszyn już zielonych — z nowym wyborem aktualizacji (nic nie
+    jest przenoszone z poprzedniego cyklu), wyzerowanymi wynikami i licznikiem rund oraz
     osobnym katalogiem `out\<run>\`. Połączenia i poświadczenia, także poprawione podczas pracy,
     pozostają w sesji; testy startowe nie są powtarzane. Decyzje o pominięciu kont lub przerwaniu
     obsługi poświadczeń pozostają ważne w tej sesji. `N` lub pusty Enter kończy pracę i zamyka
@@ -733,7 +737,7 @@ scripts\
   GuestOpsLib.ps1                     # Helpery PowerCLI/GuestOps (transfer plików, uruchamianie procesów)
   OrchestratorRuntime.ps1             # Throttling, semantyka apply/reboot, artefakty restartu
   VMTargetLib.ps1                     # Wspólne rozwiązywanie nazw VM (launcher + orchestrator)
-  GuiPrompts.ps1                      # Okna dialogowe WinForms (parametry, poświadczenia, grupy)
+  GuiPrompts.ps1                      # Okna dialogowe WinForms (parametry, poświadczenia, grupy, reskan)
   SettingsStore.ps1                   # Zarządzanie ustawieniami i magazynem poświadczeń DPAPI
 guest\
   Run-LocalPatch.ps1                  # Agent działający w gościu (WUA COM)

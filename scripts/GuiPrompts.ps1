@@ -244,6 +244,56 @@ function Show-UpdateGroupDialog {
     }
 }
 
+function Show-RescanDialog {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'PatchingGuestOps rescan'
+    $form.Width = 560
+    $form.Height = 240
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.ShowInTaskbar = $true
+
+    $prompt = New-GuiLabel -Text 'This scan cycle is finished and its report is saved.' -Top 15
+    $prompt.Width = 520
+    $prompt.Height = 20
+
+    $detailText = 'A fresh rescan is not a continuation of this cycle. It scans every VM from the ' +
+        'original list again, asks for a new update selection with nothing carried over, restarts ' +
+        'round numbering and writes its own report.'
+    $detail = New-GuiLabel -Text $detailText -Top 45
+    $detail.Width = 520
+    $detail.Height = 80
+
+    $again = New-Object System.Windows.Forms.Button
+    $again.Text = 'Fresh full rescan'
+    $again.Left = 15
+    $again.Top = 150
+    $again.Width = 170
+    $again.DialogResult = [System.Windows.Forms.DialogResult]::OK
+
+    $finish = New-Object System.Windows.Forms.Button
+    $finish.Text = 'Finish'
+    $finish.Left = 415
+    $finish.Top = 150
+    $finish.Width = 110
+    $finish.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+
+    $form.Controls.AddRange(@($prompt, $detail, $again, $finish))
+    # Enter, Esc and the window's close button all finish, which is what an empty answer does in
+    # the console. A rescan rediscovers every VM on the list, so it starts on a deliberate click
+    # and never on a reflex keystroke.
+    $form.AcceptButton = $finish
+    $form.CancelButton = $finish
+
+    # Same reason as the update group dialog: this window opens hours into a run, behind the
+    # console window.
+    $form.Add_Shown({ $form.Activate() })
+    $result = $form.ShowDialog()
+    $form.Dispose()
+
+    return ($result -eq [System.Windows.Forms.DialogResult]::OK)
+}
+
 function Show-LauncherDialog {
     param($Settings)
 

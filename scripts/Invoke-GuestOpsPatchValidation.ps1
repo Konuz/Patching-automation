@@ -781,7 +781,9 @@ function Read-ContinuePatchingDecision {
     }
     Write-Host ''
     Write-Host 'Actions:'
-    Write-Host '  - CONTINUE  run another patch round for the VMs above.'
+    Write-Host '  - CONTINUE  another round for the VM(s) listed above only - the ones that are not'
+    Write-Host '              green yet. It rescans them and installs what is still outstanding;'
+    Write-Host '              update groups you unticked in this cycle stay unticked.'
     Write-Host '  - FINISH    stop patching now; the run ends with an error because they are not up to date.'
     Write-Host ''
 
@@ -797,12 +799,27 @@ function Read-ContinuePatchingDecision {
 }
 
 function Read-RescanDecision {
-    while ($true) {
-        $answer = ([string](Read-Host 'Rescan the same VM(s)? [Y/N]')).Trim().ToUpperInvariant()
-        if ($answer -eq 'Y') { return $true }
-        if ($answer -eq 'N' -or $answer -eq '') { return $false }
-        Write-Host 'Enter Y or N.'
-    }
+    param([hashtable]$PromptProvider)
+
+    # A GUI run answers this in a window. Without the seam the question stays in the console
+    # behind the update group dialog, where an operator who is watching the window never sees
+    # it and reads the wait as a hang.
+    return [bool](Invoke-OperatorPrompt -Provider $PromptProvider -Key 'ConfirmRescan' -Arguments @{} -FallbackScript {
+        param($promptArgs)
+
+        Write-Host ''
+        Write-Host 'This scan cycle is finished and its report is saved.'
+        Write-Host 'A fresh rescan is not a continuation of this cycle: it scans every VM from the'
+        Write-Host 'original list again, asks for a new update selection with nothing carried over,'
+        Write-Host 'restarts round numbering and writes its own report.'
+
+        while ($true) {
+            $answer = ([string](Read-Host 'Start a fresh full rescan of every VM? [Y/N]')).Trim().ToUpperInvariant()
+            if ($answer -eq 'Y') { return $true }
+            if ($answer -eq 'N' -or $answer -eq '') { return $false }
+            Write-Host 'Enter Y or N.'
+        }
+    })
 }
 
 function Write-PatchRoundVerification {
@@ -2251,7 +2268,7 @@ try {
     }
     # Saved plans exit above. Explicit keys, dry runs and unattended runs must not acquire a
     # new interactive prompt or silently reuse update revisions in another scan cycle.
-    } while (-not ($SearchOnly -or $PlanOnly -or $SkipConfirmation -or $hasExplicitSelectedUpdateKeys) -and (Read-RescanDecision))
+    } while (-not ($SearchOnly -or $PlanOnly -or $SkipConfirmation -or $hasExplicitSelectedUpdateKeys) -and (Read-RescanDecision -PromptProvider $PromptProvider))
 }
 catch {
     # Keep the origin. The message alone is reported against the launcher's call operator,

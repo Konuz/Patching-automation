@@ -66,8 +66,22 @@ function Invoke-RescanScenario {
     $MaxUpdates = 1
     $LocalOutputDirectory = Join-Path $testRoot ($Mode + '-' + $KeepConnected)
     $trace = [pscustomobject]@{
-        Connects = 0; Disconnects = @(); CredentialPrompts = 0; Prompts = 0
+        Connects = 0; Disconnects = @(); CredentialPrompts = 0; Prompts = 0; ProviderPrompts = 0
         Runs = @(); Discoveries = @(); Selections = @(); ExitCodes = @(); Contexts = @()
+    }
+    # A GUI run answers the end-of-cycle question in a window. The console fallback must then
+    # not run at all: two surfaces asking the same question is how an operator ends up staring
+    # at a prompt nobody told them about.
+    if ($Mode -eq 'Provider') {
+        $PromptProvider = @{
+            ConfirmRescan = {
+                param($Arguments)
+                $trace.ProviderPrompts++
+                Assert-Equal $trace.Disconnects.Count 0 'Connections stay open until the operator finishes'
+                Assert-Equal (Test-Path -LiteralPath (Join-Path $runOutputDirectory 'summary.md')) $true 'Summary is saved before the question'
+                ($trace.ProviderPrompts -eq 1)
+            }
+        }
     }
     $credential = New-Object pscredential('synthetic-user', (ConvertTo-SecureString 'synthetic-password' -AsPlainText -Force))
     $correctedCredential = New-Object pscredential('corrected-user', (ConvertTo-SecureString 'synthetic-corrected-password' -AsPlainText -Force))
@@ -144,7 +158,7 @@ function Invoke-RescanScenario {
         param($Prompt)
         $trace.Prompts++
         if ($trace.Prompts -gt 3) { throw 'Unexpected extra operator prompt' }
-        Assert-Equal $Prompt 'Rescan the same VM(s)? [Y/N]' 'End-of-cycle question'
+        Assert-Equal $Prompt 'Start a fresh full rescan of every VM? [Y/N]' 'End-of-cycle question'
         Assert-Equal $trace.Disconnects.Count 0 'Connections stay open until the operator finishes'
         Assert-Equal (Test-Path -LiteralPath (Join-Path $runOutputDirectory 'summary.md')) $true 'Summary is saved before the question'
         if ($trace.Prompts -eq 1) { return 'invalid' }
@@ -182,6 +196,12 @@ try {
         $secondPlan = Get-Content -LiteralPath (Join-Path $trace.Runs[1] 'round-01/patch-plan.json') -Raw | ConvertFrom-Json
         Assert-Equal (@($secondPlan | Where-Object { @($_.selectedUpdates).Count -eq 1 }).Count) 2 'Both previously selected and deselected updates can be selected in the new cycle'
     }
+    $providerResult = Invoke-RescanScenario -Mode 'Provider'
+    Assert-Equal $providerResult.Trace.Prompts 0 'A prompt provider answers instead of the console question'
+    Assert-Equal $providerResult.Trace.ProviderPrompts 2 'The provider is asked once per finished cycle'
+    Assert-Equal $providerResult.Trace.Runs.Count 2 'A provider yes starts a second cycle and its no stops'
+    Assert-Equal $providerResult.ExitCode 0 'The provider path returns the final cycle exit code'
+
     foreach ($mode in @('SearchOnly', 'PlanOnly', 'NonInteractive', 'ExplicitKeys', 'Exception')) {
         $result = Invoke-RescanScenario -Mode $mode
         Assert-Equal $result.Trace.Prompts 0 ($mode + ' does not add an end-of-cycle prompt')

@@ -3157,6 +3157,21 @@ else {
         $cancelledCredential = & $credentialBlock 'Credentials for vCenter vc1'
         Assert-Equal -Actual ($null -eq $cancelledCredential) -Expected $true -Message 'a cancelled credential dialog yields $null for the retry loop to reject'
 
+        # The end-of-cycle question. Read-RescanDecision casts this answer to [bool], so a
+        # provider that returned the dialog wrapper instead of its verdict would read as $true
+        # and start a full rescan of every VM nobody asked for.
+        $rescanPair = @($providerPairs | Where-Object { [string]$_.Item1.Extent.Text -eq 'ConfirmRescan' })
+        Assert-Equal -Actual $rescanPair.Count -Expected 1 -Message 'the GUI provider answers the rescan question in a window'
+        if ($rescanPair.Count -eq 1) {
+            $rescanBlock = $rescanPair[0].Item2.GetPureExpression().ScriptBlock.GetScriptBlock()
+
+            function Show-RescanDialog { return $true }
+            Assert-Equal -Actual (& $rescanBlock @{}) -Expected $true -Message 'an accepted rescan dialog starts another scan cycle'
+
+            function Show-RescanDialog { return $false }
+            Assert-Equal -Actual (& $rescanBlock @{}) -Expected $false -Message 'a declined rescan dialog ends the session'
+        }
+
         # The four recovery hooks. Each one is a scriptblock whose parameters must line up
         # positionally with a caller in another file, and nothing else checks that: a renamed
         # parameter or a swapped argument shows up as a password written under the wrong key.
