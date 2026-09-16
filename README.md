@@ -214,9 +214,10 @@ Krok po kroku:
 9. **Kolejna runda** — po potwierdzonym restarcie przebieg wraca do discovery i sprawdza, czy
    maszyny są już aktualne. „Zielona" znaczy: nie została żadna grupa, którą polityka domyślna by
    wybrała (sterowniki, preview i optional nie blokują), pomniejszona o grupy, które sam odznaczyłeś.
-   Jeśli coś zostało, skrypt pyta `CONTINUE`/`FINISH`. `CONTINUE` to kolejna runda **tylko dla
-   wypisanych maszyn**, czyli tych, które nie są jeszcze zielone: skanuje je ponownie i instaluje
-   to, co pozostało, a grupy odznaczone w tym cyklu pozostają odznaczone. Limit rund to
+   Jeśli coś zostało, skrypt pyta `CONTINUE`/`FINISH` (w trybie GUI: osobne okno).
+   `CONTINUE` to kolejna runda **tylko dla wypisanych maszyn**, czyli tych, które nie są jeszcze
+   zielone: skanuje je ponownie i instaluje to, co pozostało, a grupy odznaczone w tym cyklu
+   pozostają odznaczone. Limit rund to
    `-MaxPatchRounds` (domyślnie 3 rundy instalacji plus końcowe discovery weryfikacyjne).
    Artefakty każdej rundy trafiają do `out\<run>\round-NN\`, a `out\<run>\summary.md`
    zbiera stan końcowy. Kolejna runda **nie** startuje, jeśli którakolwiek restartowana maszyna nie

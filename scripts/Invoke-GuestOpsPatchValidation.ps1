@@ -772,30 +772,48 @@ function Confirm-PatchPlan {
 }
 
 function Read-ContinuePatchingDecision {
-    param($CompletionStates, [int]$Round)
+    param($CompletionStates, [int]$Round, [hashtable]$PromptProvider)
 
-    Write-Host ''
-    Write-Host ('After round {0} the following VM(s) still have selectable updates:' -f $Round)
-    foreach ($state in @(@($CompletionStates) | Where-Object { [string]$_.state -eq 'Pending' })) {
-        Write-Host ('- {0}: {1}' -f $state.vmName, $state.reason)
-    }
-    Write-Host ''
-    Write-Host 'Actions:'
-    Write-Host '  - CONTINUE  another round for the VM(s) listed above only - the ones that are not'
-    Write-Host '              green yet. It rescans them and installs what is still outstanding;'
-    Write-Host '              update groups you unticked in this cycle stay unticked.'
-    Write-Host '  - FINISH    stop patching now; the run ends with an error because they are not up to date.'
-    Write-Host ''
+    # Filtered here rather than in either surface, so the window and the console describe the
+    # same VMs. A GUI run answers this in a window for the same reason the rescan question moved:
+    # the console prompt waits behind the update group dialog and reads as a hang.
+    $pendingStates = @(@($CompletionStates) | Where-Object { [string]$_.state -eq 'Pending' })
 
-    $answer = ''
-    while (@('CONTINUE', 'FINISH') -notcontains $answer) {
-        $answer = ([string](Read-Host 'Choose CONTINUE, FINISH')).Trim().ToUpperInvariant()
-        if (@('CONTINUE', 'FINISH') -notcontains $answer) {
-            Write-Host 'Invalid choice. Options: CONTINUE / FINISH'
+    $decision = [string](Invoke-OperatorPrompt -Provider $PromptProvider -Key 'ContinuePatching' -Arguments @{ PendingStates = $pendingStates; Round = $Round } -FallbackScript {
+        param($promptArgs)
+
+        Write-Host ''
+        Write-Host ('After round {0} the following VM(s) still have selectable updates:' -f $promptArgs.Round)
+        foreach ($state in @($promptArgs.PendingStates)) {
+            Write-Host ('- {0}: {1}' -f $state.vmName, $state.reason)
         }
+        Write-Host ''
+        Write-Host 'Actions:'
+        Write-Host '  - CONTINUE  another round for the VM(s) listed above only - the ones that are not'
+        Write-Host '              green yet. It rescans them and installs what is still outstanding;'
+        Write-Host '              update groups you unticked in this cycle stay unticked.'
+        Write-Host '  - FINISH    stop patching now; the run ends with an error because they are not up to date.'
+        Write-Host ''
+
+        $answer = ''
+        while (@('CONTINUE', 'FINISH') -notcontains $answer) {
+            $answer = ([string](Read-Host 'Choose CONTINUE, FINISH')).Trim().ToUpperInvariant()
+            if (@('CONTINUE', 'FINISH') -notcontains $answer) {
+                Write-Host 'Invalid choice. Options: CONTINUE / FINISH'
+            }
+        }
+
+        return $answer
+    })
+
+    # Only an explicit CONTINUE starts another round, and nothing else is passed on as it stands:
+    # Get-PatchRoundDecision reads an empty decision as "still waiting for an answer" and would
+    # end the run on a reason that describes nothing the operator did.
+    if ($decision.Trim().ToUpperInvariant() -eq 'CONTINUE') {
+        return 'CONTINUE'
     }
 
-    return $answer
+    return 'FINISH'
 }
 
 function Read-RescanDecision {
@@ -2063,7 +2081,7 @@ try {
 
         $roundDecision = Get-PatchRoundDecision -CompletionStates $completionStates -Round $roundNumber -MaxRounds $MaxPatchRounds -OperatorDecision $null -ExplicitSelectionOnly $hasExplicitSelectedUpdateKeys -NonInteractive ([bool]$SkipConfirmation)
         if ($roundDecision.NeedsOperatorDecision) {
-            $roundDecision = Get-PatchRoundDecision -CompletionStates $completionStates -Round $roundNumber -MaxRounds $MaxPatchRounds -OperatorDecision (Read-ContinuePatchingDecision -CompletionStates $completionStates -Round ($roundNumber - 1)) -ExplicitSelectionOnly $hasExplicitSelectedUpdateKeys -NonInteractive ([bool]$SkipConfirmation)
+            $roundDecision = Get-PatchRoundDecision -CompletionStates $completionStates -Round $roundNumber -MaxRounds $MaxPatchRounds -OperatorDecision (Read-ContinuePatchingDecision -CompletionStates $completionStates -Round ($roundNumber - 1) -PromptProvider $PromptProvider) -ExplicitSelectionOnly $hasExplicitSelectedUpdateKeys -NonInteractive ([bool]$SkipConfirmation)
         }
 
         if ($roundDecision.Action -ne 'Continue') {

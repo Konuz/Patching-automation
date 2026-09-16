@@ -2096,7 +2096,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         return [pscustomobject]@{ Aborted = $false; Keys = @() }
     }
     function Confirm-PatchPlan { param([switch]$SkipConfirmation) $true }
-    function Read-ContinuePatchingDecision { param($CompletionStates, $Round) return 'FINISH' }
+    function Read-ContinuePatchingDecision { param($CompletionStates, $Round, $PromptProvider) return 'FINISH' }
     function Invoke-ApplyAndOptionalReboot {
         param($PatchPlanRecords, $VIServerScope, $Managers, $GuestCredentialMap, $VIServers, $VIServerCredentialMap, [switch]$IgnoreVCenterCertificate, $GuestOpsLibPath, $CurlPath, $AgentPath, $IdentityHelperPath, $WorkspaceScriptPath, $RunGuardScriptPath, $RebootRequestScriptPath, $GuestWorkingDirectory, $TimeoutSeconds, $RebootTimeoutSeconds, $PollSeconds, $CycleOutputDirectory, $ThrottleLimit, $RebootBatchSize, $DiscoveryRecords, $CredentialContext, $CredentialDecisionScript, $CredentialValidatedScript, $CredentialInteractive)
         return [pscustomobject]@{ ExitCode = 0; RebootRan = $false; RebootActions = @(); ApplyResults = @() }
@@ -2239,7 +2239,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
     }
     function Read-UpdateGroupSelection { param($UpdateGroups, $PromptProvider) return [pscustomobject]@{ Aborted = $false; Keys = @(@($UpdateGroups) | ForEach-Object { [string]$_.identityKey }) } }
     function Confirm-PatchPlan { param([switch]$SkipConfirmation) $true }
-    function Read-ContinuePatchingDecision { param($CompletionStates, $Round) return 'CONTINUE' }
+    function Read-ContinuePatchingDecision { param($CompletionStates, $Round, $PromptProvider) return 'CONTINUE' }
     function Write-PatchRoundVerification { param($CompletionStates, $Round) }
     function Write-PatchRunSummary { param($RunOutputDirectory, $RoundSummaries, $FinalStateMap) }
     function Show-UpdateGroups { param($UpdateGroups) }

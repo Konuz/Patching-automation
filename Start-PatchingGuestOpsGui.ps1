@@ -156,6 +156,10 @@ $launcherParams = @{
                 New-UpdateSelectionResult -Keys (Get-SelectedIdentityKeys -UpdateGroups $groups -CheckedIndexes $dialogResult.CheckedIndexes)
             }
         }
+        ContinuePatching = {
+            param($Arguments)
+            Show-ContinuePatchingDialog -PendingStates @($Arguments.PendingStates) -Round ([int]$Arguments.Round)
+        }
         ConfirmRescan = {
             param($Arguments)
             Show-RescanDialog

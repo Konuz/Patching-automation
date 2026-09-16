@@ -244,6 +244,72 @@ function Show-UpdateGroupDialog {
     }
 }
 
+function Show-ContinuePatchingDialog {
+    param($PendingStates, [int]$Round)
+
+    $states = @($PendingStates)
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'PatchingGuestOps - updates still outstanding'
+    $form.Width = 760
+    $form.Height = 420
+    $form.StartPosition = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.ShowInTaskbar = $true
+
+    $prompt = New-GuiLabel -Text ('After round {0} the following VM(s) still have selectable updates:' -f $Round) -Top 12
+    $prompt.Width = 718
+    $prompt.Height = 20
+
+    $list = New-Object System.Windows.Forms.ListBox
+    $list.Left = 12
+    $list.Top = 40
+    $list.Width = 718
+    $list.Height = 200
+    foreach ($state in $states) {
+        [void]$list.Items.Add(('{0}: {1}' -f $state.vmName, $state.reason))
+    }
+
+    $detailText = 'Continue runs another round for those VM(s) only. It rescans them and installs what is ' +
+        'still outstanding; update groups you unticked in this cycle stay unticked. Finish stops patching ' +
+        'now, and the run ends with an error because those VMs are not up to date.'
+    $detail = New-GuiLabel -Text $detailText -Top 250
+    $detail.Width = 718
+    $detail.Height = 60
+
+    $continue = New-Object System.Windows.Forms.Button
+    $continue.Text = 'Continue patching'
+    $continue.Left = 12
+    $continue.Top = 325
+    $continue.Width = 170
+    $continue.DialogResult = [System.Windows.Forms.DialogResult]::OK
+
+    $finish = New-Object System.Windows.Forms.Button
+    $finish.Text = 'Finish'
+    $finish.Left = 620
+    $finish.Top = 325
+    $finish.Width = 110
+    $finish.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+
+    $form.Controls.AddRange(@($prompt, $list, $detail, $continue, $finish))
+    # Enter, Esc and the window's close button all finish. Another round starts guest agents on
+    # machines that are not up to date, so it begins on a deliberate click - the same rule the
+    # rescan dialog follows.
+    $form.AcceptButton = $finish
+    $form.CancelButton = $finish
+
+    # This window appears hours into a run, behind the console window.
+    $form.Add_Shown({ $form.Activate() })
+    $result = $form.ShowDialog()
+    $form.Dispose()
+
+    if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+        return 'CONTINUE'
+    }
+
+    return 'FINISH'
+}
+
 function Show-RescanDialog {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'PatchingGuestOps rescan'

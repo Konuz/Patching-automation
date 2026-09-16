@@ -2945,6 +2945,39 @@ else {
     Assert-Equal -Actual $otherKey -Expected 'console' -Message 'a provider carrying a different key does not answer this prompt'
 }
 
+# --- Continue/finish decision (scripts/Invoke-GuestOpsPatchValidation.ps1, AST-extracted) ---
+# Under the GUI this verdict is whatever a window returned, so only an explicit CONTINUE may
+# start another round. Passing anything else on as it stands is worse than stopping: an empty
+# decision reads to Get-PatchRoundDecision as "nobody has answered yet", and the run would end
+# on a reason describing nothing the operator did.
+$continueDefinition = @($orchestratorFunctions | Where-Object { $_.Name -eq 'Read-ContinuePatchingDecision' })
+if ($continueDefinition.Count -eq 0) {
+    Add-Failure -Message 'Orchestrator function not found: Read-ContinuePatchingDecision'
+}
+else {
+    . ([scriptblock]::Create($continueDefinition[0].Extent.Text))
+
+    $continueStates = @(
+        [pscustomobject]@{ vmName = 'VM01'; state = 'Pending'; reason = '2 selectable update group(s) still apply.' },
+        [pscustomobject]@{ vmName = 'VM02'; state = 'Green'; reason = 'No selectable updates remain.' }
+    )
+
+    $script:continuePromptArgs = $null
+    $continueAnswer = Read-ContinuePatchingDecision -CompletionStates $continueStates -Round 2 -PromptProvider @{
+        ContinuePatching = { param($promptArgs) $script:continuePromptArgs = $promptArgs; 'CONTINUE' }
+    }
+    Assert-Equal -Actual $continueAnswer -Expected 'CONTINUE' -Message 'the provider answer drives the round decision'
+    Assert-Equal -Actual (@($script:continuePromptArgs.PendingStates).Count) -Expected 1 -Message 'only pending VMs are offered as the next round targets'
+    Assert-Equal -Actual ([string](@($script:continuePromptArgs.PendingStates)[0].vmName)) -Expected 'VM01' -Message 'the pending VM travels to the prompt'
+    Assert-Equal -Actual ([int]$script:continuePromptArgs.Round) -Expected 2 -Message 'the round number travels to the prompt'
+
+    foreach ($rawAnswer in @('CONTINUE', ' continue ', 'FINISH', 'finish', '', 'Cancel')) {
+        $normalized = Read-ContinuePatchingDecision -CompletionStates $continueStates -Round 2 -PromptProvider @{ ContinuePatching = { param($promptArgs) $rawAnswer } }
+        $expected = if ($rawAnswer.Trim().ToUpperInvariant() -eq 'CONTINUE') { 'CONTINUE' } else { 'FINISH' }
+        Assert-Equal -Actual $normalized -Expected $expected -Message ('a provider answer of "{0}" resolves to {1}' -f $rawAnswer, $expected)
+    }
+}
+
 # Write-FinalReport counts six groups of VMs, and the reboot group is the one that can legally
 # be empty. An if-expression assigns its branch's pipeline output and an empty collection emits
 # nothing, so @() inside a branch assigned $null and the count threw under StrictMode. That state
@@ -3170,6 +3203,30 @@ else {
 
             function Show-RescanDialog { return $false }
             Assert-Equal -Actual (& $rescanBlock @{}) -Expected $false -Message 'a declined rescan dialog ends the session'
+        }
+
+        # The round question. Its two arguments are built in one file and consumed in another,
+        # and a dialog handed the full completion state instead of the pending subset would list
+        # green VMs as work still outstanding.
+        $continuePair = @($providerPairs | Where-Object { [string]$_.Item1.Extent.Text -eq 'ContinuePatching' })
+        Assert-Equal -Actual $continuePair.Count -Expected 1 -Message 'the GUI provider answers the round question in a window'
+        if ($continuePair.Count -eq 1) {
+            $continueBlock = $continuePair[0].Item2.GetPureExpression().ScriptBlock.GetScriptBlock()
+
+            $script:continueDialogArgs = $null
+            function Show-ContinuePatchingDialog {
+                param($PendingStates, [int]$Round)
+                $script:continueDialogArgs = [pscustomobject]@{
+                    Names = @(@($PendingStates) | ForEach-Object { [string]$_.vmName })
+                    Round = $Round
+                }
+                return 'CONTINUE'
+            }
+
+            $continueOutcome = & $continueBlock @{ PendingStates = @([pscustomobject]@{ vmName = 'VM01'; reason = 'still pending' }); Round = 3 }
+            Assert-Equal -Actual $continueOutcome -Expected 'CONTINUE' -Message 'the round provider returns the dialog verdict'
+            Assert-Equal -Actual (@($script:continueDialogArgs.Names) -join ',') -Expected 'VM01' -Message 'the provider hands the pending VM list to the dialog'
+            Assert-Equal -Actual $script:continueDialogArgs.Round -Expected 3 -Message 'the provider hands the round number to the dialog'
         }
 
         # The four recovery hooks. Each one is a scriptblock whose parameters must line up
