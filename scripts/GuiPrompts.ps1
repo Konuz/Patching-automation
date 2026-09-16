@@ -224,7 +224,11 @@ function Show-UpdateGroupDialog {
     $list.Top = 12
     $list.Width = 860
     $list.Height = 330
-    $list.CheckOnClick = $true
+    # Selecting a row must not change what gets installed. CheckOnClick toggled the box wherever
+    # the row was clicked, so reading an entry's text was enough to approve or refuse an update
+    # on the whole fleet. Off is not sufficient on its own: WinForms then toggles on the SECOND
+    # click anywhere on an already-selected row, which is the same accident one click later.
+    $list.CheckOnClick = $false
 
     foreach ($group in $groups) {
         $kbText = if ([string]::IsNullOrWhiteSpace([string]$group.kbText)) { 'No KB' } else { [string]$group.kbText }
@@ -236,6 +240,36 @@ function Show-UpdateGroupDialog {
             $list.SetItemChecked($index, $true)
         }
     }
+
+    # So the box changes only on a deliberate hit: a click on the glyph, or Space on the selected
+    # row. Everything else is refused in ItemCheck by writing the current value back. Wired AFTER
+    # the defaults above, because SetItemChecked raises ItemCheck too and the guard would cancel
+    # the default policy's own ticks.
+    $checkGuard = [pscustomobject]@{ Allow = $false }
+
+    $list.Add_MouseDown({
+        param($eventSender, $mouseArgs)
+        # The glyph is drawn in a box at the row's left edge, so its width tracks the row height
+        # and therefore the DPI. Deliberately generous: a bound that is slightly too wide costs a
+        # toggle from just beside the box, one that is too narrow makes the box unclickable.
+        $checkGuard.Allow = ($mouseArgs.X -le ($list.ItemHeight + 4))
+    })
+
+    $list.Add_KeyDown({
+        param($eventSender, $keyArgs)
+        if ($keyArgs.KeyCode -eq [System.Windows.Forms.Keys]::Space) {
+            $checkGuard.Allow = $true
+        }
+    })
+
+    $list.Add_ItemCheck({
+        param($eventSender, $itemArgs)
+        if (-not $checkGuard.Allow) {
+            $itemArgs.NewValue = $itemArgs.CurrentValue
+        }
+
+        $checkGuard.Allow = $false
+    })
 
     # The counts on each row say that something was excluded; only the names say which machine
     # somebody has to patch by hand. A pane rather than more text on the row: a fleet's worth of

@@ -1154,6 +1154,46 @@ function Test-CredentialDialogSkipIsGated {
     return 'ok'
 }
 
+
+# Reading a row must not change what gets installed on the fleet. The update group list therefore
+# leaves CheckOnClick off AND refuses an ItemCheck the operator did not aim at the box - off alone
+# still lets WinForms toggle on the second click anywhere on an already-selected row. Exercising a
+# WinForms list needs an STA host and a desktop the gates cannot assume, so both halves are pinned
+# here. Returns 'ok', or the half that is missing.
+function Test-UpdateGroupDialogChecksOnlyOnPurpose {
+    param($Ast)
+
+    $definition = @($Ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Show-UpdateGroupDialog'
+            }, $true))
+
+    if ($definition.Count -eq 0) {
+        return 'Show-UpdateGroupDialog was not found'
+    }
+
+    foreach ($assignment in @($definition[0].FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.AssignmentStatementAst]
+                }, $true))) {
+        if ((([string]$assignment.Left.Extent.Text) -match '(?i)\.CheckOnClick$') -and
+            (([string]$assignment.Right.Extent.Text).Trim() -imatch '^\$true$')) {
+            return ('line {0}: the whole row toggles the box' -f $assignment.Extent.StartLineNumber)
+        }
+    }
+
+    $guards = @($definition[0].FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and ([string]$node.Member.Extent.Text) -eq 'Add_ItemCheck'
+            }, $true))
+
+    if ($guards.Count -eq 0) {
+        return 'nothing refuses a check the operator did not aim at the box'
+    }
+
+    return 'ok'
+}
+
 # The other half of the same rule, on the caller: the GUI must decide per scope, so a literal
 # $true passed to -AllowSkip would offer Skip on the vCenter prompt too.
 function Test-CredentialDialogSkipIsScoped {
@@ -1365,6 +1405,11 @@ if ($existingScripts.ContainsKey($guiPromptsPath)) {
     if ($skipGateVerdict -ne 'ok') {
         $failures += ('{0}: the credential dialog may offer Skip only when the caller allows it ({1})' -f $guiPromptsPath, $skipGateVerdict)
     }
+
+    $checkIntentVerdict = Test-UpdateGroupDialogChecksOnlyOnPurpose -Ast (Get-ScriptAst -RelativePath $guiPromptsPath -Path $existingScripts[$guiPromptsPath])
+    if ($checkIntentVerdict -ne 'ok') {
+        $failures += ('{0}: selecting an update row must not tick its box ({1})' -f $guiPromptsPath, $checkIntentVerdict)
+    }
 }
 
 if ($existingScripts.ContainsKey($guiLauncherPath)) {
@@ -1494,6 +1539,41 @@ function Show-CredentialDialog {
 }
 '@
 Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $skipNoParameterSource -Rule $skipGateRule) -Expected $false -Message 'a dialog without AllowSkip trips the credential dialog rule'
+
+
+$checkIntentRule = {
+    param($Ast)
+    return ((Test-UpdateGroupDialogChecksOnlyOnPurpose -Ast $Ast) -eq 'ok')
+}
+
+$checkIntentGuardedSource = @'
+function Show-UpdateGroupDialog {
+    param($UpdateGroups)
+    $list = New-Object System.Windows.Forms.CheckedListBox
+    $list.CheckOnClick = $false
+    $list.Add_ItemCheck({ param($eventSender, $itemArgs) $itemArgs.NewValue = $itemArgs.CurrentValue })
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $checkIntentGuardedSource -Rule $checkIntentRule) -Expected $true -Message 'a guarded update list satisfies the check-intent rule'
+
+$checkIntentOnClickSource = @'
+function Show-UpdateGroupDialog {
+    param($UpdateGroups)
+    $list = New-Object System.Windows.Forms.CheckedListBox
+    $list.CheckOnClick = $true
+    $list.Add_ItemCheck({ param($eventSender, $itemArgs) $itemArgs.NewValue = $itemArgs.CurrentValue })
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $checkIntentOnClickSource -Rule $checkIntentRule) -Expected $false -Message 'toggling on any click in the row trips the check-intent rule'
+
+$checkIntentNoGuardSource = @'
+function Show-UpdateGroupDialog {
+    param($UpdateGroups)
+    $list = New-Object System.Windows.Forms.CheckedListBox
+    $list.CheckOnClick = $false
+}
+'@
+Assert-ProbeResult -Actual (Test-AstRuleOnText -Text $checkIntentNoGuardSource -Rule $checkIntentRule) -Expected $false -Message 'an unguarded ItemCheck trips the check-intent rule'
 
 $skipScopeRule = {
     param($Ast)
