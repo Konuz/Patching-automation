@@ -286,6 +286,10 @@ if ($existingScripts.ContainsKey($agentPath)) {
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'roleFlags'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'failoverCluster'
     Assert-TextDoesNotMatch -RelativePath $agentPath -Text $agentText -Pattern '(?i)\$[a-z_][a-z0-9_]*\.HResult\b' -Reason 'WUA COM HResult can be absent under StrictMode'
+    # Same class as the HResult rule, and it cost seven guests their discovery: PowerShell cannot
+    # always adapt the collection WUA returns, so reading Count off one directly is a
+    # PropertyNotFoundException under StrictMode rather than a number.
+    Assert-TextDoesNotMatch -RelativePath $agentPath -Text $agentText -Pattern '(?i)\$(searchResult\.Updates|searchWarnings|Collection)\.Count\b' -Reason 'WUA collections must be counted through Get-ComCollectionCount'
 }
 
 if ($existingScripts.ContainsKey($workspaceHelperPath)) {

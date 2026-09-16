@@ -231,6 +231,11 @@ function Invoke-AgentFixture {
         # because a retry pass receives a shorter collection and what these tests are about is
         # which package ended up in which pass. Unlisted updates answer Succeeded.
         $InstallPasses = $null,
+        # The shape WUA hands back for a collection. 'NoCount' is an object PowerShell cannot
+        # adapt at all - reading .Count throws PropertyNotFoundException under StrictMode, which
+        # is what actually happened on seven guests; 'ItemThrows' counts but refuses the entry.
+        [ValidateSet('Ok', 'NoCount', 'ItemThrows')][string]$WarningsMode = 'Ok',
+        [bool]$UpdatesUnreadable = $false,
         [bool]$ClusterMembershipUnknown = $false)
     # Only external effects are mocked: local probes, artifact I/O, and WUA COM.
     function Write-AgentLog { param($Message) }
@@ -301,10 +306,32 @@ function Invoke-AgentFixture {
     }
     if ($Empty) { $searchUpdateObjects = @() }
 
-    $updates = [pscustomobject]@{ Count = @($searchUpdateObjects).Count; Value = @($searchUpdateObjects) }
-    $updates | Add-Member ScriptMethod Item { param($Index) $this.Value[$Index] }
-    $warnings = [pscustomobject]@{ Count = $(if ($SearchCode -eq 3) { 1 } else { 0 }) }
-    $warnings | Add-Member ScriptMethod Item { param($Index) [pscustomobject]@{ Message = 'Search results incomplete'; HResult = -2145124338; Context = 1 } }
+    $updates = if ($UpdatesUnreadable) {
+        # No Count and no Item: the collection is there, and nothing can be read off it.
+        [pscustomobject]@{ Value = @($searchUpdateObjects) }
+    }
+    else {
+        $adaptableUpdates = [pscustomobject]@{ Count = @($searchUpdateObjects).Count; Value = @($searchUpdateObjects) }
+        $adaptableUpdates | Add-Member ScriptMethod Item { param($Index) $this.Value[$Index] }
+        $adaptableUpdates
+    }
+    $warnings = switch ($WarningsMode) {
+        'NoCount' {
+            $unadaptableWarnings = [pscustomobject]@{ Value = 1 }
+            $unadaptableWarnings | Add-Member ScriptMethod Item { param($Index) [pscustomobject]@{ Message = 'never reached'; HResult = 0; Context = 1 } }
+            $unadaptableWarnings
+        }
+        'ItemThrows' {
+            $refusingWarnings = [pscustomobject]@{ Count = 1 }
+            $refusingWarnings | Add-Member ScriptMethod Item { param($Index) throw 'synthetic: the warning entry cannot be read' }
+            $refusingWarnings
+        }
+        default {
+            $ordinaryWarnings = [pscustomobject]@{ Count = $(if ($SearchCode -eq 3) { 1 } else { 0 }) }
+            $ordinaryWarnings | Add-Member ScriptMethod Item { param($Index) [pscustomobject]@{ Message = 'Search results incomplete'; HResult = -2145124338; Context = 1 } }
+            $ordinaryWarnings
+        }
+    }
     $searcher = [pscustomobject]@{ ClientApplicationID = ''; Value = [pscustomobject]@{ ResultCode = $SearchCode; Updates = $updates; Warnings = $warnings } }
     $searcher | Add-Member ScriptMethod Search { param($Criteria) $this.Value }
     $operationResult = [pscustomobject]@{ ResultCode = 2; RebootRequired = $PendingReboot }
@@ -407,6 +434,36 @@ if ($searchWarnings.Count -eq 1) {
 $emptyScan = Invoke-AgentFixture -Empty $true -SearchOnly
 Assert-Equal $emptyScan.ExitCode 0 'complete empty scan remains successful'
 Assert-Equal $emptyScan.State 'Green' 'complete empty scan remains Green'
+Assert-Equal $emptyScan.Status.searchResult.warningsUnreadable $null 'an ordinary search records no warning-read problem'
+
+# --- a collection WUA hands back unreadable must not cost the VM ------------------------------
+# On seven guests of one fleet $searchWarnings.Count threw PropertyNotFoundException under
+# StrictMode - PowerShell could not adapt the object WUA returned - and the top-level catch
+# turned that into DiscoveryFailed for the whole machine. Warnings are diagnostic metadata:
+# nothing in the run decides on them, so losing a VM over them is never the right answer.
+$warningsNoCount = Invoke-AgentFixture -Empty $true -SearchOnly -WarningsMode 'NoCount'
+Assert-Equal $warningsNoCount.ExitCode 0 'a warnings collection that cannot be counted does not fail the cycle'
+Assert-Equal $warningsNoCount.Status.outcome 'NoApplicableUpdates' 'discovery still reaches its own verdict'
+Assert-Equal $warningsNoCount.State 'Green' 'a guest whose warnings cannot be read is still assessed normally'
+Assert-Equal ([bool]$warningsNoCount.Status.searchResult.warningsUnreadable) $true 'the artifact says the warnings could not be read'
+Assert-Equal (@($warningsNoCount.Status.searchResult.warnings).Count) 0 'no warning is invented when none could be read'
+Assert-Equal ([int]$warningsNoCount.Status.searchResult.resultCode) 2 'what WUA answered is still recorded'
+
+# The entry can refuse for the same reason the count can, and one bad entry is not the batch.
+$warningsItemThrows = Invoke-AgentFixture -Empty $true -SearchOnly -WarningsMode 'ItemThrows'
+Assert-Equal $warningsItemThrows.ExitCode 0 'a warning entry that cannot be read does not fail the cycle either'
+Assert-Equal $warningsItemThrows.Status.outcome 'NoApplicableUpdates' 'discovery still reaches its own verdict'
+Assert-Equal ([bool]$warningsItemThrows.Status.searchResult.warningsUnreadable) $true 'a refused warning entry is recorded rather than thrown'
+
+# The update collection is the one count that decides something, so it does fail the cycle -
+# but by name, and only after the search result is on the record. The old order counted first,
+# so the artifact carried no ResultCode at all and nobody could tell what WUA had answered.
+$updatesUnreadable = Invoke-AgentFixture -SearchOnly -UpdatesUnreadable $true
+Assert-Equal $updatesUnreadable.ExitCode 1 'an update collection that cannot be read fails the cycle'
+Assert-Equal $updatesUnreadable.Status.outcome 'Failed' 'an unreadable update collection is a failure'
+Assert-Equal $updatesUnreadable.State 'Failed' 'an unreadable update collection cannot become Green'
+Assert-Equal ([int]$updatesUnreadable.Status.searchResult.resultCode) 2 'the search result is recorded before any count is attempted'
+Assert-Equal $updatesUnreadable.DownloadCalled $false 'nothing is downloaded when the update collection cannot be read'
 $ordinaryApply = Invoke-AgentFixture -PendingReboot $true
 Assert-Equal $ordinaryApply.InstallCalled $true 'ordinary selected updates still reach WUA install'
 Assert-Equal $ordinaryApply.Status.outcome 'InstallSucceeded' 'ordinary successful installation stays successful'

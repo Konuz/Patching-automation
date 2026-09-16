@@ -128,16 +128,48 @@ function ConvertTo-UpdateTypeName {
     }
 }
 
+function Get-ComCollectionCount {
+    param($Collection)
+
+    # WUA hands back collections PowerShell cannot always adapt. On some guests the object is a
+    # bare __ComObject with no members exposed, so under StrictMode reading Count off it is a
+    # PropertyNotFoundException rather than a number - which is how a whole VM's discovery was
+    # lost over a warnings list that decides nothing. Every COM count goes through here.
+    #
+    # $null means "this collection cannot be counted", which is deliberately a different fact
+    # from zero: the caller decides whether that is fatal (the update collection) or merely
+    # means there is no display metadata to harvest (warnings, KB ids, categories).
+    $count = Get-OptionalPropertyValue -InputObject $Collection -Name 'Count'
+    if ($null -eq $count) {
+        return $null
+    }
+
+    try {
+        return [int]$count
+    }
+    catch {
+        return $null
+    }
+}
+
 function Get-ComStringCollection {
     param($Collection)
 
     $values = @()
-    if ($null -eq $Collection) {
+    $count = Get-ComCollectionCount -Collection $Collection
+    if ($null -eq $count) {
         return $values
     }
 
-    for ($i = 0; $i -lt $Collection.Count; $i++) {
-        $values += [string]$Collection.Item($i)
+    for ($i = 0; $i -lt $count; $i++) {
+        # Guarded per item for the same reason the count is: one unreadable entry must not cost
+        # the caller the whole collection, let alone the VM.
+        try {
+            $values += [string]$Collection.Item($i)
+        }
+        catch {
+            Write-AgentLog -Message ('Unable to read collection entry at index {0}: {1}' -f $i, $_.Exception.Message)
+        }
     }
 
     return $values
@@ -175,11 +207,12 @@ function Get-ComCategoryCollection {
     param($Collection)
 
     $values = @()
-    if ($null -eq $Collection) {
+    $count = Get-ComCollectionCount -Collection $Collection
+    if ($null -eq $count) {
         return $values
     }
 
-    for ($i = 0; $i -lt $Collection.Count; $i++) {
+    for ($i = 0; $i -lt $count; $i++) {
         try {
             $category = $Collection.Item($i)
             if ($null -ne $category -and -not [string]::IsNullOrWhiteSpace([string]$category.Name)) {
@@ -201,11 +234,12 @@ function Get-ComCategoryIdCollection {
     # display text only. The CategoryID is the stable classification GUID, and it is what the
     # selection policy decides on.
     $values = @()
-    if ($null -eq $Collection) {
+    $count = Get-ComCollectionCount -Collection $Collection
+    if ($null -eq $count) {
         return $values
     }
 
-    for ($i = 0; $i -lt $Collection.Count; $i++) {
+    for ($i = 0; $i -lt $count; $i++) {
         try {
             $category = $Collection.Item($i)
             $categoryId = [string](Get-OptionalStringPropertyValue -InputObject $category -Name 'CategoryID')
@@ -660,36 +694,65 @@ try {
     $updateSearcher.ClientApplicationID = 'PatchingGuestOpsPhase0b'
     $searchResult = $updateSearcher.Search($SearchCriteria)
 
-    $status.availableUpdateCount = [int]$searchResult.Updates.Count
+    # What WUA answered goes on the record BEFORE anything is counted. The old order counted
+    # first and threw on the count, so a guest whose collections this agent could not read left
+    # an artifact with no ResultCode in it at all - the one field that says whether the search
+    # was even healthy.
     $status.searchResult = [ordered]@{
         resultCode = [int]$searchResult.ResultCode
         result = Convert-ResultCode -ResultCode $searchResult.ResultCode
         hResult = Format-HResult -HResult (Get-OptionalPropertyValue -InputObject $searchResult -Name 'HResult')
         warnings = @()
+        # Set when WUA returned warnings this agent could not read. Not an error in itself:
+        # warnings are diagnostic metadata and nothing in the run decides on them.
+        warningsUnreadable = $null
     }
 
     $searchWarnings = Get-OptionalPropertyValue -InputObject $searchResult -Name 'Warnings'
     if ($null -ne $searchWarnings) {
-        for ($i = 0; $i -lt $searchWarnings.Count; $i++) {
-            $searchWarning = $searchWarnings.Item($i)
-            $status.searchResult.warnings += [ordered]@{
-                message = Get-OptionalStringPropertyValue -InputObject $searchWarning -Name 'Message'
-                hResult = Format-HResult -HResult (Get-OptionalPropertyValue -InputObject $searchWarning -Name 'HResult')
-                context = Get-OptionalPropertyValue -InputObject $searchWarning -Name 'Context'
+        $searchWarningCount = Get-ComCollectionCount -Collection $searchWarnings
+        if ($null -eq $searchWarningCount) {
+            $status.searchResult.warningsUnreadable = 'WUA returned a warnings collection that does not expose a readable Count.'
+            Write-AgentLog -Message 'WUA search warnings could not be read; continuing without them.'
+        }
+        else {
+            for ($i = 0; $i -lt $searchWarningCount; $i++) {
+                try {
+                    $searchWarning = $searchWarnings.Item($i)
+                    $status.searchResult.warnings += [ordered]@{
+                        message = Get-OptionalStringPropertyValue -InputObject $searchWarning -Name 'Message'
+                        hResult = Format-HResult -HResult (Get-OptionalPropertyValue -InputObject $searchWarning -Name 'HResult')
+                        context = Get-OptionalPropertyValue -InputObject $searchWarning -Name 'Context'
+                    }
+                }
+                catch {
+                    $status.searchResult.warningsUnreadable = $_.Exception.Message
+                    Write-AgentLog -Message ('WUA search warning at index {0} could not be read: {1}' -f $i, $_.Exception.Message)
+                }
             }
         }
     }
+
+    # The update collection is the one count that decides something, so an unreadable one does
+    # fail the cycle - but by name, and after the result above is already on the record.
+    $availableUpdateCount = Get-ComCollectionCount -Collection (Get-OptionalPropertyValue -InputObject $searchResult -Name 'Updates')
+    if ($null -eq $availableUpdateCount) {
+        throw 'WUA returned a search result whose update collection could not be read. Download and installation are blocked.'
+    }
+
+    $status.availableUpdateCount = $availableUpdateCount
+
     if ([int]$searchResult.ResultCode -ne 2) {
         throw ('WUA search did not complete successfully (ResultCode={0}). Results may be incomplete; download and installation are blocked.' -f [int]$searchResult.ResultCode)
     }
 
-    if ($searchResult.Updates.Count -eq 0) {
+    if ($availableUpdateCount -eq 0) {
         $status.outcome = 'NoApplicableUpdates'
         $scriptExitCode = 0
         Write-AgentLog -Message 'No applicable updates found.'
     }
     elseif ($SearchOnly) {
-        for ($i = 0; $i -lt $searchResult.Updates.Count; $i++) {
+        for ($i = 0; $i -lt $availableUpdateCount; $i++) {
             $update = $searchResult.Updates.Item($i)
             $status.updates += New-UpdateRecord -Update $update -Index $i
         }
@@ -721,10 +784,10 @@ try {
         }
 
         $hasExplicitKeySelection = ($selectedKeyLookup.Count -gt 0)
-        $selectionLimit = [Math]::Min($MaxUpdates, [int]$searchResult.Updates.Count)
+        $selectionLimit = [Math]::Min($MaxUpdates, $availableUpdateCount)
         $seenSelectedLookupKeys = @{}
 
-        for ($i = 0; $i -lt $searchResult.Updates.Count; $i++) {
+        for ($i = 0; $i -lt $availableUpdateCount; $i++) {
             $update = $searchResult.Updates.Item($i)
             $record = New-UpdateRecord -Update $update -Index $i
             $status.updates += $record
