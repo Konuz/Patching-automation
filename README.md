@@ -192,7 +192,13 @@ Krok po kroku:
    twardo pomijany** ("aktualizuj ręcznie, węzeł po węźle"). Plan zapisuje się do
    `patch-plan.json`.
 6. **Potwierdzenie** — wpisujesz `Y`, żeby ruszyć z instalacją (chyba że użyjesz
-   `-SkipConfirmation`).
+   `-SkipConfirmation`). W trybie GUI to **osobne okno** z tą samą rozpiską, którą wypisuje
+   konsola — obie powierzchnie renderują ją przez tę samą funkcję modelu, więc nie mogą
+   opisać jednego planu inaczej. Enter, Esc i zamknięcie okna **odmawiają**, dokładnie tak
+   jak pusta odpowiedź na konsolowe `Proceed with this plan? [Y/N]`: instalację na flocie
+   uruchamia świadome kliknięcie *Apply this plan*, nie odruchowy klawisz.
+   `-SkipConfirmation` jest rozstrzygane **przed** sięgnięciem po okno, więc przebieg
+   nieinteraktywny nigdy go nie otwiera.
 7. **Apply** — instalacja przez WUA na gościach; powstaje raport `summary.md` i `summary.csv`.
 8. **Restart** — jeśli któraś maszyna zgłosi `rebootRequired` po apply albo już w discovery miała
    `pendingRebootBefore.isPending=true`, skrypt pokazuje listę i prosi o wpisanie **`REBOOT`**

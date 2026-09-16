@@ -746,36 +746,37 @@ function Show-PatchPlan {
     Write-Host ''
     Write-Host 'Patch plan'
     Write-Host '----------'
+    Write-Host (Get-PatchPlanSummaryLine -PatchPlanRecords $PatchPlanRecords)
 
-    foreach ($record in @($PatchPlanRecords)) {
-        Write-Host ''
-        Write-Host '--------------------------------------------------'
-        Write-Host $record.vmName
-        $roleFlagText = if ($record.roleFlags -is [string]) { [string]$record.roleFlags } else { Get-RoleFlagText -RoleFlags $record.roleFlags }
-        Write-Host ('Role flags: {0}' -f $roleFlagText)
-
-        if ($record.action -in @('Skip', 'NoSelectedUpdates')) {
-            Write-Host $record.reason
-            continue
-        }
-
-        Write-Host 'Selected:'
-        foreach ($update in @($record.selectedUpdates)) {
-            $kbPrefix = if ([string]::IsNullOrWhiteSpace([string]$update.kbText)) { '' } else { ('{0} - ' -f $update.kbText) }
-            Write-Host ('- {0}{1}' -f $kbPrefix, $update.title)
-        }
+    # Rendered by the model, not here, so the console listing and the GUI approval window
+    # cannot describe one plan differently.
+    foreach ($line in @(Get-PatchPlanDisplayLines -PatchPlanRecords $PatchPlanRecords)) {
+        Write-Host $line
     }
 }
 
 function Confirm-PatchPlan {
-    param([switch]$SkipConfirmation)
+    param(
+        $PatchPlanRecords,
+        [hashtable]$PromptProvider,
+        [switch]$SkipConfirmation
+    )
 
+    # Settled before the provider is consulted. A run told not to confirm must not open a
+    # window nobody is there to answer - and this is the approval that starts installing.
     if ($SkipConfirmation) {
         return $true
     }
 
-    $answer = Read-Host 'Proceed with this plan? [Y/N]'
-    return ($answer -ieq 'Y' -or $answer -ieq 'Yes')
+    # A GUI run answers this in a window for the same reason the round and rescan questions
+    # moved: the console prompt waits behind the update group dialog and reads as a hang.
+    # Show-PatchPlan has already printed the plan, so the console fallback only asks.
+    return [bool](Invoke-OperatorPrompt -Provider $PromptProvider -Key 'ConfirmPatchPlan' -Arguments @{ PatchPlanRecords = @($PatchPlanRecords) } -FallbackScript {
+        param($promptArgs)
+
+        $answer = Read-Host 'Proceed with this plan? [Y/N]'
+        return ($answer -ieq 'Y' -or $answer -ieq 'Yes')
+    })
 }
 
 function Read-ContinuePatchingDecision {
@@ -1932,7 +1933,7 @@ try {
         if ($PlanOnly) {
             $scriptExitCode = Get-PlanOnlyExitCode -PatchPlanRecords $patchPlanRecords
         }
-        elseif (-not (Confirm-PatchPlan -SkipConfirmation:$SkipConfirmation)) {
+        elseif (-not (Confirm-PatchPlan -PatchPlanRecords $patchPlanRecords -PromptProvider $PromptProvider -SkipConfirmation:$SkipConfirmation)) {
             Write-Warning 'Patch plan was not approved. Apply phase skipped.'
             $scriptExitCode = 1
         }
@@ -2162,7 +2163,7 @@ try {
         ConvertTo-Json -InputObject @($patchPlanRecords) -Depth 12 | Set-Content -LiteralPath $patchPlanPath -Encoding UTF8
         Show-PatchPlan -PatchPlanRecords $patchPlanRecords
 
-        if (-not (Confirm-PatchPlan -SkipConfirmation:$SkipConfirmation)) {
+        if (-not (Confirm-PatchPlan -PatchPlanRecords $patchPlanRecords -PromptProvider $PromptProvider -SkipConfirmation:$SkipConfirmation)) {
             Write-Warning 'Patch plan was not approved. Apply phase skipped.'
             $sawApplyFailure = $true
             break

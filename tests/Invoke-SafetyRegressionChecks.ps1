@@ -988,7 +988,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
             param($UpdateGroups, $PromptProvider)
             return [pscustomobject]@{ Aborted = $false; Keys = @('{0}|1' -f $updateId) }
         }
-        function Confirm-PatchPlan { param($SkipConfirmation) $true }
+        function Confirm-PatchPlan { param($PatchPlanRecords, $PromptProvider, $SkipConfirmation) $true }
         function Write-PatchRoundVerification { param($CompletionStates, $Round) }
         function Write-PatchRunSummary { param($RunOutputDirectory, $RoundSummaries, $FinalStateMap) }
         function Write-PatchingSummary { param($ApplyResults) $script:lastRoundApplyResults = @($ApplyResults) }
@@ -1189,7 +1189,7 @@ Assert-Equal $clusterScan.InstallCalled $false 'cluster discovery never installs
         param($UpdateGroups, $PromptProvider)
         return [pscustomobject]@{ Aborted = $false; Keys = @('{0}|1' -f $f5UpdateId) }
     }
-    function Confirm-PatchPlan { param($SkipConfirmation) $true }
+    function Confirm-PatchPlan { param($PatchPlanRecords, $PromptProvider, $SkipConfirmation) $true }
     function Write-PatchRoundVerification { param($CompletionStates, $Round) }
     function Write-PatchRunSummary { param($RunOutputDirectory, $RoundSummaries, $FinalStateMap) }
     function Write-PatchingSummary { param($ApplyResults) }
@@ -2097,7 +2097,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         # The operator looked at the list and left the unclassified group unticked.
         return [pscustomobject]@{ Aborted = $false; Keys = @() }
     }
-    function Confirm-PatchPlan { param([switch]$SkipConfirmation) $true }
+    function Confirm-PatchPlan { param($PatchPlanRecords, [hashtable]$PromptProvider, [switch]$SkipConfirmation) $true }
     function Read-ContinuePatchingDecision { param($CompletionStates, $Round, $PromptProvider) return 'FINISH' }
     function Invoke-ApplyAndOptionalReboot {
         param($PatchPlanRecords, $VIServerScope, $Managers, $GuestCredentialMap, $VIServers, $VIServerCredentialMap, [switch]$IgnoreVCenterCertificate, $GuestOpsLibPath, $CurlPath, $AgentPath, $IdentityHelperPath, $WorkspaceScriptPath, $RunGuardScriptPath, $RebootRequestScriptPath, $GuestWorkingDirectory, $TimeoutSeconds, $RebootTimeoutSeconds, $PollSeconds, $CycleOutputDirectory, $ThrottleLimit, $RebootBatchSize, $DiscoveryRecords, $CredentialContext, $CredentialDecisionScript, $CredentialValidatedScript, $CredentialInteractive)
@@ -2241,7 +2241,7 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm) }
         return @([pscustomobject]@{ vmName = 'VM-reboot'; computerName = 'VM-reboot'; outcome = 'SearchOnly'; errors = @(); roleFlags = $f7Role; pendingRebootBefore = [pscustomobject]@{ isPending = $script:f7PendingAfterReboot }; updates = @($script:f7RoundTwoUpdates) })
     }
     function Read-UpdateGroupSelection { param($UpdateGroups, $PromptProvider) return [pscustomobject]@{ Aborted = $false; Keys = @(@($UpdateGroups) | ForEach-Object { [string]$_.identityKey }) } }
-    function Confirm-PatchPlan { param([switch]$SkipConfirmation) $true }
+    function Confirm-PatchPlan { param($PatchPlanRecords, [hashtable]$PromptProvider, [switch]$SkipConfirmation) $true }
     function Read-ContinuePatchingDecision { param($CompletionStates, $Round, $PromptProvider) return 'CONTINUE' }
     function Write-PatchRoundVerification { param($CompletionStates, $Round) }
     function Write-PatchRunSummary { param($RunOutputDirectory, $RoundSummaries, $FinalStateMap) }

@@ -909,3 +909,67 @@ function ConvertTo-PatchSummaryRows {
 
     return @($rows)
 }
+
+function Get-PatchPlanSummaryLine {
+    param($PatchPlanRecords)
+
+    $records = @(@($PatchPlanRecords) | Where-Object { $null -ne $_ })
+    $install = 0
+    $nothing = 0
+    $skipped = 0
+    $updates = 0
+
+    foreach ($record in $records) {
+        switch ([string](Get-ModelPropertyValue -InputObject $record -Name 'action')) {
+            'Skip' { $skipped++ }
+            'NoSelectedUpdates' { $nothing++ }
+            default {
+                $install++
+                $updates += @(Get-ModelPropertyValue -InputObject $record -Name 'selectedUpdates' -DefaultValue @()).Count
+            }
+        }
+    }
+
+    # The counts an operator needs before approving: how many machines this is about to touch,
+    # and how many it is deliberately not touching. The per-update total is a sum over VMs, so
+    # one package applying to four machines counts four times - that is the number of installs.
+    $format = '{0} VM in plan: {1} to install ({2} update install(s) in total), {3} with nothing selected, {4} skipped.'
+    return ($format -f $records.Count, $install, $updates, $nothing, $skipped)
+}
+
+function Get-PatchPlanDisplayLines {
+    param($PatchPlanRecords)
+
+    # Shared by the console listing and the GUI approval window for the same reason
+    # Get-UpdateGroupDisplayTitle is shared: the two must not describe one plan differently,
+    # and what the operator approves in a window has to be what the console recorded.
+    $lines = @()
+    foreach ($record in @($PatchPlanRecords)) {
+        if ($null -eq $record) {
+            continue
+        }
+
+        $lines += ''
+        $lines += '--------------------------------------------------'
+        $lines += [string](Get-ModelPropertyValue -InputObject $record -Name 'vmName')
+
+        $roleFlags = Get-ModelPropertyValue -InputObject $record -Name 'roleFlags'
+        $roleFlagText = if ($roleFlags -is [string]) { [string]$roleFlags } else { Get-RoleFlagText -RoleFlags $roleFlags }
+        $lines += ('Role flags: {0}' -f $roleFlagText)
+
+        $action = [string](Get-ModelPropertyValue -InputObject $record -Name 'action')
+        if ($action -in @('Skip', 'NoSelectedUpdates')) {
+            $lines += [string](Get-ModelPropertyValue -InputObject $record -Name 'reason')
+            continue
+        }
+
+        $lines += 'Selected:'
+        foreach ($update in @(Get-ModelPropertyValue -InputObject $record -Name 'selectedUpdates' -DefaultValue @())) {
+            $kbText = [string](Get-ModelPropertyValue -InputObject $update -Name 'kbText')
+            $kbPrefix = if ([string]::IsNullOrWhiteSpace($kbText)) { '' } else { ('{0} - ' -f $kbText) }
+            $lines += ('- {0}{1}' -f $kbPrefix, (Get-ModelPropertyValue -InputObject $update -Name 'title'))
+        }
+    }
+
+    return @($lines)
+}

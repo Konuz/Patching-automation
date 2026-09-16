@@ -195,6 +195,11 @@ $launcherParams = @{
             param($Arguments)
             Show-ContinuePatchingDialog -PendingStates @($Arguments.PendingStates) -Round ([int]$Arguments.Round)
         }
+        ConfirmPatchPlan = {
+            param($Arguments)
+            $records = @($Arguments.PatchPlanRecords)
+            Show-PatchPlanDialog -PlanLines @(Get-PatchPlanDisplayLines -PatchPlanRecords $records) -Summary (Get-PatchPlanSummaryLine -PatchPlanRecords $records)
+        }
         ConfirmRescan = {
             param($Arguments)
             Show-RescanDialog

@@ -138,7 +138,7 @@ function Invoke-RescanScenario {
         $keys = if ($trace.Runs.Count -eq 1) { @('11111111-1111-1111-1111-111111111111|1') } else { @($UpdateGroups | ForEach-Object { $_.identityKey }) }
         [pscustomobject]@{ Aborted = $false; Keys = $keys }
     }
-    function Confirm-PatchPlan { param([switch]$SkipConfirmation) $true }
+    function Confirm-PatchPlan { param($PatchPlanRecords, [hashtable]$PromptProvider, [switch]$SkipConfirmation) $true }
     function Invoke-ApplyAndOptionalReboot {
         param($PatchPlanRecords)
         $results = @(foreach ($record in $PatchPlanRecords) {

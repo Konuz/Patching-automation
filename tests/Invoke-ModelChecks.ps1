@@ -507,6 +507,37 @@ Assert-Equal -Actual $summaryVm01.RoleFlags -Expected 'SQL' -Message 'summary in
 Assert-Equal -Actual $summaryVm01.SelectedUpdateCount -Expected 1 -Message 'summary counts selected updates'
 Assert-Equal -Actual $summaryVm03.Action -Expected 'Skip' -Message 'summary includes skipped cluster action'
 
+# The plan listing, rendered once for both surfaces. The console prints these lines and the
+# GUI approval window shows the same ones, so the operator cannot approve a plan described
+# differently from the one that was recorded.
+$planLines = @(Get-PatchPlanDisplayLines -PatchPlanRecords $plan)
+Assert-Equal -Actual (@($planLines | Where-Object { $_ -eq 'VM01' }).Count) -Expected 1 -Message 'each VM is named once in the plan listing'
+Assert-Equal -Actual (@($planLines | Where-Object { $_ -like 'Role flags:*' }).Count) -Expected 3 -Message 'every VM in the plan states its role flags'
+Assert-Equal -Actual (@($planLines | Where-Object { $_ -eq 'Selected:' }).Count) -Expected 2 -Message 'only the installing VMs get a Selected: heading'
+Assert-Equal -Actual (@($planLines | Where-Object { $_ -eq 'Skipped: Failover Cluster detected. Please update manually one by one.' }).Count) -Expected 1 -Message 'a skipped VM states its reason instead of a selection'
+
+# A null entry is dropped rather than rendered as a blank VM: a plan that reads as one more
+# machine than it covers is a plan an operator would approve for the wrong fleet.
+$sparsePlanLines = @(Get-PatchPlanDisplayLines -PatchPlanRecords @($plan[0], $null))
+Assert-Equal -Actual (@($sparsePlanLines | Where-Object { $_ -eq 'Selected:' }).Count) -Expected 1 -Message 'a null plan record is skipped rather than rendered'
+
+# A saved plan read back from patch-plan.json has already flattened its role flags to a
+# string, and an update WUA gave no KB id for has none to print.
+$stringRolePlanLines = @(Get-PatchPlanDisplayLines -PatchPlanRecords @([pscustomobject]@{
+    vmName = 'VM09'
+    action = 'Install'
+    roleFlags = 'SQL, IIS'
+    selectedUpdates = @([pscustomobject]@{ kbText = ''; title = 'Untitled update' })
+}))
+Assert-Equal -Actual (@($stringRolePlanLines | Where-Object { $_ -eq 'Role flags: SQL, IIS' }).Count) -Expected 1 -Message 'role flags already flattened by a saved plan are not re-rendered'
+Assert-Equal -Actual (@($stringRolePlanLines | Where-Object { $_ -eq '- Untitled update' }).Count) -Expected 1 -Message 'an update with no KB text loses the prefix, not the title'
+
+# The counts an operator reads before approving. The update total is a sum over VMs - one
+# package applying to two machines is two installs - because that is what the run will do.
+Assert-Equal -Actual (Get-PatchPlanSummaryLine -PatchPlanRecords $plan) -Expected '3 VM in plan: 2 to install (2 update install(s) in total), 0 with nothing selected, 1 skipped.' -Message 'the plan summary counts installs, non-selections and skips'
+Assert-Equal -Actual (Get-PatchPlanSummaryLine -PatchPlanRecords $noSelectionPlan) -Expected '1 VM in plan: 0 to install (0 update install(s) in total), 1 with nothing selected, 0 skipped.' -Message 'a VM with nothing selected is not counted as an install'
+Assert-Equal -Actual (Get-PatchPlanSummaryLine -PatchPlanRecords @()) -Expected '0 VM in plan: 0 to install (0 update install(s) in total), 0 with nothing selected, 0 skipped.' -Message 'an empty plan renders a line rather than throwing'
+
 Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $true -AvailableUpdateCount 0 -HasErrors $false) -Expected 'UpToDate' -Message 'discovery status: successful with zero updates is up-to-date'
 Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $true -AvailableUpdateCount 3 -HasErrors $false) -Expected 'UpdatesFound' -Message 'discovery status: successful with updates is updates-found'
 Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $false -AvailableUpdateCount 0 -HasErrors $true) -Expected 'Failed' -Message 'discovery status: errors make discovery failed'

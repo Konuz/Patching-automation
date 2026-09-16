@@ -487,6 +487,81 @@ function Show-RescanDialog {
     return ($result -eq [System.Windows.Forms.DialogResult]::OK)
 }
 
+function Show-PatchPlanDialog {
+    param(
+        # Already rendered by Get-PatchPlanDisplayLines, so this window and the console
+        # listing cannot disagree about what is being approved.
+        [string[]]$PlanLines,
+        [string]$Summary = ''
+    )
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'PatchingGuestOps - patch plan'
+    $form.Width = 780
+    $form.Height = 600
+    $form.StartPosition = 'CenterScreen'
+    $form.ShowInTaskbar = $true
+
+    $prompt = New-Object System.Windows.Forms.Label
+    $prompt.Text = 'This is what the run will install. Nothing has been downloaded or installed yet.'
+    $prompt.Left = 15
+    $prompt.Top = 15
+    $prompt.Width = 730
+
+    $summaryLabel = New-Object System.Windows.Forms.Label
+    $summaryLabel.Text = $Summary
+    $summaryLabel.Left = 15
+    $summaryLabel.Top = 38
+    $summaryLabel.Width = 730
+
+    $plan = New-Object System.Windows.Forms.TextBox
+    $plan.Multiline = $true
+    $plan.ReadOnly = $true
+    # The lines are console-shaped - separator rules and '- ' bullets - so they only line up
+    # in a fixed-width face. Both scrollbars, and no wrapping: a wrapped update title reads as
+    # two updates.
+    $plan.WordWrap = $false
+    $plan.ScrollBars = 'Both'
+    # Stated rather than left to the default: this box takes the initial focus, and a
+    # multiline box that swallowed Enter would take it away from the refusing AcceptButton.
+    $plan.AcceptsReturn = $false
+    $plan.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $plan.Left = 15
+    $plan.Top = 62
+    $plan.Width = 730
+    $plan.Height = 420
+    $plan.Text = (@($PlanLines) -join [Environment]::NewLine)
+
+    $apply = New-Object System.Windows.Forms.Button
+    $apply.Text = 'Apply this plan'
+    $apply.Left = 15
+    $apply.Top = 500
+    $apply.Width = 170
+    $apply.DialogResult = [System.Windows.Forms.DialogResult]::OK
+
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Do not apply'
+    $cancel.Left = 635
+    $cancel.Top = 500
+    $cancel.Width = 110
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+
+    $form.Controls.AddRange(@($prompt, $summaryLabel, $plan, $apply, $cancel))
+
+    # Enter, Esc and the window's close button all refuse, because an empty answer to the
+    # console's 'Proceed with this plan? [Y/N]' is not a Y either. This is the click that
+    # starts installing on the fleet, so it happens on purpose or not at all.
+    $form.AcceptButton = $cancel
+    $form.CancelButton = $cancel
+
+    # Same reason as the other mid-run windows: this one opens behind the console.
+    $form.Add_Shown({ $form.Activate() })
+    $result = $form.ShowDialog()
+    $form.Dispose()
+
+    return ($result -eq [System.Windows.Forms.DialogResult]::OK)
+}
+
 function Show-LauncherDialog {
     param(
         $Settings,

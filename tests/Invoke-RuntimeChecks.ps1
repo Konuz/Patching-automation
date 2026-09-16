@@ -3071,6 +3071,39 @@ else {
     }
 }
 
+# --- Patch plan approval (scripts/Invoke-GuestOpsPatchValidation.ps1, AST-extracted) ---
+# This is the approval that starts installing. Two properties are load-bearing:
+# -SkipConfirmation is settled before the provider is consulted, so a non-interactive run
+# never opens a window nobody is there to answer; and the provider's verdict is cast to
+# [bool], so a dialog that returned its wrapper instead of a verdict cannot read as approval.
+$confirmPlanDefinition = @($orchestratorFunctions | Where-Object { $_.Name -eq 'Confirm-PatchPlan' })
+if ($confirmPlanDefinition.Count -eq 0) {
+    Add-Failure -Message 'Orchestrator function not found: Confirm-PatchPlan'
+}
+else {
+    . ([scriptblock]::Create($confirmPlanDefinition[0].Extent.Text))
+
+    $confirmPlanRecords = @(
+        [pscustomobject]@{ vmName = 'VM01'; action = 'Install'; selectedUpdates = @([pscustomobject]@{ kbText = 'KB5000001'; title = 'Update A' }) }
+    )
+
+    $script:planPromptCalls = 0
+    $script:planPromptArgs = $null
+    $refusingPlanProvider = @{ ConfirmPatchPlan = { param($promptArgs) $script:planPromptCalls++; $script:planPromptArgs = $promptArgs; $false } }
+
+    $planSkipped = Confirm-PatchPlan -PatchPlanRecords $confirmPlanRecords -PromptProvider $refusingPlanProvider -SkipConfirmation
+    Assert-Equal -Actual $planSkipped -Expected $true -Message '-SkipConfirmation approves the plan without asking'
+    Assert-Equal -Actual $script:planPromptCalls -Expected 0 -Message '-SkipConfirmation never opens the approval window'
+
+    $planRefused = Confirm-PatchPlan -PatchPlanRecords $confirmPlanRecords -PromptProvider $refusingPlanProvider
+    Assert-Equal -Actual $planRefused -Expected $false -Message 'a refused plan is not applied'
+    Assert-Equal -Actual $script:planPromptCalls -Expected 1 -Message 'an interactive run asks exactly once'
+    Assert-Equal -Actual ([string](@($script:planPromptArgs.PatchPlanRecords)[0].vmName)) -Expected 'VM01' -Message 'the plan records travel to the prompt'
+
+    $planApproved = Confirm-PatchPlan -PatchPlanRecords $confirmPlanRecords -PromptProvider @{ ConfirmPatchPlan = { param($promptArgs) $true } }
+    Assert-Equal -Actual $planApproved -Expected $true -Message 'an approved plan applies'
+}
+
 # Write-FinalReport counts six groups of VMs, and the reboot group is the one that can legally
 # be empty. An if-expression assigns its branch's pipeline output and an empty collection emits
 # nothing, so @() inside a branch assigned $null and the count threw under StrictMode. That state
@@ -3320,6 +3353,33 @@ else {
             Assert-Equal -Actual $continueOutcome -Expected 'CONTINUE' -Message 'the round provider returns the dialog verdict'
             Assert-Equal -Actual (@($script:continueDialogArgs.Names) -join ',') -Expected 'VM01' -Message 'the provider hands the pending VM list to the dialog'
             Assert-Equal -Actual $script:continueDialogArgs.Round -Expected 3 -Message 'the provider hands the round number to the dialog'
+        }
+
+        # The plan approval. The provider renders through the model helpers rather than
+        # formatting the records itself, so what the operator approves in the window is what
+        # the console listing recorded.
+        $planPair = @($providerPairs | Where-Object { [string]$_.Item1.Extent.Text -eq 'ConfirmPatchPlan' })
+        Assert-Equal -Actual $planPair.Count -Expected 1 -Message 'the GUI provider answers the plan approval in a window'
+        if ($planPair.Count -eq 1) {
+            $planBlock = $planPair[0].Item2.GetPureExpression().ScriptBlock.GetScriptBlock()
+
+            function Get-PatchPlanDisplayLines { param($PatchPlanRecords) return @('VM01', 'Selected:', '- KB5000001 - Update A') }
+            function Get-PatchPlanSummaryLine { param($PatchPlanRecords) return '1 VM in plan' }
+
+            $script:planDialogArgs = $null
+            function Show-PatchPlanDialog {
+                param([string[]]$PlanLines, [string]$Summary = '')
+                $script:planDialogArgs = [pscustomobject]@{ Lines = @($PlanLines); Summary = $Summary }
+                return $true
+            }
+
+            $planApprovalOutcome = & $planBlock @{ PatchPlanRecords = @([pscustomobject]@{ vmName = 'VM01' }) }
+            Assert-Equal -Actual $planApprovalOutcome -Expected $true -Message 'an approved plan dialog returns approval'
+            Assert-Equal -Actual (@($script:planDialogArgs.Lines) -join '|') -Expected 'VM01|Selected:|- KB5000001 - Update A' -Message 'the dialog is given the model-rendered plan lines'
+            Assert-Equal -Actual $script:planDialogArgs.Summary -Expected '1 VM in plan' -Message 'the dialog is given the model-rendered summary'
+
+            function Show-PatchPlanDialog { param([string[]]$PlanLines, [string]$Summary = '') return $false }
+            Assert-Equal -Actual (& $planBlock @{ PatchPlanRecords = @() }) -Expected $false -Message 'a refused plan dialog refuses the plan'
         }
 
         # The four recovery hooks. Each one is a scriptblock whose parameters must line up
