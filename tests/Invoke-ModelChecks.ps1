@@ -593,7 +593,8 @@ Assert-Equal -Actual (Get-RebootTargetInstallNote -RebootTarget ([pscustomobject
 
 # The failure list alone is enough: an outcome this tool does not recognise must not silence
 # a package that demonstrably did not install.
-Assert-True -Condition ([string](Get-RebootTargetInstallNote -RebootTarget ([pscustomobject]@{ vmName = 'VM05'; applyOutcome = 'Failed'; approvedUpdateCount = 0; failedUpdateKbs = @('KB5000001') })).Contains('failed: KB5000001')) -Message 'named failures mark the target whatever the outcome says'
+$namedFailureNote = [string](Get-RebootTargetInstallNote -RebootTarget ([pscustomobject]@{ vmName = 'VM05'; applyOutcome = 'Failed'; approvedUpdateCount = 0; failedUpdateKbs = @('KB5000001') }))
+Assert-True -Condition ($namedFailureNote.Contains('failed: KB5000001')) -Message 'named failures mark the target whatever the outcome says'
 
 Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $true -AvailableUpdateCount 0 -HasErrors $false) -Expected 'UpToDate' -Message 'discovery status: successful with zero updates is up-to-date'
 Assert-Equal -Actual (Get-DiscoverySummaryStatus -IsSuccessful $true -AvailableUpdateCount 3 -HasErrors $false) -Expected 'UpdatesFound' -Message 'discovery status: successful with updates is updates-found'
