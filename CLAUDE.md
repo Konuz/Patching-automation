@@ -481,7 +481,7 @@ the next round, and makes the run exit 1. `-SkipConfirmation` and a missing prom
 open a dialog; the result is an explicit failure instead.
 
 **An account can also be refused before the run starts.** The GUI fills credential gaps in a
-dialog, and for a guest account that dialog offers **Skip these VMs** - never for a vCenter, where
+dialog, and for a guest account that dialog offers **Skip these VM(s)** - never for a vCenter, where
 skipping would fail every VM behind it with a reason naming a password rather than the missing
 session, and leave the run nowhere to look those VMs up. Skip and Cancel stay different answers:
 Cancel still ends the run before it touches anything (so Esc and the window's close button keep

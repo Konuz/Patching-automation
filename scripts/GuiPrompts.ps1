@@ -80,7 +80,10 @@ function Show-CredentialDialog {
     # keep meaning Cancel. Skip leaves these VMs unpatched and lets the rest of the run start;
     # Cancel still ends the run before it touches anything.
     $skip = New-Object System.Windows.Forms.Button
-    $skip.Text = 'Skip these VMs'
+    # One prompt covers an account, and an account can be a single machine - a local entry,
+    # or a domain where only one member is still uncovered. VM(s) is what the rest of the
+    # operator-facing text says for the same reason.
+    $skip.Text = 'Skip these VM(s)'
     $skip.Left = 12
     $skip.Top = 145
     $skip.Width = 140

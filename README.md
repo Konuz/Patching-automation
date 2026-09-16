@@ -447,7 +447,7 @@ Gdy w magazynie brakuje poświadczeń, GUI pyta o nie **przed startem przebiegu*
 gościa ma trzy przyciski:
 
 - **OK** — dane wchodzą do przebiegu (i, jeśli zaznaczysz „Remember", do magazynu).
-- **Skip these VMs** — maszyny tego konta **nie są łatane**, a przebieg rusza z resztą listy.
+- **Skip these VM(s)** — maszyny tego konta **nie są łatane**, a przebieg rusza z resztą listy.
   Są raportowane jako pominięte, nie znikają z `summary.md`, i nie kosztują żadnego zapytania
   do vCenter. Pominięcie dotyczy **tych maszyn**, a nie całego konta: okno pyta tylko o te, dla
   których w magazynie nic nie ma, więc maszyna z tej samej domeny mająca własny zapisany wpis
