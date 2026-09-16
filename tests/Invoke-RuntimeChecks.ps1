@@ -3107,6 +3107,11 @@ else {
 # --- Reboot checkpoint (scripts/Invoke-GuestOpsPatchValidation.ps1, AST-extracted) ---
 # The restart is the other prompt -SkipConfirmation must never answer, and the one whose
 # default has to be "leave them running". An empty target list settles itself without asking.
+# This gate deliberately does not load PatchPlanModel.ps1 - what the listing looks like is the
+# model gate's question, and this one is about which surface gets asked. Confirm-GuestReboot
+# prints through the model helper, so it needs one to exist.
+function Get-RebootTargetDisplayLines { param($RebootTargets) return @('- stub') }
+
 $confirmRebootDefinition = @($orchestratorFunctions | Where-Object { $_.Name -eq 'Confirm-GuestReboot' })
 if ($confirmRebootDefinition.Count -eq 0) {
     Add-Failure -Message 'Orchestrator function not found: Confirm-GuestReboot'
