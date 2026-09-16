@@ -163,7 +163,10 @@ function Set-GuestCredentialForGroup {
 function Test-GuestCredentialInvalidLoginKind {
     param([string]$ErrorKind)
 
-    return $ErrorKind -eq 'InvalidGuestLogin' -or $ErrorKind -eq 'InvalidCredentials'
+    # GuestLoginFailed is the unclassified case: the login call itself failed and nothing in
+    # the exception named a fault this tool knows. It is promptable for the same reason the
+    # other two are - the operator is the only one who can supply a different password.
+    return $ErrorKind -eq 'InvalidGuestLogin' -or $ErrorKind -eq 'InvalidCredentials' -or $ErrorKind -eq 'GuestLoginFailed'
 }
 
 function Resolve-GuestCredentialForTarget {
@@ -359,9 +362,14 @@ function Get-GuestCredentialExceptionKind {
     $current = $Exception
     for ($depth = 0; $null -ne $current -and $depth -lt 32; $depth++) {
         $candidates = @($current)
-        $faultProperty = $current.PSObject.Properties['Fault']
-        if ($null -ne $faultProperty -and $null -ne $faultProperty.Value -and $faultProperty.Value -ne $current) {
-            $candidates += $faultProperty.Value
+        # Both names: a VimException carries its typed fault on MethodFault, and reading only
+        # Fault is how a genuine InvalidGuestLogin reached the fallback below as an untyped
+        # MethodInvocationException - which then did not prompt anybody.
+        foreach ($faultPropertyName in @('Fault', 'MethodFault')) {
+            $faultProperty = $current.PSObject.Properties[$faultPropertyName]
+            if ($null -ne $faultProperty -and $null -ne $faultProperty.Value -and $faultProperty.Value -ne $current) {
+                $candidates += $faultProperty.Value
+            }
         }
 
         foreach ($candidate in @($candidates)) {
@@ -444,9 +452,24 @@ function Test-GuestCredential {
             }
         }
 
+        if ([string]::Equals($errorKind, 'GuestPermissionDenied', [System.StringComparison]::OrdinalIgnoreCase)) {
+            return [pscustomobject]@{
+                Status = 'Error'
+                ErrorKind = 'GuestPermissionDenied'
+                Error = $errorText
+            }
+        }
+
+        # Everything else this call can throw is still a failure to log in, and it must reach
+        # the operator. The caller resolved the VM and asserted VMware Tools are running before
+        # getting here, so a ValidateCredentialsInGuest that fails anyway is a guest login
+        # problem - whatever VMware wrapped the fault in. Reporting it as Error instead left a
+        # machine with a genuinely wrong password failing its preflight in silence, with the
+        # raw .NET message in discovery.json and no prompt: the one case recovery exists for.
+        # Asking is recoverable (the operator can still skip or abort); not asking is not.
         return [pscustomobject]@{
-            Status = 'Error'
-            ErrorKind = $errorKind
+            Status = 'Invalid'
+            ErrorKind = 'GuestLoginFailed'
             Error = $errorText
         }
     }

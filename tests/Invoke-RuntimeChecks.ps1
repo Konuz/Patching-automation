@@ -2324,6 +2324,33 @@ if ($credentialRecoveryAvailable) {
         $permissionCredentialResult = Test-GuestCredential -VMView $vmViewB -Managers $managerResultB -Credential (New-TestCredential 'PERMISSION\adm')
         Assert-Equal -Actual $permissionCredentialResult.Status -Expected 'Error' -Message 'GuestPermissionDenied is not a credential rejection'
         Assert-Equal -Actual $permissionCredentialResult.ErrorKind -Expected 'GuestPermissionDenied' -Message 'operation permission errors remain classified separately'
+
+        # The case that cost a real run. PowerShell wraps a failed COM/SOAP call in a
+        # MethodInvocationException, and when nothing in the chain carries a fault type this
+        # tool recognises the classifier fell back to that wrapper's own name. The result was
+        # Status=Error, which the resolver does not prompt on - so a guest with a genuinely
+        # wrong password failed its preflight in silence and nobody was asked for a new one.
+        $unclassifiedException = New-Object System.Exception('Failed to authenticate with the guest operating system using the supplied credentials.')
+        $authManagerB.Exception = $unclassifiedException
+        $unclassifiedResult = Test-GuestCredential -VMView $vmViewB -Managers $managerResultB -Credential (New-TestCredential 'UNKNOWN\adm')
+        Assert-Equal -Actual $unclassifiedResult.Status -Expected 'Invalid' -Message 'an unclassified login failure is still a credential rejection'
+        Assert-Equal -Actual $unclassifiedResult.ErrorKind -Expected 'GuestLoginFailed' -Message 'the unclassified kind is named rather than borrowing the wrapper exception name'
+        Assert-Equal -Actual (Test-GuestCredentialInvalidLoginKind -ErrorKind $unclassifiedResult.ErrorKind) -Expected $true -Message 'the unclassified kind reaches the operator prompt'
+
+        # The message survives: it is the only thing that says which guest refused and why.
+        Assert-Contains -Text ([string]$unclassifiedResult.Error) -Needle 'Failed to authenticate' -Message 'the underlying message is carried to the operator'
+
+        # GuestPermissionDenied is still not a password problem, and must not start asking for
+        # one - it is classified, so it never reaches the unclassified branch.
+        Assert-Equal -Actual (Test-GuestCredentialInvalidLoginKind -ErrorKind 'GuestPermissionDenied') -Expected $false -Message 'an operation permission denial never prompts for a password'
+
+        # A fault reachable only through MethodFault is what a PowerCLI VimException actually
+        # carries; reading Fault alone is how a real InvalidGuestLogin became unclassified.
+        $faultCarrier = New-Object System.Exception('synthetic wrapper')
+        $typedFault = New-Object System.Exception('synthetic typed fault')
+        $typedFault.PSTypeNames.Insert(0, 'VMware.Vim.InvalidGuestLogin')
+        $faultCarrier | Add-Member -MemberType NoteProperty -Name MethodFault -Value $typedFault -Force
+        Assert-Equal -Actual (Get-GuestCredentialExceptionKind -Exception $faultCarrier) -Expected 'InvalidGuestLogin' -Message 'a fault carried on MethodFault is classified like one on Fault'
     }
     finally {
         Set-Item Function:\New-GuestAuthentication -Value $savedGuestAuthentication

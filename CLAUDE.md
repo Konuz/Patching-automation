@@ -477,6 +477,19 @@ Two rules are load-bearing there:
   throws on exactly that - keeps its transient handling and still reaches the operator prompt.
   Treating it as a refusal would record a guest that rebooted correctly as a credential failure.
 
+**An unclassified login failure is still a login failure.** `ValidateCredentialsInGuest` is
+reached only after the VM has been resolved and `Assert-VMReadyForGuestOps` has confirmed
+VMware Tools are running, so a failure of that call is a guest login problem whatever VMware
+wrapped the fault in. `Get-GuestCredentialExceptionKind` walks `MethodFault` as well as
+`Fault` - a PowerCLI `VimException` carries its typed fault on the former - and anything it
+still cannot name becomes `Status = 'Invalid'` with kind `GuestLoginFailed`, which
+`Test-GuestCredentialInvalidLoginKind` accepts. Reporting it as `Status = 'Error'` is how a
+guest with a genuinely wrong password failed its preflight **in silence**: the resolver only
+prompts on `Invalid`, so nobody was asked for a replacement and the raw .NET message ended up
+in `discovery.json` as the whole explanation. Asking is recoverable - the operator can still
+skip or abort - and not asking is not. `GuestPermissionDenied` stays `Error` and never
+prompts: it is classified, and a different password is not what it needs.
+
 A skipped account becomes `Failed` with a reason, is filtered out of discovery, apply, reboot and
 the next round, and makes the run exit 1. `-SkipConfirmation` and a missing prompt provider never
 open a dialog; the result is an explicit failure instead.
