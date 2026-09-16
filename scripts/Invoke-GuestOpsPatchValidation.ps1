@@ -798,10 +798,10 @@ function Read-ContinuePatchingDecision {
 
 function Read-RescanDecision {
     while ($true) {
-        $answer = ([string](Read-Host 'Ponownie przeskanować te same VM? [T/N]')).Trim().ToUpperInvariant()
-        if ($answer -eq 'T') { return $true }
+        $answer = ([string](Read-Host 'Rescan the same VM(s)? [Y/N]')).Trim().ToUpperInvariant()
+        if ($answer -eq 'Y') { return $true }
         if ($answer -eq 'N' -or $answer -eq '') { return $false }
-        Write-Host 'Wpisz T lub N.'
+        Write-Host 'Enter Y or N.'
     }
 }
 

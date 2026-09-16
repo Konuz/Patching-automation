@@ -221,7 +221,7 @@ Krok po kroku:
    potwierdziła nowszego czasu startu.
 
 10. **Ponowny skan** — po zapisaniu podsumowania skrypt pyta
-    `Ponownie przeskanować te same VM? [T/N]`. `T` rozpoczyna nowy cykl dla całej pierwotnej
+    `Rescan the same VM(s)? [Y/N]`. `Y` rozpoczyna nowy cykl dla całej pierwotnej
     listy VM, z nowym wyborem aktualizacji, wyzerowanymi wynikami i licznikiem rund oraz
     osobnym katalogiem `out\<run>\`. Połączenia i poświadczenia, także poprawione podczas pracy,
     pozostają w sesji; testy startowe nie są powtarzane. Decyzje o pominięciu kont lub przerwaniu

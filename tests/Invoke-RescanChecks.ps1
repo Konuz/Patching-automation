@@ -144,12 +144,12 @@ function Invoke-RescanScenario {
         param($Prompt)
         $trace.Prompts++
         if ($trace.Prompts -gt 3) { throw 'Unexpected extra operator prompt' }
-        Assert-Equal $Prompt 'Ponownie przeskanować te same VM? [T/N]' 'End-of-cycle question'
+        Assert-Equal $Prompt 'Rescan the same VM(s)? [Y/N]' 'End-of-cycle question'
         Assert-Equal $trace.Disconnects.Count 0 'Connections stay open until the operator finishes'
         Assert-Equal (Test-Path -LiteralPath (Join-Path $runOutputDirectory 'summary.md')) $true 'Summary is saved before the question'
         if ($trace.Prompts -eq 1) { return 'invalid' }
         $trace.ExitCodes += $scriptExitCode
-        if ($trace.Prompts -eq 2) { return ' t ' }
+        if ($trace.Prompts -eq 2) { return ' y ' }
         return 'n'
     }
 
@@ -163,7 +163,7 @@ try {
     foreach ($keep in @($false, $true)) {
         $result = Invoke-RescanScenario -KeepConnected $keep
         $trace = $result.Trace
-        Assert-Equal $trace.Runs.Count 2 'T starts a second cycle and N stops'
+        Assert-Equal $trace.Runs.Count 2 'Y starts a second cycle and N stops'
         Assert-Equal $trace.Connects 1 'The session connects once for both cycles'
         Assert-Equal $trace.CredentialPrompts 1 'Guest credentials are resolved once'
         Assert-Equal ($trace.ExitCodes -join ',') '1,0' 'A failed first run does not contaminate the second result'

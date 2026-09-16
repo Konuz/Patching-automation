@@ -549,7 +549,7 @@ both travel through grouping, the plan and the saved-plan reader.
 ### Patch rounds
 
 Interactive discovery-driven patching has an outer scan-cycle loop. After each cycle's summary,
-`Read-RescanDecision` asks `Ponownie przeskanować te same VM? [T/N]`: T starts a fresh cycle over
+`Read-RescanDecision` asks `Rescan the same VM(s)? [Y/N]`: Y starts a fresh cycle over
 the original target list; N or empty input ends the session. Connections and the guest credential
 context (including corrected credentials and skip/abort decisions) live outside that loop. Each
 cycle creates a unique output directory and resets round counters, state maps, deselected keys,
