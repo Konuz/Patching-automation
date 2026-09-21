@@ -495,6 +495,24 @@ $discoveryFailurePlan = @(
     }
 )
 Assert-Equal -Actual (Get-PlanOnlyExitCode -PatchPlanRecords $discoveryFailurePlan) -Expected 1 -Message 'PlanOnly exits non-zero for discovery failure skip'
+
+# The reason a VM was skipped has to reach the summary. It used to read "Review discovery.json
+# and per-VM agent artifacts" for every discovery failure - and for the whole preflight class
+# those artifacts were never created, because the VM never reached its first transfer.
+$discoveryReason = Get-DiscoveryFailurePlanReason -Errors @('Agent preflight failed: VMware Tools are not running on HOST04.') -Outcome 'DiscoveryFailed'
+Assert-Equal -Actual $discoveryReason -Expected 'Skipped: Discovery failed. Agent preflight failed: VMware Tools are not running on HOST04.' -Message 'the concrete discovery failure follows the marker'
+Assert-True -Condition (Test-IsDiscoveryFailurePatchPlanRecord -PatchPlanRecord ([pscustomobject]@{ action = 'Skip'; reason = $discoveryReason })) -Message 'a record carrying the detail is still recognised as a discovery failure'
+
+# Records written before this change carry the old wording and must keep their meaning.
+Assert-True -Condition (Test-IsDiscoveryFailurePatchPlanRecord -PatchPlanRecord $discoveryFailurePlan[0]) -Message 'the previous wording is still recognised'
+Assert-Equal -Actual (Test-IsDiscoveryFailurePatchPlanRecord -PatchPlanRecord ([pscustomobject]@{ action = 'Skip'; reason = 'Skipped: Failover Cluster detected. Please update manually one by one.' })) -Expected $false -Message 'an unrelated skip is not a discovery failure'
+Assert-Equal -Actual (Test-IsDiscoveryFailurePatchPlanRecord -PatchPlanRecord ([pscustomobject]@{ action = 'Install'; reason = $discoveryReason })) -Expected $false -Message 'the action still has to be a skip'
+
+# Blank entries are dropped rather than rendered as an empty reason, and no error at all is a
+# different fact from an error nobody read - so it is named rather than papered over.
+Assert-Equal -Actual (Get-DiscoveryFailurePlanReason -Errors @('', '   ', 'the real one') -Outcome 'DiscoveryFailed') -Expected 'Skipped: Discovery failed. the real one' -Message 'blank error entries never become the reason'
+Assert-Equal -Actual (Get-DiscoveryFailurePlanReason -Errors @() -Outcome 'Failed') -Expected 'Skipped: Discovery failed. The guest agent reported outcome Failed and named no error.' -Message 'an outcome with no error text names the outcome'
+Assert-Equal -Actual (Get-DiscoveryFailurePlanReason -Errors @() -Outcome '') -Expected 'Skipped: Discovery failed. No reason was recorded; review discovery.json.' -Message 'nothing recorded at all says exactly that'
 Assert-Equal -Actual (Get-PlanOnlyExitCode -PatchPlanRecords $noSelectionPlan) -Expected 0 -Message 'PlanOnly exits zero for no selected updates'
 Assert-Equal -Actual (Get-PlanOnlyExitCode -PatchPlanRecords @($vm03)) -Expected 0 -Message 'PlanOnly exits zero for failover cluster skip'
 

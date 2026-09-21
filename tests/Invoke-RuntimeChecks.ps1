@@ -267,6 +267,14 @@ Assert-Equal -Actual (Test-IsApplyResultError -ApplyResult $failedApply) -Expect
 $discoverySkip = [pscustomobject]@{ action = 'Skip'; outcome = 'Skipped'; reason = 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.' }
 Assert-Equal -Actual (Test-IsApplyResultError -ApplyResult $discoverySkip) -Expected $true -Message 'discovery-failure skip is an apply error'
 
+# The reason now carries the concrete failure after the marker. This file is loaded without the
+# model in this gate, so it spells the marker out itself - and an exact match would have stopped
+# counting the very records it was written for the moment the wording gained a detail.
+$detailedDiscoverySkip = [pscustomobject]@{ action = 'Skip'; outcome = 'Skipped'; reason = 'Skipped: Discovery failed. Agent preflight failed: VM not found: vm01.invalid.' }
+Assert-Equal -Actual (Test-IsApplyResultError -ApplyResult $detailedDiscoverySkip) -Expected $true -Message 'a discovery-failure skip carrying its reason is still an apply error'
+$nullReasonSkip = [pscustomobject]@{ action = 'Skip'; outcome = 'Skipped'; reason = $null }
+Assert-Equal -Actual (Test-IsApplyResultError -ApplyResult $nullReasonSkip) -Expected $false -Message 'a skip with no reason at all is not read as a discovery failure'
+
 $clusterSkip = [pscustomobject]@{ action = 'Skip'; outcome = 'Skipped'; reason = 'Skipped: Failover Cluster detected. Please update manually one by one.' }
 Assert-Equal -Actual (Test-IsApplyResultError -ApplyResult $clusterSkip) -Expected $false -Message 'failover cluster skip is not an apply error'
 

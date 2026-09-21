@@ -663,6 +663,16 @@ the verification of round N.
   verification discovery and then stops.
 - Each round writes to `<run>\round-NN\` with the existing artifact names; the run root gets
   `rounds.json` and an aggregate `summary.md`. This applies to single-round runs too.
+- **A discovery failure names its own cause.** `Get-DiscoveryFailurePlanReason` (model) renders
+  the plan record's reason as the marker `Skipped: Discovery failed.` followed by the first error
+  the discovery record carried, so `summary.md`, `summary.csv`, the console line and the apply
+  result all name it — the apply result because it copies this reason. The marker is a
+  **prefix**, not the whole string: `Test-IsDiscoveryFailurePatchPlanRecord` (model) and
+  `Test-IsApplyResultError` (`OrchestratorRuntime.ps1`, which the runtime gate loads without the
+  model, so it spells the marker out itself) both key on it, and two static needles hold the
+  copies identical. The old wording told every operator to "Review discovery.json and per-VM
+  agent artifacts", and for the whole preflight class those artifacts never existed — the VM
+  never reached its first transfer, so no per-VM directory was ever created.
 - **Every collection artifact is a JSON array at the root**, for 0, 1 and 2+ records alike:
   `discovery.json`, `patch-plan.json` (both write sites), `apply-results.json`,
   `reboot-actions.json`, `rounds.json`. Piping a collection into `ConvertTo-Json` unrolls it, so

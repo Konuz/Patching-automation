@@ -472,7 +472,10 @@ if ($existingScripts.ContainsKey($orchestratorPath)) {
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Proceed with this plan? [Y/N]'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Update-PatchPlanWithDiscoveryFailures'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Test-IsSuccessfulDiscoveryOutcome -Outcome $outcome'
-    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.'
+    # The reason is rendered by the model now, so the orchestrator must ask it rather than
+    # writing its own wording - two wordings would be two markers, and two predicates key on it.
+    Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Get-DiscoveryFailurePlanReason'
+    Assert-TextDoesNotMatch -RelativePath $orchestratorPath -Text $orchestratorText -Pattern "(?i)reason\s*=\s*'Skipped: Discovery failed" -Reason 'the discovery-failure reason is rendered by the model, not written inline'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle '@($SelectedUpdateKeys).Count -eq 0'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'SelectedUpdateKeys did not contain any non-empty update keys.'
     Assert-TextContains -RelativePath $orchestratorPath -Text $orchestratorText -Needle 'Selected update key is not present in discovered update groups:'
@@ -564,7 +567,11 @@ if ($existingScripts.ContainsKey($runtimeHelperPath)) {
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Receive-Job returned no output.'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'Test-ApplyResultsSuccessful'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle "`$ApplyResult.action -eq 'Install' -and `$ApplyResult.outcome -ne 'InstallSucceeded'"
-    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle "`$ApplyResult.action -ne 'Install' -and `$ApplyResult.reason -eq 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.'"
+    # The runtime helper is loaded without the model in the runtime gate, so it spells the
+    # marker out itself. These two needles are what keep its copy identical to the model's -
+    # a record the model marks and this file does not recognise would stop counting as an error.
+    Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle "StartsWith('Skipped: Discovery failed.', [System.StringComparison]::Ordinal)"
+    Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle "DiscoveryFailureReasonPrefix = 'Skipped: Discovery failed.'"
     Assert-TextMatches -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Pattern '(?s)function\s+Test-ApplyResultsSuccessful\b.*?Test-IsApplyResultError\s+-ApplyResult\s+\$_' -Reason 'apply success uses shared apply-result error semantics'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'New-ApplyResultFromCycle'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle '$agentResult.Completed'

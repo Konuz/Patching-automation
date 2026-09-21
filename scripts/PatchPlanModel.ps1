@@ -619,13 +619,44 @@ function New-PatchPlanRecords {
     return @($records)
 }
 
+# The marker every discovery-failure record starts with. Two predicates key on it - this
+# file's Test-IsDiscoveryFailurePatchPlanRecord and OrchestratorRuntime's apply-result error
+# check - so it is a prefix rather than the whole reason, and the concrete failure follows it.
+$script:DiscoveryFailureReasonPrefix = 'Skipped: Discovery failed.'
+
+function Get-DiscoveryFailurePlanReason {
+    param(
+        [string[]]$Errors = @(),
+        [string]$Outcome
+    )
+
+    # Every discovery failure used to read "Review discovery.json and per-VM agent artifacts",
+    # which for the whole preflight class pointed at artifacts that were never created: those
+    # VMs never reached their first transfer, so no per-VM directory exists. The reason the
+    # operator needs was already sitting in the discovery record's errors - it just never
+    # travelled to the summary. Now it does, and the marker still leads so the predicates keep
+    # recognising the record.
+    $named = @(@($Errors) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { ([string]$_).Trim() })
+    if ($named.Count -gt 0) {
+        return ('{0} {1}' -f $script:DiscoveryFailureReasonPrefix, $named[0])
+    }
+
+    # No error text at all is itself worth naming: the outcome is then the only thing known,
+    # and "no reason was recorded" is a different problem from a reason nobody read.
+    if (-not [string]::IsNullOrWhiteSpace($Outcome)) {
+        return ('{0} The guest agent reported outcome {1} and named no error.' -f $script:DiscoveryFailureReasonPrefix, $Outcome)
+    }
+
+    return ('{0} No reason was recorded; review discovery.json.' -f $script:DiscoveryFailureReasonPrefix)
+}
+
 function Test-IsDiscoveryFailurePatchPlanRecord {
     param($PatchPlanRecord)
 
     $action = [string](Get-ModelPropertyValue -InputObject $PatchPlanRecord -Name 'action')
     $reason = [string](Get-ModelPropertyValue -InputObject $PatchPlanRecord -Name 'reason')
 
-    return ($action -eq 'Skip' -and $reason -eq 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.')
+    return ($action -eq 'Skip' -and $reason.StartsWith($script:DiscoveryFailureReasonPrefix, [System.StringComparison]::Ordinal))
 }
 
 function Get-PlanOnlyExitCode {

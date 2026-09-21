@@ -686,7 +686,11 @@ function Test-IsApplyResultError {
         return $true
     }
 
-    if ($ApplyResult.action -ne 'Install' -and $ApplyResult.reason -eq 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.') {
+    # A prefix, not the whole reason: a discovery failure now carries its concrete cause after
+    # the marker, and an exact match would stop recognising the record it was written for. This
+    # file is loaded without the model in the runtime gate, so the marker is spelled out here
+    # rather than shared - the two have to agree, and a test holds them to it.
+    if ($ApplyResult.action -ne 'Install' -and ([string]$ApplyResult.reason).StartsWith('Skipped: Discovery failed.', [System.StringComparison]::Ordinal)) {
         return $true
     }
 

@@ -966,7 +966,9 @@ function Update-PatchPlanWithDiscoveryFailures {
 
         $planRecord = $planRecordsByVmName[$vmName]
         $planRecord.action = 'Skip'
-        $planRecord.reason = 'Skipped: Discovery failed. Review discovery.json and per-VM agent artifacts.'
+        # The concrete failure travels with the record, so summary.md, summary.csv and the
+        # console line all name it. It reaches the apply result too, which copies this reason.
+        $planRecord.reason = Get-DiscoveryFailurePlanReason -Errors $errors -Outcome $outcome
         $planRecord.selectedUpdates = @()
     }
 
