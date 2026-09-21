@@ -459,6 +459,12 @@ Assert-Equal $emptyScan.Status.searchResult.warningsUnreadable $null 'an ordinar
 # number against git history - which is exactly how most of an afternoon went.
 Assert-Equal ([string]$emptyScan.Status.agentSha256).Length 64 'status.json records the SHA-256 of the agent that wrote it'
 
+# The path is passed in from script scope rather than read inside the helper, because a function
+# defined from a scriptblock built at runtime - which is how this fixture loads it - has no
+# source file, so $PSCommandPath is empty in its scope and the build went unrecorded.
+Assert-Equal (Get-AgentFileHash -Path '') $null 'an agent that cannot identify its own file records no build rather than a wrong one'
+Assert-Equal (Get-AgentFileHash -Path 'C:\does\not\exist\Run-LocalPatch.ps1') $null 'a path that cannot be read records no build either'
+
 # --- a collection WUA hands back unreadable must not cost the VM ------------------------------
 # On seven guests of one fleet $searchWarnings.Count threw PropertyNotFoundException under
 # StrictMode - PowerShell could not adapt the object WUA returned - and the top-level catch

@@ -129,21 +129,29 @@ function ConvertTo-UpdateTypeName {
 }
 
 function Get-AgentFileHash {
+    param([string]$Path)
+
     # Which build of this agent wrote the artifact beside it. A status.json that could not say
     # that cost most of an afternoon: a fleet was running a file copied across by hand while the
     # branch had moved on, and the only way to tell the two apart was matching an exception's
     # line number against git history.
     #
-    # Self-hashed rather than handed in by the orchestrator: the file that ran is the file that
-    # hashes itself, so the value can never describe a different copy than the one that produced
-    # this artifact. $null means the agent could not identify itself, which is its own answer -
-    # it is never reported as a build.
-    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
+    # Self-hashed rather than handed a value by the orchestrator: the file that ran is the file
+    # that hashes itself, so it can never describe a different copy than the one that produced
+    # this artifact. The path is passed IN, from script scope, and not read off $PSCommandPath
+    # here - PowerShell sets that per scope from the calling code's source file, and a function
+    # has no file of its own when it was defined from a scriptblock built at runtime, which is
+    # how the offline fixture loads this one. Read inside, it came back empty and the build went
+    # unrecorded; read at script scope it is the agent's own path.
+    #
+    # $null means the agent could not identify its own file, which is its own answer - it is
+    # never reported as a build.
+    if ([string]::IsNullOrWhiteSpace($Path)) {
         return $null
     }
 
     try {
-        return [string](Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+        return [string](Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
     }
     catch {
         return $null
@@ -599,7 +607,7 @@ $status = [ordered]@{
     schemaVersion = 'phase0b-1'
     runId = $RunId
     # SHA-256 of this agent file, read from the copy that is actually running in the guest.
-    agentSha256 = Get-AgentFileHash
+    agentSha256 = Get-AgentFileHash -Path $PSCommandPath
     computerName = $env:COMPUTERNAME
     startedAt = (Get-Date).ToString('o')
     finishedAt = $null
