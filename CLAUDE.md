@@ -281,6 +281,19 @@ orchestrator's reason table must agree: 10 path, 11 owner, 12 access rule, 13 re
 **unrecognised code, and a lost exit code, both fail the VM** — vSphere forgets exit codes shortly
 after a process ends, and "no answer" is the one thing that must never read as success.
 
+The guard knows far more than it can say. Its verdict names the offending access rule and the
+exact level carrying a reparse point, and **none of that crosses the channel** — widening it
+would mean writing a diagnostics file into the directory the guard has just refused, which is
+the one thing this design does not do. So the refusal message names the check and then says
+where on the guest the answer is (`Get-GuestWorkspaceFailureNextStep`): `icacls` on the refused
+path for an access rule, `(Get-Acl ...).Owner` for an owner, **the parent** for a parent
+refusal — deliberately not the directory itself, because that refusal is not about it — and
+"any level above it" for a reparse point. Which level each code refers to is already settled and
+is not guesswork: `AccessRuleRefused`, `OwnerRefused`, `SecurityUnreadable` and `CreateFailed`
+are always about the **requested** directory (`Initialize-GuestWorkspace` creates every missing
+level but verifies only the canonical one), while `ReparsePoint` and `ParentRefused` are the two
+that concern an ancestor and say so in their own wording.
+
 #### The seal: one token for the whole cycle
 
 The checks above answer *who may write here*. They cannot answer *is this still the directory we

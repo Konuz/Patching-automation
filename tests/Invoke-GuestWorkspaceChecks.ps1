@@ -94,6 +94,27 @@ Assert-Equal (Get-GuestWorkspaceExitCode -Status 'SomethingElse') (Get-GuestWork
 Assert-Contains (Get-GuestWorkspaceFailureReason -ExitCode 99) 'unrecognised' 'an unrecognised exit code is a failure'
 Assert-Contains (Get-GuestWorkspaceFailureReason -ExitCode $null) 'never reported an exit code' 'a lost exit code is a failure, not a pass'
 
+# The guard knows which access rule offended and which level carries the link, and none of it
+# crosses a channel that is an exit code and nothing else. Widening the channel would mean
+# writing a diagnostics file into the directory the guard has just refused, so the message
+# names the check and then says where on the guest the answer is.
+Assert-Contains (Get-GuestWorkspaceFailureNextStep -ExitCode 12 -Path 'C:\ProgramData\PatchingGuestOps\abc') 'icacls "C:\ProgramData\PatchingGuestOps\abc"' 'an access-rule refusal points at the refused directory'
+Assert-Contains (Get-GuestWorkspaceFailureNextStep -ExitCode 11 -Path 'C:\ProgramData\PatchingGuestOps\abc') 'Get-Acl "C:\ProgramData\PatchingGuestOps\abc"' 'an owner refusal points at the owner of the refused directory'
+
+# The parent refusal is the one that is deliberately NOT about the refused directory, so it
+# must not send the operator to look at it.
+$parentStep = [string](Get-GuestWorkspaceFailureNextStep -ExitCode 14 -Path 'C:\ProgramData\PatchingGuestOps\abc')
+Assert-Contains $parentStep 'icacls "C:\ProgramData\PatchingGuestOps"' 'a parent refusal points at the parent'
+Assert-Equal ($parentStep.Contains('PatchingGuestOps\abc')) $false 'a parent refusal does not point at the directory itself'
+
+# A reparse point can sit on any level, and saying so is the whole point of that reason.
+Assert-Contains (Get-GuestWorkspaceFailureNextStep -ExitCode 13 -Path 'C:\ProgramData\PatchingGuestOps\abc') 'any level above it' 'a reparse refusal says the link may be above the directory'
+
+# Codes with nothing useful to check add nothing, and a lost exit code has no path to name.
+Assert-Equal (Get-GuestWorkspaceFailureNextStep -ExitCode 0 -Path 'C:\ProgramData\PatchingGuestOps\abc') '' 'success adds no next step'
+Assert-Equal (Get-GuestWorkspaceFailureNextStep -ExitCode 18 -Path 'C:\ProgramData\PatchingGuestOps\abc') '' 'a refused seal is not an ACL question'
+Assert-Equal (Get-GuestWorkspaceFailureNextStep -ExitCode $null -Path 'C:\ProgramData\PatchingGuestOps\abc') '' 'a lost exit code adds no next step'
+
 # --- the seal: identity on top of authority -------------------------------------------------------
 # The owner and access-rule checks answer "who may write here". They cannot answer "is this the
 # same directory we secured", because a directory created and permissioned identically by someone

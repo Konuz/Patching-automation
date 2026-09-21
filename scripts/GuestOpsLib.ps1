@@ -509,6 +509,47 @@ $script:GuestWorkspaceExitCodeReasons = @{
     18 = 'the workspace seal is missing or does not match this run, so the directory is not the one that was secured'
 }
 
+# What to look at on the guest, per refusal. The guard knows far more than it can say: its own
+# verdict names the offending access rule or the exact level carrying the reparse point, and
+# none of that crosses the channel, which is an exit code and nothing else. It cannot be
+# widened - writing a diagnostics file would mean writing into the directory the guard has
+# just refused, which is the one thing this design does not do - so the message names the
+# check and then says where the answer is. {0} is the refused path, {1} its parent.
+$script:GuestWorkspaceExitCodeNextSteps = @{
+    11 = 'On the guest, check the owner: (Get-Acl "{0}").Owner'
+    12 = 'On the guest, check the access rules: icacls "{0}"'
+    13 = 'The link may be on the directory or on any level above it; check each level of "{0}" for a junction or a symlink.'
+    14 = 'On the guest, check the parent: icacls "{1}"'
+    15 = 'On the guest, check whether the descriptor can be read at all: Get-Acl "{0}"'
+    16 = 'On the guest, check that "{0}" can be created and that no policy blocks it.'
+}
+
+function Get-GuestWorkspaceFailureNextStep {
+    param(
+        $ExitCode,
+        [string]$Path
+    )
+
+    if ($null -eq $ExitCode) {
+        return ''
+    }
+
+    $code = [int]$ExitCode
+    if (-not $script:GuestWorkspaceExitCodeNextSteps.ContainsKey($code)) {
+        return ''
+    }
+
+    # The parent is resolved here rather than in the guest, because the guest is the one place
+    # this tool refuses to ask a second question of once the answer was "not safe".
+    $parentPath = ''
+    try { $parentPath = [string](Split-Path -Path $Path -Parent) } catch { $parentPath = '' }
+    if ([string]::IsNullOrWhiteSpace($parentPath)) {
+        $parentPath = $Path
+    }
+
+    return ([string]$script:GuestWorkspaceExitCodeNextSteps[$code] -f $Path, $parentPath)
+}
+
 function New-GuestWorkspaceSealToken {
     # Identity, not a secret: it says "this is the directory the bootstrap created". Forging it in
     # a directory that also passes the owner and access-rule checks needs administrator rights,
@@ -673,7 +714,13 @@ function Assert-GuestWorkspaceReady {
 
     $reason = Get-GuestWorkspaceFailureReason -ExitCode $result.ExitCode
     if ($null -ne $reason) {
-        throw ('Guest directory "{0}" on {1} cannot be used: {2}. Nothing was uploaded to it.' -f $Path, $VMName, $reason)
+        $nextStep = Get-GuestWorkspaceFailureNextStep -ExitCode $result.ExitCode -Path $Path
+        $message = 'Guest directory "{0}" on {1} cannot be used: {2}. Nothing was uploaded to it.' -f $Path, $VMName, $reason
+        if (-not [string]::IsNullOrWhiteSpace($nextStep)) {
+            $message = '{0} {1}' -f $message, $nextStep
+        }
+
+        throw $message
     }
 }
 
