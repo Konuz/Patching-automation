@@ -571,7 +571,6 @@ if ($existingScripts.ContainsKey($runtimeHelperPath)) {
     # marker out itself. These two needles are what keep its copy identical to the model's -
     # a record the model marks and this file does not recognise would stop counting as an error.
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle "StartsWith('Skipped: Discovery failed.', [System.StringComparison]::Ordinal)"
-    Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle "DiscoveryFailureReasonPrefix = 'Skipped: Discovery failed.'"
     Assert-TextMatches -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Pattern '(?s)function\s+Test-ApplyResultsSuccessful\b.*?Test-IsApplyResultError\s+-ApplyResult\s+\$_' -Reason 'apply success uses shared apply-result error semantics'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle 'New-ApplyResultFromCycle'
     Assert-TextContains -RelativePath $runtimeHelperPath -Text $runtimeHelperText -Needle '$agentResult.Completed'
@@ -630,6 +629,10 @@ if ($existingScripts.ContainsKey($modelPath)) {
     Assert-NoOrphanedBranchKeyword -Ast $modelAst -RelativePath $modelPath
     Assert-TextDoesNotMatch -RelativePath $modelPath -Text $modelText -Pattern '(?i)(ForEach-Object|%)\s+-Para' -Reason 'PowerShell 7 parallelism is out of scope'
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'New-CanonicalUpdateIdentityKey'
+    # The other half of the discovery-failure marker. Its twin is asserted in the runtime helper
+    # block above, which the runtime gate loads without this file, so the two spell it out
+    # separately and these two needles are what keep the spellings identical.
+    Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle "DiscoveryFailureReasonPrefix = 'Skipped: Discovery failed.'"
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'New-UpdateGroupRecords'
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'Get-DefaultUpdateSelection'
     Assert-TextContains -RelativePath $modelPath -Text $modelText -Needle 'New-PatchPlanRecords'
