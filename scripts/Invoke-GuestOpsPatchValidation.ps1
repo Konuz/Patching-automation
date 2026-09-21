@@ -981,6 +981,33 @@ function Test-IsSuccessfulDiscoveryOutcome {
     return ($Outcome -in @('SearchOnly', 'NoApplicableUpdates'))
 }
 
+function Get-AgentStatusErrorText {
+    param($Status)
+
+    # The agent records its own failures as objects (message/type/line/command); a discovery
+    # record carries strings, and the state map and summary.md read them as strings. Only the
+    # message crosses - the rest is in agent.log, which is downloaded beside status.json.
+    $texts = @()
+    foreach ($agentError in @(Get-ObjectPropertyValue -InputObject $Status -Path @('errors') -DefaultValue @())) {
+        if ($null -eq $agentError) {
+            continue
+        }
+
+        $message = if ($agentError -is [string]) { [string]$agentError } else { [string](Get-ObjectPropertyValue -InputObject $agentError -Path @('message')) }
+        if ([string]::IsNullOrWhiteSpace($message)) {
+            # An entry this code cannot read is still evidence that the agent failed, so it is
+            # named rather than dropped: a silently shortened error list is how a VM ends up
+            # reported as failed with nothing to act on.
+            $texts += 'Agent error: the guest recorded an error this run could not read; see agent.log.'
+            continue
+        }
+
+        $texts += ('Agent error: {0}' -f $message.Trim())
+    }
+
+    return @($texts)
+}
+
 function New-DiscoveryRecord {
     param(
         [string]$VMName,
@@ -1005,10 +1032,22 @@ function New-DiscoveryRecord {
         roleFlags = Get-ObjectPropertyValue -InputObject $Status -Path @('roleFlags')
         pendingRebootBefore = Get-ObjectPropertyValue -InputObject $Status -Path @('pendingRebootBefore')
         updates = @(Get-ObjectPropertyValue -InputObject $Status -Path @('updates') -DefaultValue @())
+        # The two ways the guest refuses this tool outright. Apply results have carried them
+        # since the run guard was added; discovery did not, so a guest that was busy, or whose
+        # directory was not the one this run secured, arrived as a bare outcome=Failed with the
+        # explanation left behind in status.json on the stepping stone.
+        guestRunConflict = [bool](Get-ObjectPropertyValue -InputObject $Status -Path @('guestRunConflict') -DefaultValue $false)
+        guestRunConflictKind = Get-ObjectPropertyValue -InputObject $Status -Path @('guestRunConflictKind')
+        guestRunConflictReason = Get-ObjectPropertyValue -InputObject $Status -Path @('guestRunConflictReason')
+        # Three-valued, exactly as in the apply result: $null is "not checked" (an older agent,
+        # a manual run), which must never read as "checked and refused".
+        workspaceSealVerified = Get-ObjectPropertyValue -InputObject $Status -Path @('workspaceSealVerified')
         outputDirectory = $OutputDirectory
         cleanupStatus = $CleanupStatus
         cleanupReason = $CleanupReason
-        errors = @($Errors)
+        # The agent's own errors travel with the transport errors, in one list, because every
+        # consumer - the console summary, the state map, summary.md - reads this one field.
+        errors = @($Errors) + @(Get-AgentStatusErrorText -Status $Status)
     }
 }
 
@@ -1844,6 +1883,19 @@ function Invoke-DiscoveryPhase {
             $rebootText = '{0} (advisory: {1})' -f $rebootText, ($advisoryReboot -join ', ')
         }
         Write-Host ('{0}: outcome={1}; updates={2}; reboot={3}; roles={4}' -f $record.vmName, $record.outcome, $record.availableUpdateCount, $rebootText, (Get-RoleFlagText -RoleFlags $record.roleFlags)) -ForegroundColor $summaryColor
+        # The reason, next to the verdict. Without it a guest that refused this tool - another
+        # run holding the lock, a directory that is not the one this run secured, a WUA or WMI
+        # call that threw - reads as a bare outcome=Failed, and the only explanation sits in a
+        # status.json nobody is told about.
+        if (-not $isSuccessful) {
+            foreach ($recordError in @($record.errors)) {
+                if ([string]::IsNullOrWhiteSpace([string]$recordError)) {
+                    continue
+                }
+                Write-Host ('    {0}' -f ([string]$recordError).Trim()) -ForegroundColor $summaryColor
+            }
+            Write-Host ('    Artifacts: {0}' -f $record.outputDirectory) -ForegroundColor $summaryColor
+        }
         Write-Host ''
     }
 

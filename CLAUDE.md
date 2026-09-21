@@ -381,6 +381,20 @@ states that let the next run proceed — an existing lock file from a finished r
 anything. Nothing is ever cleared by age, by a pid missing from vSphere, or by the controller
 exiting.
 
+A refusal is also the one failure the operator was least able to see. `New-DiscoveryRecord` now
+carries `guestRunConflict`, `guestRunConflictKind`, `guestRunConflictReason` and
+`workspaceSealVerified` out of `status.json`, and merges the **agent's own `errors`** into the
+record's error list, so the console prints the cause under the `outcome=` line (with the artifact
+directory) and `Get-VMPatchCompletionStates` puts the first one into the `Failed` reason in
+`summary.md`. Before that, a guest that refused this tool and a guest that could not be reached
+both read as a bare `outcome=Failed; updates=0; reboot=?; roles=unknown`, and the only explanation
+sat in a `status.json` on the stepping stone nobody was told about. Two rules hold: the agent's
+errors are objects (`message`/`type`/`line`/`command`) and the record carries strings, so only the
+message crosses and the rest stays in `agent.log`; and an entry this code cannot read is **named
+rather than dropped**, because a silently shortened error list is how a VM ends up reported as
+failed with nothing to act on. A clean discovery gains nothing from this — the agent writes
+`status.errors` only from its own `catch`, and the EULA writer is on the apply path.
+
 The agent takes the guard before creating the WUA session and holds it through the terminal
 status write. A refusal becomes `guestRunConflict = true` in `status.json` and in the apply
 result, and that is **absolute for the rest of the run**: the VM is `Failed`, it is filtered out

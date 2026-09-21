@@ -872,6 +872,13 @@ function Get-VMPatchCompletionStates {
         elseif ($recordErrors.Count -gt 0 -or $outcome -notin @('SearchOnly', 'NoApplicableUpdates')) {
             $state = 'Failed'
             $reason = ('Discovery did not succeed (outcome {0}).' -f $outcome)
+            if ($recordErrors.Count -gt 0) {
+                # The first recorded error, in the summary itself. "Discovery did not succeed"
+                # names the verdict and nothing about the cause, which is how a guest that
+                # refused this tool and a guest that could not be reached read identically to
+                # whoever opens summary.md.
+                $reason = ('{0} {1}' -f $reason, ([string]$recordErrors[0]).Trim())
+            }
         }
         elseif ([bool](Get-ModelPropertyValue -InputObject (Get-ModelPropertyValue -InputObject $discoveryRecord -Name 'pendingRebootBefore') -Name 'isPending' -DefaultValue $false)) {
             $state = 'PendingReboot'

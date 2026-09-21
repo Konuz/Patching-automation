@@ -16,7 +16,7 @@ function Assert-Equal {
 $tokens = $null
 $parseErrors = $null
 $orchestratorAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $repoRoot 'scripts/Invoke-GuestOpsPatchValidation.ps1'), [ref]$tokens, [ref]$parseErrors)
-foreach ($functionName in @('Test-IsSuccessfulDiscoveryOutcome', 'New-DiscoveryRecord', 'New-DiscoveryRecordFromAgentRun', 'New-AgentFleetItem', 'Invoke-DiscoveryPhase', 'Get-SafeFileName', 'Invoke-GuestAgentFleet', 'Invoke-GuestOperationWithCredentialRecovery', 'New-GuestCredentialResolutionException', 'Get-GuestCredentialResolutionErrorKind', 'Get-GuestOperationFailureMetadata')) {
+foreach ($functionName in @('Test-IsSuccessfulDiscoveryOutcome', 'Get-AgentStatusErrorText', 'New-DiscoveryRecord', 'New-DiscoveryRecordFromAgentRun', 'New-AgentFleetItem', 'Invoke-DiscoveryPhase', 'Get-SafeFileName', 'Invoke-GuestAgentFleet', 'Invoke-GuestOperationWithCredentialRecovery', 'New-GuestCredentialResolutionException', 'Get-GuestCredentialResolutionErrorKind', 'Get-GuestOperationFailureMetadata')) {
     $definition = $orchestratorAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName }, $true)
     . ([scriptblock]::Create($definition.Extent.Text))
 }
@@ -244,6 +244,54 @@ foreach ($refusalKind in @('CredentialsSkipped', 'CredentialsAborted')) {
         Assert-Equal (@($records | Where-Object { $_.vmName -eq 'vm-1' })[0].errorKind) $refusalKind ($refusalKind + ': the original refusal is retained')
         Assert-Equal $fixture.Prompts 0 ($refusalKind + ': refusal is not replaced by a generic continue prompt')
     }
+}
+
+# --- a failed discovery has to say why --------------------------------------------------------
+# outcome=Failed is written by the agent's own catch, so the explanation exists - it was just
+# never carried out of status.json. A guest that refused this tool (another run holding the lock,
+# a directory that is not the one this run secured) then reads exactly like a guest that could
+# not be reached, and the operator has nothing on screen to act on.
+& {
+    $conflictStatus = [pscustomobject]@{
+        outcome = 'Failed'
+        guestRunConflict = $true
+        guestRunConflictKind = 'Unconfirmed'
+        guestRunConflictReason = 'a previous run never reported completion on this guest'
+        workspaceSealVerified = $true
+        errors = @([pscustomobject]@{ message = 'This guest is not available for a patching run: a previous run never reported completion on this guest'; type = 'System.Exception' })
+    }
+
+    $record = New-DiscoveryRecord -VMName 'vm-conflict' -Status $conflictStatus -OutputDirectory 'out\round-01\001-vm-conflict'
+    Assert-Equal $record.guestRunConflict $true 'a discovery record carries the guest run conflict'
+    Assert-Equal $record.guestRunConflictKind 'Unconfirmed' 'a discovery record carries the conflict kind, which is what says whether it clears itself'
+    Assert-Equal $record.workspaceSealVerified $true 'a discovery record carries the seal verdict'
+    Assert-Equal (@($record.errors | Where-Object { $_ -like '*not available for a patching run*' }).Count) 1 'the agent error reaches the discovery record'
+
+    # $null is "not checked", never "checked and refused": an older agent, or a manual run,
+    # supplies no seal token at all.
+    $uncheckedRecord = New-DiscoveryRecord -VMName 'vm-old' -Status ([pscustomobject]@{ outcome = 'SearchOnly' }) -OutputDirectory 'unused'
+    Assert-Equal ($null -eq $uncheckedRecord.workspaceSealVerified) $true 'an agent that was never asked about the seal reports nothing, not a refusal'
+    Assert-Equal $uncheckedRecord.guestRunConflict $false 'a status with no conflict field is not a conflict'
+    Assert-Equal (@($uncheckedRecord.errors).Count) 0 'a clean discovery gains no errors from this'
+
+    # An error entry this code cannot read still has to count as an error. A silently shortened
+    # list is how a VM ends up reported as failed with nothing to act on.
+    $unreadable = New-DiscoveryRecord -VMName 'vm-odd' -Status ([pscustomobject]@{ outcome = 'Failed'; errors = @([pscustomobject]@{ stage = 'AcceptEulaOrSelect' }) }) -OutputDirectory 'unused'
+    Assert-Equal (@($unreadable.errors).Count) 1 'an unreadable agent error is named rather than dropped'
+    Assert-Equal (@($unreadable.errors | Where-Object { $_ -like '*could not read*' }).Count) 1 'an unreadable agent error says so'
+
+    # Transport errors and agent errors end up in one list, because every consumer reads that
+    # one field: the console summary, the state map and summary.md.
+    $both = New-DiscoveryRecord -VMName 'vm-both' -Status $conflictStatus -OutputDirectory 'unused' -Errors @('Agent run timed out after 1800 seconds.')
+    $bothErrors = @($both.errors)
+    Assert-Equal $bothErrors.Count 2 'a transport error and an agent error are both retained'
+    Assert-Equal ([string]$bothErrors[0]) 'Agent run timed out after 1800 seconds.' 'the transport error stays first, ahead of what the guest reported'
+
+    # summary.md reads the same list. Without the cause, "Discovery did not succeed" is the whole
+    # explanation an operator gets for a machine nobody patched.
+    $states = @(Get-VMPatchCompletionStates -DiscoveryRecords @($record) -UpdateGroups @())
+    Assert-Equal $states[0].state 'Failed' 'a refused guest is still a failed VM'
+    Assert-Equal ($states[0].reason -like '*not available for a patching run*') $true 'the summary names the cause, not just the verdict'
 }
 
 if ($failures.Count -gt 0) {
