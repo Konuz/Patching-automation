@@ -288,11 +288,30 @@ the one thing this design does not do. So the refusal message names the check an
 where on the guest the answer is (`Get-GuestWorkspaceFailureNextStep`): `icacls` on the refused
 path for an access rule, `(Get-Acl ...).Owner` for an owner, **the parent** for a parent
 refusal — deliberately not the directory itself, because that refusal is not about it — and
-"any level above it" for a reparse point. Which level each code refers to is already settled and
-is not guesswork: `AccessRuleRefused`, `OwnerRefused`, `SecurityUnreadable` and `CreateFailed`
-are always about the **requested** directory (`Initialize-GuestWorkspace` creates every missing
-level but verifies only the canonical one), while `ReparsePoint` and `ParentRefused` are the two
-that concern an ancestor and say so in their own wording.
+"any level above it" for a reparse point. `ReparsePoint` and `ParentRefused` are the two that
+concern an ancestor, and both say so in their own wording.
+
+**Which directory a refusal is about is a second question, and the code has to answer it.** It
+is not enough to say that `Initialize-GuestWorkspace` verifies only the canonical path: when
+`-LegacyRootPath` is supplied — and both call sites always supply it — it *also* verifies the
+existing tool directory, before the cycle directory has been created. A refusal from that check
+naming the cycle directory sends the operator to inspect a path that is not on the guest at all,
+while `C:\ProgramData\PatchingGuestOps`, which holds the offending rule, goes unnamed. That is not
+hypothetical: a real explicit-ACE finding on the tool directory was reported as a phantom GUID
+folder, and `icacls` on it answered "path not found".
+
+So a verdict carries a `Scope` (`Workspace`/`Root`), and a root-scoped refusal travels back as the
+same reason plus the guest's `$script:GuestWorkspaceRootScopeExitCodeOffset` (20, clear of the
+reboot request's own 20/21/22 contract): 32 is "access rule, on the tool directory" where 12 is
+"access rule, on the cycle directory". `Get-GuestWorkspaceFailureScope` decodes it, and
+`Assert-GuestWorkspaceReady` resolves the failing path once — `-LegacyRootPath` for a root-scoped
+code, `-Path` otherwise — and uses it for both the message and the next step. Three rules hold it
+together: both scopes decode through the **one** reason table, because two tables would be two
+chances to drift; success is never offset, or the single code meaning "nothing is wrong" would
+decode back into a pass for a refusal; and the two sides deliberately use **different variable
+names** for the offset, because `tests/Invoke-GuestWorkspaceChecks.ps1` dot-sources both files into
+one scope and a shared name would collapse them into one value, passing the very check that exists
+to catch drift.
 
 #### The seal: one token for the whole cycle
 

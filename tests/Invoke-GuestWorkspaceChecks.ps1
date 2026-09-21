@@ -115,6 +115,42 @@ Assert-Equal (Get-GuestWorkspaceFailureNextStep -ExitCode 0 -Path 'C:\ProgramDat
 Assert-Equal (Get-GuestWorkspaceFailureNextStep -ExitCode 18 -Path 'C:\ProgramData\PatchingGuestOps\abc') '' 'a refused seal is not an ACL question'
 Assert-Equal (Get-GuestWorkspaceFailureNextStep -ExitCode $null -Path 'C:\ProgramData\PatchingGuestOps\abc') '' 'a lost exit code adds no next step'
 
+# --- which directory the operator is told to open -------------------------------------------------
+# The legacy-root checks run BEFORE the cycle directory is created, so a refusal there that names
+# the cycle directory sends the operator to a path that does not exist, while the directory that
+# actually failed goes unnamed. The scope travels in the exit code, because that is the only thing
+# that crosses back from the guest.
+
+foreach ($status in @('PathRefused', 'OwnerRefused', 'AccessRuleRefused', 'ReparsePoint', 'ParentRefused', 'SecurityUnreadable')) {
+    $workspaceCode = Get-GuestWorkspaceExitCode -Status $status
+    $rootCode = Get-GuestWorkspaceExitCode -Status $status -Scope 'Root'
+    Assert-Equal ($rootCode -ne $workspaceCode) $true ('a root-scoped ' + $status + ' has its own exit code')
+    Assert-Equal (Get-GuestWorkspaceFailureReason -ExitCode $rootCode) (Get-GuestWorkspaceFailureReason -ExitCode $workspaceCode) ('a root-scoped ' + $status + ' keeps the same reason')
+    Assert-Equal (Get-GuestWorkspaceFailureScope -ExitCode $rootCode) 'Root' ('the orchestrator reads ' + $status + ' as a refusal about the tool directory')
+    Assert-Equal (Get-GuestWorkspaceFailureScope -ExitCode $workspaceCode) 'Workspace' ('the orchestrator reads ' + $status + ' as a refusal about the cycle directory')
+}
+
+# Success has no scope. Offsetting it would turn the one code that means "nothing is wrong" into
+# a failure, and decoding the offset back would turn that failure into a pass.
+Assert-Equal (Get-GuestWorkspaceExitCode -Status 'Ok' -Scope 'Root') 0 'success is never offset into a failure'
+Assert-Contains (Get-GuestWorkspaceFailureReason -ExitCode 20) 'unrecognised' 'the offset applied to success does not decode as a pass'
+Assert-Equal (Get-GuestWorkspaceFailureScope -ExitCode 99) 'Workspace' 'an unrecognised code reports no scope, so the caller keeps the path it asked about'
+Assert-Equal (Get-GuestWorkspaceFailureScope -ExitCode $null) 'Workspace' 'a lost exit code reports no scope either'
+
+$rootScoped = ConvertTo-GuestWorkspaceRootScopedVerdict -Verdict (New-GuestWorkspaceVerdict -Status 'AccessRuleRefused' -Reason 'synthetic' -Path 'C:\ProgramData\PatchingGuestOps\cycle') -RootPath 'C:\ProgramData\PatchingGuestOps'
+Assert-Equal $rootScoped.Path 'C:\ProgramData\PatchingGuestOps' 're-scoping re-addresses the verdict to the directory that failed'
+Assert-Equal $rootScoped.Scope 'Root' 're-scoping marks the verdict as being about the tool directory'
+Assert-Equal $rootScoped.Reason 'synthetic' 're-scoping keeps the reason the check produced'
+
+$okVerdict = ConvertTo-GuestWorkspaceRootScopedVerdict -Verdict (New-GuestWorkspaceVerdict -Status 'Ok' -Path 'C:\ProgramData\PatchingGuestOps') -RootPath 'C:\ProgramData\PatchingGuestOps'
+Assert-Equal $okVerdict.Scope 'Workspace' 'a passing check is never re-scoped: there is nothing to inspect'
+
+# A refusal about the tool directory carries the same reason with the root-scope offset, so it
+# has to keep its next step too - decoded, not read raw, or the codes that most need a next step
+# would silently lose it.
+Assert-Contains (Get-GuestWorkspaceFailureNextStep -ExitCode (Get-GuestWorkspaceExitCode -Status 'AccessRuleRefused' -Scope 'Root') -Path 'C:\ProgramData\PatchingGuestOps') 'icacls "C:\ProgramData\PatchingGuestOps"' 'a root-scoped access-rule refusal keeps its next step'
+Assert-Equal (Get-GuestWorkspaceFailureNextStep -ExitCode (Get-GuestWorkspaceExitCode -Status 'SealRefused' -Scope 'Root') -Path 'C:\ProgramData\PatchingGuestOps') '' 'a code with nothing to check adds nothing in either scope'
+
 # --- the seal: identity on top of authority -------------------------------------------------------
 # The owner and access-rule checks answer "who may write here". They cannot answer "is this the
 # same directory we secured", because a directory created and permissioned identically by someone
@@ -378,6 +414,31 @@ Assert-Contains $fileScopedDecoded ([System.Convert]::ToBase64String([System.Tex
 
     Assert-Contains (& $invokeWorkspace $null $true) 'never reported an exit code' 'a lost exit code fails the VM'
     Assert-Contains (& $invokeWorkspace 0 $false) 'did not finish' 'a workspace check that never finished fails the VM'
+
+    # Which directory the message sends the operator to. A root-scoped refusal fires before the
+    # cycle directory is created, so naming the cycle directory hands them a path that is not
+    # there and leaves the one that failed unnamed.
+    $invokeWorkspaceWithRoot = {
+        param($ExitCode)
+        $script:workspaceExitCode = $ExitCode
+        $script:workspaceCompleted = $true
+        try {
+            Assert-GuestWorkspaceReady -ProcessManager $fakeProcessManager -VMView $fakeVMView -GuestAuth $null -VMName 'vm-fixture' -Path 'C:\ProgramData\PatchingGuestOps\cyclecyclecyclecyclecyclecycle00' -WorkspaceScriptPath $workspaceScriptPath -LegacyRootPath 'C:\ProgramData\PatchingGuestOps' -TimeoutSeconds 5 -PollSeconds 1
+            return ''
+        }
+        catch {
+            return [string]$_.Exception.Message
+        }
+    }
+
+    $cycleScopedMessage = & $invokeWorkspaceWithRoot 12
+    Assert-Contains $cycleScopedMessage 'cyclecyclecyclecyclecyclecycle00' 'a refusal about the cycle directory still names the cycle directory'
+    Assert-Contains $cycleScopedMessage 'icacls "C:\ProgramData\PatchingGuestOps\cyclecyclecyclecyclecyclecycle00"' 'the hint points at the directory that failed'
+
+    $rootScopedMessage = & $invokeWorkspaceWithRoot (Get-GuestWorkspaceExitCode -Status 'AccessRuleRefused' -Scope 'Root')
+    Assert-Contains $rootScopedMessage 'untrusted account modify' 'a root-scoped refusal keeps its reason'
+    Assert-Contains $rootScopedMessage 'icacls "C:\ProgramData\PatchingGuestOps"' 'a root-scoped refusal points the operator at the tool directory'
+    Assert-Equal ($rootScopedMessage.Contains('cyclecyclecyclecyclecyclecycle00')) $false 'a root-scoped refusal does not name the cycle directory, which was never created'
 }
 
 # --- nothing is uploaded, and no agent starts, after a refused workspace ---------------------------

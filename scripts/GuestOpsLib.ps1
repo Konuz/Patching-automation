@@ -534,8 +534,11 @@ function Get-GuestWorkspaceFailureNextStep {
         return ''
     }
 
-    $code = [int]$ExitCode
-    if (-not $script:GuestWorkspaceExitCodeNextSteps.ContainsKey($code)) {
+    # Decoded, not read raw: a refusal about the tool directory carries the same reason with the
+    # root-scope offset added, and it needs the same next step - pointed at the directory the
+    # caller resolved, which for those codes is the tool directory rather than the cycle one.
+    $code = Get-GuestWorkspaceBaseExitCode -ExitCode ([int]$ExitCode)
+    if ($null -eq $code -or -not $script:GuestWorkspaceExitCodeNextSteps.ContainsKey($code)) {
         return ''
     }
 
@@ -550,11 +553,61 @@ function Get-GuestWorkspaceFailureNextStep {
     return ([string]$script:GuestWorkspaceExitCodeNextSteps[$code] -f $Path, $parentPath)
 }
 
+# The guest adds its own copy of this offset to the exit code when the refusal is about the
+# existing tool directory rather than this run's cycle directory - the legacy-root checks run
+# before the cycle directory exists, so naming it would send the operator to inspect a path that
+# is not there. Deliberately NOT the same variable name the guest uses: both files are dot-sourced
+# into one scope by tests/Invoke-GuestWorkspaceChecks.ps1, and a shared name would collapse the
+# two into one value, so a drift between encoder and decoder would pass the very check that exists
+# to catch it.
+$script:GuestWorkspaceRootScopeReasonOffset = 20
+
 function New-GuestWorkspaceSealToken {
     # Identity, not a secret: it says "this is the directory the bootstrap created". Forging it in
     # a directory that also passes the owner and access-rule checks needs administrator rights,
     # which is the authority half of the same question.
     return [guid]::NewGuid().ToString('N')
+}
+
+function Get-GuestWorkspaceBaseExitCode {
+    param([int]$ExitCode)
+
+    # Both scopes decode through the one table: two tables would be two chances to drift.
+    # Returns $null for a code this orchestrator does not know at all.
+    if ($script:GuestWorkspaceExitCodeReasons.ContainsKey($ExitCode)) {
+        return $ExitCode
+    }
+
+    $baseCode = $ExitCode - $script:GuestWorkspaceRootScopeReasonOffset
+    # Strictly above zero: the offset applied to success would otherwise decode the one code
+    # meaning "nothing is wrong" back into a pass for a refusal.
+    if ($baseCode -gt 0 -and $script:GuestWorkspaceExitCodeReasons.ContainsKey($baseCode)) {
+        return $baseCode
+    }
+
+    return $null
+}
+
+function Get-GuestWorkspaceFailureScope {
+    param($ExitCode)
+
+    # 'Root' means the reason is about the configured tool directory, not about the cycle
+    # directory. A lost or unrecognised code has no scope to report; the caller falls back to the
+    # path it asked about, which is the only one it can vouch for.
+    if ($null -eq $ExitCode) {
+        return 'Workspace'
+    }
+
+    $code = [int]$ExitCode
+    if ($script:GuestWorkspaceExitCodeReasons.ContainsKey($code)) {
+        return 'Workspace'
+    }
+
+    if ($null -ne (Get-GuestWorkspaceBaseExitCode -ExitCode $code)) {
+        return 'Root'
+    }
+
+    return 'Workspace'
 }
 
 function Get-GuestWorkspaceFailureReason {
@@ -567,8 +620,9 @@ function Get-GuestWorkspaceFailureReason {
     }
 
     $code = [int]$ExitCode
-    if ($script:GuestWorkspaceExitCodeReasons.ContainsKey($code)) {
-        $reason = $script:GuestWorkspaceExitCodeReasons[$code]
+    $baseCode = Get-GuestWorkspaceBaseExitCode -ExitCode $code
+    if ($null -ne $baseCode) {
+        $reason = $script:GuestWorkspaceExitCodeReasons[$baseCode]
         if ($null -eq $reason) {
             return $null
         }
@@ -714,8 +768,17 @@ function Assert-GuestWorkspaceReady {
 
     $reason = Get-GuestWorkspaceFailureReason -ExitCode $result.ExitCode
     if ($null -ne $reason) {
-        $nextStep = Get-GuestWorkspaceFailureNextStep -ExitCode $result.ExitCode -Path $Path
-        $message = 'Guest directory "{0}" on {1} cannot be used: {2}. Nothing was uploaded to it.' -f $Path, $VMName, $reason
+        # Which directory the operator has to open, and therefore which one the next step
+        # names. The legacy-root checks run before the cycle directory is created, so a refusal
+        # from them that named the cycle directory sent the operator to a path that was not on
+        # the guest at all, while the directory holding the offending rule went unnamed.
+        $failingPath = $Path
+        if ((Get-GuestWorkspaceFailureScope -ExitCode $result.ExitCode) -eq 'Root' -and -not [string]::IsNullOrWhiteSpace($LegacyRootPath)) {
+            $failingPath = $LegacyRootPath
+        }
+
+        $nextStep = Get-GuestWorkspaceFailureNextStep -ExitCode $result.ExitCode -Path $failingPath
+        $message = 'Guest directory "{0}" on {1} cannot be used: {2}. Nothing was uploaded to it.' -f $failingPath, $VMName, $reason
         if (-not [string]::IsNullOrWhiteSpace($nextStep)) {
             $message = '{0} {1}' -f $message, $nextStep
         }

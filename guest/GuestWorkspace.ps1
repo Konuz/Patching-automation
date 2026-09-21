@@ -37,6 +37,13 @@ $script:GuestWorkspaceExitCodes = [ordered]@{
     SealRefused        = 18
 }
 
+# Added to the exit code when the refusal is about the existing tool directory rather than the
+# cycle directory this run asked for. Same reason, different subject: the legacy-root checks run
+# BEFORE the cycle directory is created, so a refusal there names a path that does not exist yet,
+# and an operator told to inspect it finds nothing. 20 rather than 10 so the two ranges cannot be
+# read as one another, and clear of the reboot request's own 20/21/22 contract.
+$script:GuestWorkspaceRootScopeExitCodeOffset = 20
+
 # SYSTEM and the local Administrators group. Everything else that can modify the directory or
 # its contents is a finding, because everything else is an account that could replace the agent.
 $script:GuestWorkspaceAllowedSids = @('S-1-5-18', 'S-1-5-32-544')
@@ -45,20 +52,51 @@ function New-GuestWorkspaceVerdict {
     param(
         [string]$Status,
         [string]$Reason = $null,
-        [string]$Path = $null
+        [string]$Path = $null,
+        # 'Workspace' - this run's cycle directory, or a file in it. 'Root' - the existing tool
+        # directory the cycle directory would go under. Only the exit code crosses back to the
+        # orchestrator, so the scope has to travel in it.
+        [ValidateSet('Workspace', 'Root')][string]$Scope = 'Workspace'
     )
 
-    return [pscustomobject]@{ Status = $Status; Reason = $Reason; Path = $Path }
+    return [pscustomobject]@{ Status = $Status; Reason = $Reason; Path = $Path; Scope = $Scope }
+}
+
+function ConvertTo-GuestWorkspaceRootScopedVerdict {
+    param(
+        $Verdict,
+        [string]$RootPath
+    )
+
+    # The same refusal, re-addressed to the directory it is actually about. 'Ok' is never
+    # re-scoped: there is nothing for the operator to inspect.
+    if ([string]$Verdict.Status -eq 'Ok') {
+        return $Verdict
+    }
+
+    return New-GuestWorkspaceVerdict -Status ([string]$Verdict.Status) -Reason ([string]$Verdict.Reason) -Path $RootPath -Scope 'Root'
 }
 
 function Get-GuestWorkspaceExitCode {
-    param([string]$Status)
+    param(
+        [string]$Status,
+        [ValidateSet('Workspace', 'Root')][string]$Scope = 'Workspace'
+    )
 
-    if ($script:GuestWorkspaceExitCodes.Contains($Status)) {
-        return [int]$script:GuestWorkspaceExitCodes[$Status]
+    $code = if ($script:GuestWorkspaceExitCodes.Contains($Status)) {
+        [int]$script:GuestWorkspaceExitCodes[$Status]
+    }
+    else {
+        [int]$script:GuestWorkspaceExitCodes['Unexpected']
     }
 
-    return [int]$script:GuestWorkspaceExitCodes['Unexpected']
+    # Success has no scope. Offsetting zero would turn the one code that means "nothing is wrong"
+    # into a failure nobody can decode.
+    if ($code -eq 0 -or $Scope -ne 'Root') {
+        return $code
+    }
+
+    return ($code + $script:GuestWorkspaceRootScopeExitCodeOffset)
 }
 
 function Test-GuestWorkspacePathShape {
@@ -471,15 +509,20 @@ function Initialize-GuestWorkspace {
 
     if (-not [string]::IsNullOrWhiteSpace($LegacyRootPath)) {
         $rootShape = Test-GuestWorkspacePathShape -Path $LegacyRootPath
-        if ($rootShape.Status -ne 'Ok') { return $rootShape }
+        # Everything from here to the end of the block is about the existing tool directory, not
+        # about the cycle directory, which has not been created yet. Each refusal is scoped to the
+        # root so the orchestrator names the path the operator actually has to look at.
+        if ($rootShape.Status -ne 'Ok') { return (ConvertTo-GuestWorkspaceRootScopedVerdict -Verdict $rootShape -RootPath $LegacyRootPath) }
         $legacyRoot = [string]$rootShape.Path
         if ($canonical -ne $legacyRoot -and -not $canonical.StartsWith($legacyRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            # The one refusal here that is about neither directory on its own but about the
+            # relationship between them, so it keeps naming the workspace it was asked for.
             return New-GuestWorkspaceVerdict -Status 'PathRefused' -Reason 'The migration root must contain the workspace.' -Path $canonical
         }
         try {
             foreach ($segment in @(Get-GuestWorkspacePathChain -CanonicalPath $canonical)) {
                 if ((Test-Path -LiteralPath $segment) -and (Test-GuestWorkspaceReparsePoint -Path $segment)) {
-                    return New-GuestWorkspaceVerdict -Status 'ReparsePoint' -Reason 'A link redirects the legacy workspace.' -Path $canonical
+                    return New-GuestWorkspaceVerdict -Status 'ReparsePoint' -Reason ('A link redirects the legacy workspace: {0}' -f $segment) -Path $segment -Scope 'Root'
                 }
             }
             if (Test-Path -LiteralPath $legacyRoot -PathType Container) {
@@ -489,22 +532,22 @@ function Initialize-GuestWorkspace {
                     # permissions require operator review, rather than silently discarding them.
                     $explicitRules = @($security.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))
                     if ($explicitRules.Count -gt 0) {
-                        return New-GuestWorkspaceVerdict -Status 'AccessRuleRefused' -Reason 'The legacy root has explicit access rules.' -Path $canonical
+                        return New-GuestWorkspaceVerdict -Status 'AccessRuleRefused' -Reason 'The legacy root has explicit access rules.' -Path $legacyRoot -Scope 'Root'
                     }
                     $parent = [System.IO.Path]::GetDirectoryName($legacyRoot)
                     $parentSecurity = Get-Acl -LiteralPath $parent
                     $unsafeParent = Test-GuestWorkspaceAccessRules -Security $parentSecurity -Mask (Get-GuestWorkspaceReplaceMask) -IgnoreInheritOnly
                     if ($null -ne $unsafeParent) {
-                        return New-GuestWorkspaceVerdict -Status 'ParentRefused' -Reason $unsafeParent -Path $canonical
+                        return New-GuestWorkspaceVerdict -Status 'ParentRefused' -Reason $unsafeParent -Path $legacyRoot -Scope 'Root'
                     }
                     Set-GuestWorkspaceRootSecurity -Path $legacyRoot
                 }
                 $rootVerdict = Assert-GuestWorkspacePath -Path $legacyRoot
-                if ($rootVerdict.Status -ne 'Ok') { return $rootVerdict }
+                if ($rootVerdict.Status -ne 'Ok') { return (ConvertTo-GuestWorkspaceRootScopedVerdict -Verdict $rootVerdict -RootPath $legacyRoot) }
             }
         }
         catch {
-            return New-GuestWorkspaceVerdict -Status 'SecurityUnreadable' -Reason ('Legacy workspace migration failed: {0}' -f $_.Exception.Message) -Path $canonical
+            return New-GuestWorkspaceVerdict -Status 'SecurityUnreadable' -Reason ('Legacy workspace migration failed: {0}' -f $_.Exception.Message) -Path $legacyRoot -Scope 'Root'
         }
     }
 
@@ -595,7 +638,7 @@ if (Test-Path -LiteralPath 'Variable:GuestWorkspaceRequest') {
             $verdict = Assert-GuestWorkspaceFilePath -Path $requestedFile
         }
 
-        $guestWorkspaceExitCode = Get-GuestWorkspaceExitCode -Status ([string]$verdict.Status)
+        $guestWorkspaceExitCode = Get-GuestWorkspaceExitCode -Status ([string]$verdict.Status) -Scope ([string]$verdict.Scope)
     }
     catch {
         $guestWorkspaceExitCode = [int]$script:GuestWorkspaceExitCodes['Unexpected']
