@@ -119,6 +119,19 @@ Two further rules follow from the scope being real rather than advisory:
 - **`-Name` is escaped as a literal.** PowerCLI reads it as a wildcard pattern, so a VM called
   `server[1]` would never match itself and `server*literal` would match unrelated guests.
   `WildcardPattern::Escape` keeps the exact comparison — not the pattern — as the decision.
+- **The guest host name that authorises the short-name fallback is read directly**, through
+  `Get-VMGuestReportedHostName`, never through `Get-ObjectPropertyValue`. Same rule as the
+  agent's COM count: a property-bag read is safe where a `$null` omits a field and unsafe where
+  it gates a refusal, and this one refuses a VM outright. It reads `ExtensionData.Guest.HostName`
+  and `ExtensionData.Summary.Guest.HostName` — vCenter caches them separately and either can be
+  the populated one — each in its own `try`/`catch`. Eight healthy guests were refused in one
+  fleet run with `VMware Tools reported:` and nothing after the colon, while a direct read of the
+  same property returned the FQDN.
+- **"Tools reported nothing" and "Tools reported something else" are separate refusals.** They
+  shared one message that named neither. A guest that reported no host name may simply still be
+  starting; a guest that reported a different one is a different machine wearing the same short
+  name. Both refuse — only one of them is worth waiting out, and the operator could not tell
+  which they had.
 
 Reboot initiation is the one phase that runs in a child process, and it does not receive the
 scope. The parent resolves the VM in its own session first and hands the child **one** vCenter
@@ -872,6 +885,13 @@ These are not style preferences — the static check **fails the build** on them
 - **Agent must not reference `$x.HResult` directly** — WUA COM objects can lack `HResult` under StrictMode. Go through `Get-OptionalPropertyValue` / `Format-HResult`.
 - **Agent call sites must not read `.Count` off a WUA collection** — same class as the HResult rule, and it cost seven guests their discovery in one fleet run. PowerShell cannot always adapt the object WUA returns: on some guests it is a bare `__ComObject`, so `$searchWarnings.Count` is a `PropertyNotFoundException` under StrictMode, not a number. Count through `Get-ComCollectionCount`, whose `$null` means "cannot be counted" — a different fact from zero.
 - **`Get-ComCollectionCount` must read the member directly, in a `try`/`catch`** — and must **not** go through `Get-OptionalPropertyValue` / `PSObject.Properties`. Introspecting the bag looks more defensive and is strictly worse: PowerShell adapts a COM object through IDispatch, and with no usable type library the member bag comes back **empty** while `$obj.Count` still resolves by name. So the bag answers "cannot be counted" for collections that count perfectly well — which turned the fix above into a run where **every** VM failed. The `try`/`catch` is the whole mechanism; the introspection never was. **No offline double can catch this**, because a `PSCustomObject`'s property bag and its direct access always agree, so the mechanism is pinned in the static gate instead. The same reasoning is why the other `Get-OptionalPropertyValue` reads in the agent are safe: a `$null` from the bag there omits a field or skips a block, and none of them gates a `throw`.
+- **A property-bag read must never gate a refusal.** `Get-ObjectPropertyValue` /
+  `Get-OptionalPropertyValue` walk `PSObject.Properties`, which can come back empty where direct
+  member access works. That is safe where a `$null` omits a field or skips a block, and it is how
+  a fleet-wide outage and eight wrongly refused guests were both produced where a `$null` decided
+  to `throw`. Those reads take the member directly inside a `try`/`catch`. Pinned per helper in
+  the static gate (`Get-ComCollectionCount`, `Get-VMGuestReportedHostName`), because no offline
+  double can reproduce it: a `PSCustomObject`'s property bag and its direct access always agree.
 - **Orchestrator must not use `$kbArticleIds.Count`** — `ConvertFrom-Json` collapses a single KB id to a scalar under StrictMode. Wrap in `@(...)` first.
 - **Orchestrator apply must pass selected updates by `UpdateID|RevisionNumber` keys through `-SelectedUpdateKeys`** — never by display index. Guest argument values are joined into one comma-delimited argument to avoid PowerShell binding extra tokens as positional `SearchCriteria`.
 - **No orphaned `elseif`/`else`** — detaching one from its `if` while restructuring a long flow is *not* a parse error: PowerShell reads it as a call to a command named `elseif`. All three gates stay green and the run dies at runtime with `CommandNotFoundException`, which the top-level catch turns into a bare exit 1. `Assert-NoOrphanedBranchKeyword` scans for it.

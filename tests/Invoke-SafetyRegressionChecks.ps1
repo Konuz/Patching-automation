@@ -112,6 +112,24 @@ Assert-Equal (Get-GuestOperationErrorKind -ErrorRecord ([pscustomobject]@{ Excep
     $accepted = $false
     try { $null = Get-ExactVM -Name 'server.target.invalid' -Servers $scopeServers; $accepted = $true } catch { }
     Assert-Equal $accepted $false 'missing VMware Tools hostname cannot authorize an FQDN fallback'
+
+    # vCenter caches Guest.HostName and Summary.Guest.HostName separately and either can be the
+    # populated one, so both are read - directly, because a $null here refuses a VM outright.
+    $inventory = @([pscustomobject]@{ Name = 'server'; ExtensionData = [pscustomobject]@{ Guest = [pscustomobject]@{ HostName = '' }; Summary = [pscustomobject]@{ Guest = [pscustomobject]@{ HostName = 'server.target.invalid' } } } })
+    Assert-Equal (Get-ExactVM -Name 'server.target.invalid' -Servers $scopeServers).Name 'server' 'a guest host name reported only in the summary still confirms the fallback'
+
+    # Two facts, two messages. They shared one that named neither: a guest that reported nothing
+    # may simply still be starting, a guest that reported something else is a different machine.
+    $inventory = @([pscustomobject]@{ Name = 'server'; ExtensionData = [pscustomobject]@{ Guest = [pscustomobject]@{ HostName = '' } } })
+    $silentMessage = ''
+    try { $null = Get-ExactVM -Name 'server.target.invalid' -Servers $scopeServers } catch { $silentMessage = [string]$_.Exception.Message }
+    Assert-Equal ($silentMessage -like '*reported no guest host name*') $true 'a guest whose Tools reported nothing says exactly that'
+
+    $inventory = @([pscustomobject]@{ Name = 'server'; ExtensionData = [pscustomobject]@{ Guest = [pscustomobject]@{ HostName = 'server.other.invalid' } } })
+    $mismatchMessage = ''
+    try { $null = Get-ExactVM -Name 'server.target.invalid' -Servers $scopeServers } catch { $mismatchMessage = [string]$_.Exception.Message }
+    Assert-Equal ($mismatchMessage -like '*not the requested*') $true 'a guest that reported a different name is a different refusal'
+    Assert-Equal ($mismatchMessage -like '*server.other.invalid*') $true 'the mismatch names the host name VMware Tools reported'
     Assert-Equal (Get-ExactVM -Name 'server' -Servers $scopeServers).Name 'server' 'explicit bare inventory name remains supported'
     foreach ($inventory in @(@($rightVM, $rightVM), @())) {
         $accepted = $false

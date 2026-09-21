@@ -28,6 +28,36 @@ function Get-VMLookupCandidates {
     return @($Name, $shortName)
 }
 
+function Get-VMGuestReportedHostName {
+    param($VM)
+
+    # Read the member DIRECTLY, never through the property-bag helper. That helper walks
+    # PSObject.Properties, and the rule the COM count regression established applies here too:
+    # a property-bag read is safe where a $null merely omits a field, and unsafe where it gates
+    # a refusal. This one refuses a VM outright - it is what decides whether an inventory short
+    # name may stand for the FQDN the operator asked for - so it reads the member and catches.
+    #
+    # Two sources because vCenter caches them separately and either can be the populated one.
+    # They are the same GuestInfo underneath, so neither covers a guest whose VMware Tools have
+    # not reported a name at all; that case is a refusal with its own message, below.
+    if ($null -eq $VM) {
+        return ''
+    }
+
+    $reported = @()
+    try { $reported += [string]$VM.ExtensionData.Guest.HostName } catch { }
+    try { $reported += [string]$VM.ExtensionData.Summary.Guest.HostName } catch { }
+
+    foreach ($candidateHostName in $reported) {
+        $text = ([string]$candidateHostName).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($text)) {
+            return $text
+        }
+    }
+
+    return ''
+}
+
 function Get-ExactVM {
     param(
         [string]$Name,
@@ -68,9 +98,17 @@ function Get-ExactVM {
             # Inventory short names do not identify a domain. Only use that fallback
             # when VMware Tools confirms the FQDN requested by the operator.
             if ($candidate -ne $Name) {
-                $guestHostName = [string](Get-ObjectPropertyValue -InputObject $exactMatches[0] -Path @('ExtensionData', 'Guest', 'HostName'))
-                if ([string]::IsNullOrWhiteSpace($guestHostName) -or $guestHostName.Trim().TrimEnd('.') -ine $Name.Trim().TrimEnd('.')) {
-                    throw ('VM {0} does not have a confirmed guest FQDN matching {1}. VMware Tools reported: {2}' -f $candidate, $Name, $guestHostName)
+                # Two different facts, and they used to share one message that named neither.
+                # "Tools said nothing" is a guest that may still be starting; "Tools said
+                # something else" is a different machine wearing the same short name. Both
+                # refuse - only one of them is worth waiting out.
+                $guestHostName = Get-VMGuestReportedHostName -VM $exactMatches[0]
+                if ([string]::IsNullOrWhiteSpace($guestHostName)) {
+                    throw ('VM {0} matched the inventory short name, but VMware Tools reported no guest host name, so it cannot be confirmed as {1}. The guest may still be starting, or Tools may not have reported one yet.' -f $candidate, $Name)
+                }
+
+                if ($guestHostName.TrimEnd('.') -ine $Name.Trim().TrimEnd('.')) {
+                    throw ('VM {0} reports guest host name {1}, not the requested {2}. Refusing to patch a different machine through an inventory short name.' -f $candidate, $guestHostName, $Name)
                 }
             }
             return $exactMatches[0]

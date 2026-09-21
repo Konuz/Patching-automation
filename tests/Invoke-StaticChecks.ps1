@@ -398,6 +398,11 @@ if ($existingScripts.ContainsKey($guestOpsLibPath)) {
     # Certificate policy is exercised by Invoke-CertificateChecks: strict by default,
     # with an explicit run-scoped ESXi override independent of vCenter.
     Assert-TextDoesNotMatch -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Pattern '(?i)Get-View\s+ServiceInstance' -Reason 'GuestOps managers must come from the VM client'
+    # Same rule as the agent's COM count, in the orchestrator: a property-bag read is safe where
+    # a $null omits a field and unsafe where it gates a refusal. This read decides whether an
+    # inventory short name may stand for the operator's FQDN, so it reads the member and catches.
+    Assert-TextMatches -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Pattern '(?s)function\s+Get-VMGuestReportedHostName\b(?:(?!\bfunction\b).)*?\$VM\.ExtensionData\.Guest\.HostName' -Reason 'the guest host name helper must read the member directly'
+    Assert-TextDoesNotMatch -RelativePath $guestOpsLibPath -Text $guestOpsLibText -Pattern '(?s)function\s+Get-VMGuestReportedHostName\b(?:(?!\bfunction\b).)*?Get-ObjectPropertyValue' -Reason 'the guest host name helper must not introspect the property bag'
 }
 
 if ($existingScripts.ContainsKey($vmTargetLibPath)) {
