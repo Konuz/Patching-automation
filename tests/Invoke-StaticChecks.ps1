@@ -277,6 +277,11 @@ if ($existingScripts.ContainsKey($agentPath)) {
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'ConvertTo-Json'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Test-PendingReboot'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'Get-OptionalPropertyValue'
+    # The build id is only useful if the agent hashes its OWN file, and $PSCommandPath is the
+    # only thing that names it. No offline gate can hold this: the fixture loads the agent body
+    # from a scriptblock built at runtime, which has no source file, so the variable is empty
+    # there however it is read. Pinned here for the same reason the COM count is.
+    Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'agentSha256 = Get-AgentFileHash -Path $PSCommandPath'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'SelectedUpdateKeys'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'identityKey'
     Assert-TextContains -RelativePath $agentPath -Text $agentText -Needle 'New-CanonicalUpdateIdentityKey'

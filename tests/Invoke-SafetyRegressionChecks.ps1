@@ -218,7 +218,8 @@ Assert-Equal (Get-GuestOperationErrorKind -ErrorRecord ([pscustomobject]@{ Excep
 
 # Load the real agent body and discovery adapter without running either script's entry point.
 $tokens = $null; $parseErrors = $null
-$agentAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $repoRoot 'guest/Run-LocalPatch.ps1'), [ref]$tokens, [ref]$parseErrors)
+$script:agentScriptPath = Join-Path $repoRoot 'guest/Run-LocalPatch.ps1'
+$agentAst = [System.Management.Automation.Language.Parser]::ParseFile($script:agentScriptPath, [ref]$tokens, [ref]$parseErrors)
 $orchestratorAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $repoRoot 'scripts/Invoke-GuestOpsPatchValidation.ps1'), [ref]$tokens, [ref]$parseErrors)
 foreach ($tree in @($agentAst, $orchestratorAst)) {
     foreach ($definition in @($tree.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] })) {
@@ -457,13 +458,20 @@ Assert-Equal $emptyScan.Status.searchResult.warningsUnreadable $null 'an ordinar
 # The artifact has to say which build of the agent wrote it. Without that, telling a fleet
 # running a hand-copied file from one running the branch meant matching an exception's line
 # number against git history - which is exactly how most of an afternoon went.
-Assert-Equal ([string]$emptyScan.Status.agentSha256).Length 64 'status.json records the SHA-256 of the agent that wrote it'
-
-# The path is passed in from script scope rather than read inside the helper, because a function
-# defined from a scriptblock built at runtime - which is how this fixture loads it - has no
-# source file, so $PSCommandPath is empty in its scope and the build went unrecorded.
+# The helper is exercised against the real agent file, which is the part this gate can prove.
+Assert-Equal (Get-AgentFileHash -Path $script:agentScriptPath) ([string](Get-FileHash -LiteralPath $script:agentScriptPath -Algorithm SHA256).Hash) 'the build id is the SHA-256 of the agent file'
 Assert-Equal (Get-AgentFileHash -Path '') $null 'an agent that cannot identify its own file records no build rather than a wrong one'
 Assert-Equal (Get-AgentFileHash -Path 'C:\does\not\exist\Run-LocalPatch.ps1') $null 'a path that cannot be read records no build either'
+
+# The field is on the record whatever the value, so a reader never has to guess whether an
+# artifact predates the build id or merely could not compute one.
+Assert-Equal ($null -ne $emptyScan.Status.PSObject.Properties['agentSha256']) $true 'status.json always carries the agent build field'
+
+# What this gate CANNOT prove is the wiring: the fixture loads the agent body from a scriptblock
+# built at runtime, and such a scriptblock has no source file, so $PSCommandPath is empty here
+# no matter where it is read. The template reading the real path is pinned in the static gate
+# instead - the same treatment the COM count and the guest host name read get, and for the same
+# reason: the double and the real thing disagree about the mechanism.
 
 # --- a collection WUA hands back unreadable must not cost the VM ------------------------------
 # On seven guests of one fleet $searchWarnings.Count threw PropertyNotFoundException under
