@@ -395,6 +395,13 @@ rather than dropped**, because a silently shortened error list is how a VM ends 
 failed with nothing to act on. A clean discovery gains nothing from this — the agent writes
 `status.errors` only from its own `catch`, and the EULA writer is on the apply path.
 
+**`isElevated` is three-valued for the same reason `workspaceSealVerified` is**: `$null` until it
+is measured, which happens only after the seal and the run guard have both been cleared. It used
+to initialise to `$false`, so a guest that refused the run guard reported `isElevated=False` in
+`status.json` and in `discovery.json` — "never checked" reading exactly like "checked, and this
+account is not an administrator", which sends whoever finds it after a permissions problem nobody
+ever diagnosed. The gate itself is `-ne $true`, so only a measured elevation proceeds.
+
 The agent takes the guard before creating the WUA session and holds it through the terminal
 status write. A refusal becomes `guestRunConflict = true` in `status.json` and in the apply
 result, and that is **absolute for the rest of the run**: the VM is `Failed`, it is filtered out

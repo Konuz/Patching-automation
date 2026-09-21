@@ -873,11 +873,17 @@ foreach ($guardCase in @(
     Assert-Equal ([bool]$refused.ApplyResult.guestRunConflict) $guardCase.Conflict ('the apply result carries the conflict flag (' + $guardCase.Result + ')')
     Assert-Equal @($refused.GuardCompletions).Count 0 ('a run that never took the guard never records completion (' + $guardCase.Result + ')')
     Assert-Equal $refused.State 'Failed' ('a refused guest is never green (' + $guardCase.Result + ')')
+    # The elevation check runs after the guard, so a refused run never measured it. $false here
+    # would read as "this account is not an administrator" and send the operator after a
+    # permissions problem that was never diagnosed - the same reason workspaceSealVerified is
+    # three-valued.
+    Assert-Equal ($null -eq $refused.Status.isElevated) $true ('a refused run reports no elevation verdict rather than a false one (' + $guardCase.Result + ')')
 }
 
 # Completion is recorded once, after the terminal status, and the handle is released with it.
 $acquired = Invoke-AgentFixture
 Assert-Equal ([bool]$acquired.Status.guestRunConflict) $false 'an ordinary run reports no conflict'
+Assert-Equal $acquired.Status.isElevated $true 'a run that got past the guard reports the elevation it measured'
 Assert-Equal @($acquired.GuardCompletions).Count 1 'a finished run records completion exactly once'
 Assert-Equal $acquired.GuardCompletions[0] ([string]$acquired.Status.outcome) 'the recorded completion carries this cycle terminal outcome'
 Assert-Equal $acquired.GuardReleases 1 'a finished run releases the handle'

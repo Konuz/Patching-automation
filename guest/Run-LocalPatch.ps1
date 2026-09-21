@@ -612,7 +612,12 @@ $status = [ordered]@{
     startedAt = (Get-Date).ToString('o')
     finishedAt = $null
     outcome = 'Started'
-    isElevated = $false
+    # Three-valued, like workspaceSealVerified: $null until it is actually measured, which
+    # happens only after the seal and the run guard have both been cleared. $false here would
+    # make "never checked" indistinguishable from "checked, and this token is not elevated" -
+    # and a guest that refused the run guard then reports isElevated=False in status.json and
+    # in discovery.json, pointing whoever reads it at an account problem that does not exist.
+    isElevated = $null
     powershellVersion = $PSVersionTable.PSVersion.ToString()
     runAs = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     workingDirectory = $WorkingDirectory
@@ -715,7 +720,10 @@ try {
     $status.roleFlags = Get-RoleFlags
     Save-Status -Status $status
 
-    if (-not $status.isElevated) {
+    # Only a measured $true proceeds. Identical behaviour today - the measurement is four lines
+    # up - but it states the intent now that the field can also be $null, and it fails closed if
+    # anything ever moves the measurement or fails to produce a boolean.
+    if ($status.isElevated -ne $true) {
         throw 'The agent process is not elevated. WUA install validation requires an elevated local admin token.'
     }
 
