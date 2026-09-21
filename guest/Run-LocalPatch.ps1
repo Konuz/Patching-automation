@@ -128,6 +128,28 @@ function ConvertTo-UpdateTypeName {
     }
 }
 
+function Get-AgentFileHash {
+    # Which build of this agent wrote the artifact beside it. A status.json that could not say
+    # that cost most of an afternoon: a fleet was running a file copied across by hand while the
+    # branch had moved on, and the only way to tell the two apart was matching an exception's
+    # line number against git history.
+    #
+    # Self-hashed rather than handed in by the orchestrator: the file that ran is the file that
+    # hashes itself, so the value can never describe a different copy than the one that produced
+    # this artifact. $null means the agent could not identify itself, which is its own answer -
+    # it is never reported as a build.
+    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        return $null
+    }
+
+    try {
+        return [string](Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+    }
+    catch {
+        return $null
+    }
+}
+
 function Get-ComCollectionCount {
     param($Collection)
 
@@ -576,6 +598,8 @@ function Save-Status {
 $status = [ordered]@{
     schemaVersion = 'phase0b-1'
     runId = $RunId
+    # SHA-256 of this agent file, read from the copy that is actually running in the guest.
+    agentSha256 = Get-AgentFileHash
     computerName = $env:COMPUTERNAME
     startedAt = (Get-Date).ToString('o')
     finishedAt = $null
@@ -633,7 +657,13 @@ $scriptExitCode = 1
 $guestRunGuard = $null
 
 try {
-    Write-AgentLog -Message 'Agent started.'
+    $agentBuildText = 'unknown'
+    $agentSha256Text = [string]$status.agentSha256
+    if ($agentSha256Text.Length -ge 12) {
+        $agentBuildText = $agentSha256Text.Substring(0, 12)
+    }
+
+    Write-AgentLog -Message ('Agent started (build {0}).' -f $agentBuildText)
     Save-Status -Status $status
 
     if ($MaxUpdates -lt 1) {

@@ -454,6 +454,11 @@ Assert-Equal $emptyScan.ExitCode 0 'complete empty scan remains successful'
 Assert-Equal $emptyScan.State 'Green' 'complete empty scan remains Green'
 Assert-Equal $emptyScan.Status.searchResult.warningsUnreadable $null 'an ordinary search records no warning-read problem'
 
+# The artifact has to say which build of the agent wrote it. Without that, telling a fleet
+# running a hand-copied file from one running the branch meant matching an exception's line
+# number against git history - which is exactly how most of an afternoon went.
+Assert-Equal ([string]$emptyScan.Status.agentSha256).Length 64 'status.json records the SHA-256 of the agent that wrote it'
+
 # --- a collection WUA hands back unreadable must not cost the VM ------------------------------
 # On seven guests of one fleet $searchWarnings.Count threw PropertyNotFoundException under
 # StrictMode - PowerShell could not adapt the object WUA returned - and the top-level catch
